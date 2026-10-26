@@ -51,7 +51,7 @@ function Console() {
       push("POST /aurif/handshake → 200", { agent_id: agentId, scopes: scopes.split("+"), purpose, token: "agt_" + crypto.randomUUID().slice(0, 8) });
     },
     page: () => {
-      const ep = site.endpoints.find((e) => e.kind === "page" && (e.ref === path || (e.ref.includes(":") && path.startsWith(e.ref.split(":")[0]))));
+      const ep = site.endpoints.find((e) => e.kind === "page" && (e.ref === path || (e.ref.includes(":") && path.startsWith(e.ref.split(":")[0] ?? ""))));
       if (!ep || !ep.agentAccess) {
         logEvent(site.id, { agentId, kind: "page_blocked", target: path });
         return push(`GET /aurif/page?path=${path} → 403`, { error: "agent_access_off" });
