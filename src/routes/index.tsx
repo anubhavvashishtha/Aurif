@@ -1,24 +1,27 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, Link } from "@tanstack/react-router";
+import { AuthCard } from "@/components/aurif/ui";
+import { AuthForm } from "@/components/aurif/auth-form";
 
-// No head() here: the home route inherits title/description/og/twitter from
-// __root.tsx, and ships no og:image so serve-time hosting can inject the
-// project's social preview (explicit og:image or latest screenshot).
 export const Route = createFileRoute("/")({
-  component: Index,
+  head: () => ({
+    meta: [
+      { title: "Log in — Aurif" },
+      { name: "description", content: "Sign in to Aurif, the permission layer for AI agents visiting your website." },
+      { property: "og:title", content: "Log in — Aurif" },
+      { property: "og:description", content: "Control which AI agents can read and act on your website." },
+    ],
+  }),
+  component: LoginPage,
 });
 
-// IMPORTANT: Replace this placeholder. See ./README.md for routing conventions.
-function Index() {
+function LoginPage() {
   return (
-    <div
-      className="flex min-h-screen items-center justify-center"
-      style={{ backgroundColor: "#fcfbf8" }}
+    <AuthCard
+      title="Welcome back"
+      subtitle="Log in to manage AI access to your sites."
+      footer={<>New to Aurif? <Link to="/signup" className="font-medium text-primary hover:underline">Create an account</Link></>}
     >
-      <img
-        data-lovable-blank-page-placeholder="REMOVE_THIS"
-        src="https://cdn.gpteng.co/blank-app-v1.svg"
-        alt="Your app will live here!"
-      />
-    </div>
+      <AuthForm mode="login" />
+    </AuthCard>
   );
 }
