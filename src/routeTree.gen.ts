@@ -10,33 +10,141 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as AboutRouteImport } from './routes/about'
+import { Route as BagsRouteImport } from './routes/bags'
+import { Route as CartRouteImport } from './routes/cart'
+import { Route as NotebooksRouteImport } from './routes/notebooks'
+import { Route as ShippingRouteImport } from './routes/shipping'
+import { Route as ShopRouteImport } from './routes/shop'
+import { Route as ToolsRouteImport } from './routes/tools'
+import { Route as ProductsSlugRouteImport } from './routes/products.$slug'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const AboutRoute = AboutRouteImport.update({
+  id: '/about',
+  path: '/about',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const BagsRoute = BagsRouteImport.update({
+  id: '/bags',
+  path: '/bags',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const CartRoute = CartRouteImport.update({
+  id: '/cart',
+  path: '/cart',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const NotebooksRoute = NotebooksRouteImport.update({
+  id: '/notebooks',
+  path: '/notebooks',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ShippingRoute = ShippingRouteImport.update({
+  id: '/shipping',
+  path: '/shipping',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ShopRoute = ShopRouteImport.update({
+  id: '/shop',
+  path: '/shop',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ToolsRoute = ToolsRouteImport.update({
+  id: '/tools',
+  path: '/tools',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ProductsSlugRoute = ProductsSlugRouteImport.update({
+  id: '/products/$slug',
+  path: '/products/$slug',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/about': typeof AboutRoute
+  '/bags': typeof BagsRoute
+  '/cart': typeof CartRoute
+  '/notebooks': typeof NotebooksRoute
+  '/shipping': typeof ShippingRoute
+  '/shop': typeof ShopRoute
+  '/tools': typeof ToolsRoute
+  '/products/$slug': typeof ProductsSlugRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/about': typeof AboutRoute
+  '/bags': typeof BagsRoute
+  '/cart': typeof CartRoute
+  '/notebooks': typeof NotebooksRoute
+  '/shipping': typeof ShippingRoute
+  '/shop': typeof ShopRoute
+  '/tools': typeof ToolsRoute
+  '/products/$slug': typeof ProductsSlugRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/about': typeof AboutRoute
+  '/bags': typeof BagsRoute
+  '/cart': typeof CartRoute
+  '/notebooks': typeof NotebooksRoute
+  '/shipping': typeof ShippingRoute
+  '/shop': typeof ShopRoute
+  '/tools': typeof ToolsRoute
+  '/products/$slug': typeof ProductsSlugRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/'
+  fullPaths:
+    | '/'
+    | '/about'
+    | '/bags'
+    | '/cart'
+    | '/notebooks'
+    | '/shipping'
+    | '/shop'
+    | '/tools'
+    | '/products/$slug'
   fileRoutesByTo: FileRoutesByTo
-  to: '/'
-  id: '__root__' | '/'
+  to:
+    | '/'
+    | '/about'
+    | '/bags'
+    | '/cart'
+    | '/notebooks'
+    | '/shipping'
+    | '/shop'
+    | '/tools'
+    | '/products/$slug'
+  id:
+    | '__root__'
+    | '/'
+    | '/about'
+    | '/bags'
+    | '/cart'
+    | '/notebooks'
+    | '/shipping'
+    | '/shop'
+    | '/tools'
+    | '/products/$slug'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  AboutRoute: typeof AboutRoute
+  BagsRoute: typeof BagsRoute
+  CartRoute: typeof CartRoute
+  NotebooksRoute: typeof NotebooksRoute
+  ShippingRoute: typeof ShippingRoute
+  ShopRoute: typeof ShopRoute
+  ToolsRoute: typeof ToolsRoute
+  ProductsSlugRoute: typeof ProductsSlugRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -48,11 +156,75 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/about': {
+      id: '/about'
+      path: '/about'
+      fullPath: '/about'
+      preLoaderRoute: typeof AboutRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/bags': {
+      id: '/bags'
+      path: '/bags'
+      fullPath: '/bags'
+      preLoaderRoute: typeof BagsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/cart': {
+      id: '/cart'
+      path: '/cart'
+      fullPath: '/cart'
+      preLoaderRoute: typeof CartRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/notebooks': {
+      id: '/notebooks'
+      path: '/notebooks'
+      fullPath: '/notebooks'
+      preLoaderRoute: typeof NotebooksRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/shipping': {
+      id: '/shipping'
+      path: '/shipping'
+      fullPath: '/shipping'
+      preLoaderRoute: typeof ShippingRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/shop': {
+      id: '/shop'
+      path: '/shop'
+      fullPath: '/shop'
+      preLoaderRoute: typeof ShopRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/tools': {
+      id: '/tools'
+      path: '/tools'
+      fullPath: '/tools'
+      preLoaderRoute: typeof ToolsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/products/$slug': {
+      id: '/products/$slug'
+      path: '/products/$slug'
+      fullPath: '/products/$slug'
+      preLoaderRoute: typeof ProductsSlugRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  AboutRoute: AboutRoute,
+  BagsRoute: BagsRoute,
+  CartRoute: CartRoute,
+  NotebooksRoute: NotebooksRoute,
+  ShippingRoute: ShippingRoute,
+  ShopRoute: ShopRoute,
+  ToolsRoute: ToolsRoute,
+  ProductsSlugRoute: ProductsSlugRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
