@@ -185,6 +185,6 @@ export const logEvent = (siteId: string, ev: Omit<AgentEvent, "id" | "time">) =>
   }));
 
 export const useActiveSite = () =>
-  useAurif((s) => s.sites.find((x) => x.id === s.activeSiteId) ?? s.sites[0]);
+  useAurif((s) => (s.sites.find((x) => x.id === s.activeSiteId) ?? s.sites[0]) as Site);
 
 export const isBlockedKind = (k: EventKind) => k.endsWith("_blocked") || k === "handshake_denied";
