@@ -94,7 +94,7 @@ export function useCart() {
 
 export const defaultVariant = (slug: string) => {
   const p = getProduct(slug);
-  return Object.fromEntries((p?.variants ?? []).map((v) => [v.name, v.options[0]]));
+  return Object.fromEntries((p?.variants ?? []).map((v) => [v.name, v.options[0] ?? ""])) as Record<string, string>;
 };
 
 export const ORDER_KEY = "northline-last-order";

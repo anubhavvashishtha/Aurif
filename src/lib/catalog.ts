@@ -50,7 +50,7 @@ export type Product = {
   description: string[];
   category: CategorySlug;
   price: number;
-  compareAt?: number;
+  compareAt?: number | undefined;
   sku: string;
   rating: number;
   reviewCount: number;
@@ -414,7 +414,7 @@ export const products: Product[] = [
 
 export const getProduct = (slug: string) => products.find((p) => p.slug === slug);
 
-export const discountPct = (p: { price: number; compareAt?: number }) =>
+export const discountPct = (p: { price: number; compareAt?: number | undefined }) =>
   p.compareAt && p.compareAt > p.price ? Math.round((1 - p.price / p.compareAt) * 100) : 0;
 
 export const formatUSD = (n: number) =>

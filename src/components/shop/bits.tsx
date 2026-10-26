@@ -42,7 +42,7 @@ export function Price({
   size = "sm",
 }: {
   price: number;
-  compareAt?: number;
+  compareAt?: number | undefined;
   size?: "sm" | "lg";
 }) {
   const pct = discountPct({ price, compareAt });
