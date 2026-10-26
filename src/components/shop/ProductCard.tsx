@@ -15,7 +15,7 @@ export function ProductCard({ product }: { product: Product }) {
         className="relative block aspect-[4/5] overflow-hidden rounded-md bg-muted"
       >
         <img
-          src={product.images[0].src}
+          src={product.images[0]?.src}
           alt={product.name}
           loading="lazy"
           width={1024}
