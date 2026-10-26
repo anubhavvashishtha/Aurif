@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Aurif Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;600&family=Fraunces:opsz,wght@9..144,500;9..144,600&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/dashboard/dashboard.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/dashboard">Aurif <span>Dashboard</span></a>
+      <div class="row" id="top-actions">
+        <a class="btn btn-ghost" href="/" target="_blank" rel="noopener"
+          >Customer site ↗</a
+        >
+        <a class="btn btn-ghost" href="/dashboard/agent-console.html"
+          >Agent console</a
+        >
+      </div>
+    </header>
+
+    <main class="shell">
+      <!-- Auth -->
+      <section id="view-auth" class="auth-card">
+        <h1>Owner login</h1>
+        <p class="sub">
+          Manage AI endpoint access and see which agents visited your site.
+        </p>
+        <div class="row" style="margin-bottom: 1rem">
+          <button class="btn" type="button" id="tab-login">Log in</button>
+          <button class="btn btn-ghost" type="button" id="tab-signup">
+            Sign up
+          </button>
+        </div>
+
+        <form id="form-login">
+          <div class="field">
+            <label for="login-email">Email</label>
+            <input id="login-email" type="email" value="owner@aurif.dev" required />
+          </div>
+          <div class="field">
+            <label for="login-password">Password</label>
+            <input id="login-password" type="password" value="demo1234" required />
+          </div>
+          <button class="btn" type="submit">Log in</button>
+          <p class="hint">Demo: owner@aurif.dev / demo1234</p>
+          <p class="error hidden" id="login-error"></p>
+        </form>
+
+        <form id="form-signup" class="hidden">
+          <div class="field">
+            <label for="signup-name">Name</label>
+            <input id="signup-name" type="text" />
+          </div>
+          <div class="field">
+            <label for="signup-email">Email</label>
+            <input id="signup-email" type="email" required />
+          </div>
+          <div class="field">
+            <label for="signup-password">Password</label>
+            <input id="signup-password" type="password" minlength="6" required />
+          </div>
+          <button class="btn" type="submit">Create account</button>
+          <p class="error hidden" id="signup-error"></p>
+        </form>
+      </section>
+
+      <!-- App -->
+      <section id="view-app" class="hidden">
+        <div class="row" style="justify-content: space-between; margin-bottom: 1rem">
+          <div class="row">
+            <label class="mono" for="site-select">Site</label>
+            <select class="site-select" id="site-select"></select>
+          </div>
+          <div class="row">
+            <span class="mono" id="user-email"></span>
+            <button class="btn btn-ghost" type="button" id="btn-logout">
+              Log out
+            </button>
+          </div>
+        </div>
+
+        <div class="layout">
+          <nav class="side">
+            <button type="button" data-tab="overview" class="active">Overview</button>
+            <button type="button" data-tab="activity">Agent activity</button>
+            <button type="button" data-tab="endpoints">Endpoint control</button>
+            <button type="button" data-tab="settings">Site credentials</button>
+          </nav>
+
+          <div>
+            <div class="panel tab" id="tab-overview">
+              <h2>Overview</h2>
+              <p class="lead">
+                Live status for the selected site. Toggle endpoints or change the
+                agent welcome message to change what agents see.
+              </p>
+              <div class="stats" id="stats"></div>
+              <p class="mono" id="overview-meta"></p>
+            </div>
+
+            <div class="panel tab hidden" id="tab-activity">
+              <h2>Agent activity</h2>
+              <p class="lead">
+                Who visited, which URLs they opened, and which buttons/actions they
+                triggered.
+              </p>
+              <div class="row" style="margin-bottom: 0.75rem">
+                <button class="btn btn-ghost" type="button" id="btn-refresh-activity">
+                  Refresh
+                </button>
+              </div>
+              <div style="overflow-x: auto">
+                <table class="table">
+                  <thead>
+                    <tr>
+                      <th>Time</th>
+                      <th>Agent</th>
+                      <th>Event</th>
+                      <th>URL / action</th>
+                    </tr>
+                  </thead>
+                  <tbody id="activity-body"></tbody>
+                </table>
+              </div>
+            </div>
+
+            <div class="panel tab hidden" id="tab-endpoints">
+              <h2>Endpoint control</h2>
+              <p class="lead">
+                Turn agent access on or off per page and button. Off = agents get
+                blocked (403) and cannot read that output.
+              </p>
+              <div id="endpoint-list"></div>
+            </div>
+
+            <div class="panel tab hidden" id="tab-settings">
+              <h2>Site credentials</h2>
+              <p class="lead">
+                Change what agents see after handshake. Rotating the site key
+                invalidates agents that send the old key.
+              </p>
+              <form id="form-settings">
+                <div class="field">
+                  <label for="set-name">Site name</label>
+                  <input id="set-name" />
+                </div>
+                <div class="field">
+                  <label for="set-url">Site URL</label>
+                  <input id="set-url" />
+                </div>
+                <div class="field">
+                  <label for="set-welcome">Agent welcome message</label>
+                  <textarea id="set-welcome"></textarea>
+                </div>
+                <div class="field">
+                  <label for="set-blocked">Blocked agent ids (comma-separated)</label>
+                  <input id="set-blocked" placeholder="blocked, scraper-bot" />
+                </div>
+                <div class="field">
+                  <label>Site key</label>
+                  <p class="mono" id="set-key"></p>
+                </div>
+                <div class="row">
+                  <button class="btn" type="submit">Save changes</button>
+                  <button class="btn btn-danger" type="button" id="btn-rotate-key">
+                    Rotate site key
+                  </button>
+                </div>
+                <p class="error hidden" id="settings-msg"></p>
+              </form>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script src="/dashboard/app.js"></script>
+  </body>
+</html>

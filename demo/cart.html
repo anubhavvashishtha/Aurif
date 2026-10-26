@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cart — Northline</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,500;6..72,600&family=Sora:wght@400;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="/">Northline</a>
+      <nav class="nav">
+        <a href="/products">Shop</a>
+        <a href="/cart">Cart</a>
+      </nav>
+    </header>
+
+    <section class="section">
+      <h2>Your cart</h2>
+      <p class="lead">Review items before checkout.</p>
+      <div id="cart" class="product-list"></div>
+      <p style="margin-top:1.5rem;display:flex;gap:0.75rem;flex-wrap:wrap">
+        <button class="btn btn-ghost" type="button" id="clear">Clear</button>
+        <button class="btn btn-primary" type="button" id="checkout">Checkout</button>
+      </p>
+    </section>
+
+    <footer>© Northline Goods</footer>
+    <script src="/sdk/aurif.js" data-aurif-site="demo-shop"></script>
+    <script>
+      const cartKey = "northline-cart";
+
+      function render(products) {
+        const ids = JSON.parse(localStorage.getItem(cartKey) || "[]");
+        const root = document.getElementById("cart");
+        if (!ids.length) {
+          root.innerHTML = "<p class='note'>Your cart is empty.</p>";
+          return;
+        }
+        root.innerHTML = ids
+          .map((id) => {
+            const p = products.find((x) => x.id === id) || { name: id, price: "?" };
+            return `<div class="product-row"><div><h3>${p.name}</h3></div><span class="price">$${p.price}</span></div>`;
+          })
+          .join("");
+      }
+
+      fetch("/api/products")
+        .then((r) => r.json())
+        .then(({ products }) => {
+          render(products);
+          document.getElementById("clear").onclick = () => {
+            localStorage.setItem(cartKey, "[]");
+            render(products);
+          };
+          document.getElementById("checkout").onclick = () => {
+            alert("Thanks — this is a demo checkout. No payment taken.");
+            localStorage.setItem(cartKey, "[]");
+            render(products);
+          };
+        });
+    </script>
+  </body>
+</html>
