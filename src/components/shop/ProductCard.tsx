@@ -1,3 +1,4 @@
+import { Button } from "@/components/ui/button";
 import { Link } from "@tanstack/react-router";
 import { toast } from "sonner";
 import { discountPct, type Product } from "@/lib/catalog";
@@ -30,8 +31,8 @@ export function ProductCard({ product }: { product: Product }) {
             </span>
           )}
         </div>
-        <button
-          type="button"
+        <Button
+          type="button" disabled={product.stock === "out"}
           onClick={(e) => {
             e.preventDefault();
             add(product.slug, defaultVariant(product.slug));
@@ -39,8 +40,8 @@ export function ProductCard({ product }: { product: Product }) {
           }}
           className="absolute inset-x-3 bottom-3 translate-y-2 rounded-md bg-primary py-2.5 text-sm font-medium text-primary-foreground opacity-0 transition-all group-hover:translate-y-0 group-hover:opacity-100 max-md:translate-y-0 max-md:opacity-100"
         >
-          Quick add
-        </button>
+          {product.stock === "out" ? "Out of stock" : "Quick add"}
+        </Button>
       </Link>
       <div className="mt-3 flex items-start justify-between gap-3">
         <Link to="/products/$slug" params={{ slug: product.slug }} className="font-display text-lg leading-tight hover:underline">

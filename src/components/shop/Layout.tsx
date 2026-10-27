@@ -2,6 +2,7 @@ import { Link, useNavigate } from "@tanstack/react-router";
 import { Menu, Search, ShoppingBag, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useCart } from "@/lib/cart";
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
 const nav = [
@@ -37,11 +38,11 @@ export function Header() {
         Free shipping over $100 · Free returns within 30 days
       </div>
       <div className="mx-auto flex h-16 max-w-7xl items-center gap-6 px-4 md:px-8">
-        <button className="md:hidden" aria-label="Menu" onClick={() => setOpen((o) => !o)}>
+        <Button variant="ghost" size="icon" className="md:hidden" aria-expanded={open} aria-label="Menu" onClick={() => setOpen((o) => !o)}>
           {open ? <X className="size-5" /> : <Menu className="size-5" />}
-        </button>
-        <Link to="/" className="font-display text-2xl tracking-tight">
-          Northline
+        </Button>
+        <Link to="/" className="font-display text-2xl">
+          Northline<span className="text-accent">.</span>
         </Link>
         <nav className="hidden items-center gap-6 md:flex">
           {nav.map((n) => (
@@ -61,7 +62,7 @@ export function Header() {
             value={q}
             onChange={(e) => setQ(e.target.value)}
             placeholder="Search goods"
-            className="h-9 w-44 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+            aria-label="Search goods" className="h-9 w-36 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
           />
         </form>
         <Link to="/cart" className="relative ml-auto md:ml-0" aria-label={`Cart, ${count} items`}>
@@ -82,7 +83,7 @@ export function Header() {
         <div className="border-t border-border px-4 pb-4 md:hidden">
           <form onSubmit={submit} className="mt-3 flex items-center gap-2 rounded-md border border-input bg-card px-3">
             <Search className="size-4 text-muted-foreground" />
-            <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search goods" className="h-10 flex-1 bg-transparent text-sm outline-none" />
+            <input aria-label="Search goods" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search goods" className="h-10 flex-1 bg-transparent text-sm outline-none" />
           </form>
           <nav className="mt-3 flex flex-col">
             {nav.map((n) => (
@@ -116,7 +117,7 @@ export function Footer() {
           <Link to="/about" className="opacity-80 hover:opacity-100">About</Link>
           <Link to="/shipping" className="opacity-80 hover:opacity-100">Shipping</Link>
           <Link to="/shipping" hash="returns" className="opacity-80 hover:opacity-100">Returns</Link>
-          <a href="mailto:hello@northlinegoods.com" className="opacity-80 hover:opacity-100">Contact</a>
+          <Link to="/contact" className="opacity-80 hover:opacity-100">Contact</Link>
         </div>
       </div>
       <div className="border-t border-ink-foreground/10 py-5 text-center text-xs opacity-60">© {2026} Northline Goods</div>
