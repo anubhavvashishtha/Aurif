@@ -1,8 +1,9 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { PageHeader, Panel, Stat, shortKey } from "@/components/aurif/ui";
 import { isBlockedKind, useActiveSite } from "@/lib/aurif-store";
+import { aurifHead } from "@/lib/aurif-meta";
 
-export const Route = createFileRoute("/dashboard/")({ component: Overview });
+export const Route = createFileRoute("/dashboard/")({ head: () => aurifHead("Overview", "See AI agent reads, actions, blocks and field redactions."), component: Overview });
 
 function Overview() {
   const site = useActiveSite();
@@ -15,11 +16,12 @@ function Overview() {
         title="Overview"
         description="Toggle endpoints or change the welcome message to change what agents see."
       />
-      <Panel className="grid grid-cols-2 divide-x divide-y sm:grid-cols-3 lg:grid-cols-5 lg:divide-y-0">
+      <Panel className="grid grid-cols-2 divide-x divide-y sm:grid-cols-3 lg:grid-cols-6 lg:divide-y-0">
         <Stat label="Agents seen" value={agents} />
         <Stat label="Page reads" value={ev.filter((e) => e.kind === "page").length} />
         <Stat label="Actions" value={ev.filter((e) => e.kind === "action").length} />
         <Stat label="Blocked" value={ev.filter((e) => isBlockedKind(e.kind)).length} tone="danger" />
+        <Stat label="Redacted" value={ev.filter((e) => e.kind === "field_redacted").length} />
         <Stat label="Endpoints open" value={<>{open}<span className="text-lg text-muted-foreground"> / {site.endpoints.length}</span></>} />
       </Panel>
       <Panel className="mt-6 divide-y">
