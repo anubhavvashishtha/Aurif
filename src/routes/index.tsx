@@ -1,34 +1,9 @@
-import { createFileRoute } from "@tanstack/react-router";
-import { products, formatUSD } from "@/lib/catalog";
-export const Route = createFileRoute("/")({
-  head: () => ({ meta: [
-    { title: "Northline Goods — Everyday field goods" },
-    { name: "description", content: "Explore Northline canvas bags, notebooks and field tools." },
-    { property: "og:title", content: "Northline Goods — Everyday field goods" },
-    { property: "og:description", content: "Explore Northline canvas bags, notebooks and field tools." },
-    { property: "og:type", content: "website" },
-    { name: "twitter:card", content: "summary_large_image" },
-  ] }),
-  component: Index,
-});
-
-function Index() {
-  return (
-    <main className="mx-auto max-w-7xl px-4 py-12 md:px-8">
-      <h1 className="text-4xl text-foreground">Northline Goods</h1>
-      <p className="mt-3 text-muted-foreground">Bags, notebooks and field tools.</p>
-      <div className="mt-10 grid grid-cols-2 gap-x-6 gap-y-10 lg:grid-cols-4">
-        {products.map((product) => (
-          <article key={product.slug}>
-            <img src={product.images[0]?.src} alt={product.name} width={1024} height={1024} className="aspect-square w-full rounded-md object-cover" />
-            <div className="mt-3 flex flex-wrap items-baseline justify-between gap-2">
-              <h2 className="text-xl">{product.name}</h2>
-              <span className="text-sm">{formatUSD(product.price)}</span>
-            </div>
-            <p className="mt-2 text-sm text-muted-foreground">{product.tagline}</p>
-          </article>
-        ))}
-      </div>
-    </main>
-  );
-}
+import { createFileRoute, Link } from '@tanstack/react-router';
+import { ArrowRight } from 'lucide-react';
+import hero from '@/assets/hero.jpg';
+import { products, storyImage } from '@/lib/catalog';
+import { ProductCard } from '@/components/shop/ProductCard';
+import { Button } from '@/components/ui/button';
+import { pageHead } from '@/lib/seo';
+export const Route=createFileRoute('/')({head:()=>pageHead('Northline · Gear for slow weekends','Thoughtfully made bags, notebooks and field tools. Gear for slow weekends, from Portland, Oregon.'),component:Home});
+function Home(){return <main><section className="relative flex min-h-[490px] h-[min(650px,72svh)] items-center overflow-hidden bg-ink text-ink-foreground"><img src={hero} alt="A canvas bag and camp gear beside an Oregon lake" className="absolute inset-0 h-full w-full object-cover"/><div className="hero-scrim absolute inset-0"/><div className="relative mx-auto w-full max-w-7xl px-6 md:px-12"><div className="max-w-xl animate-rise"><p className="mb-5 text-sm uppercase tracking-[0.18em]">Northline Goods</p><h1 className="text-5xl leading-[1.08] md:text-7xl">Gear for<br/>slow weekends.</h1><p className="mt-6 max-w-sm text-base leading-relaxed opacity-85">Useful things for the long way home. Made to be carried, kept, and worn in.</p><Button asChild variant="hero" size="lg" className="mt-8"><Link to="/shop">Explore the collection<ArrowRight/></Link></Button></div></div></section><section className="mx-auto max-w-7xl px-4 py-14 md:px-8 md:py-20"><div className="mb-8 flex items-end justify-between gap-4"><div><p className="eyebrow">Well-made essentials</p><h2 className="mt-3 text-4xl">This season</h2></div><Button asChild variant="link" className="px-0"><Link to="/shop">View all goods<ArrowRight/></Link></Button></div><div className="grid grid-cols-2 gap-x-4 gap-y-10 md:gap-x-6 lg:grid-cols-4">{products.filter(p=>p.featured).map(p=><ProductCard key={p.slug} product={p}/>)}</div></section><section className="bg-secondary"><div className="mx-auto grid max-w-7xl items-center gap-10 px-4 py-14 md:grid-cols-2 md:px-8 md:py-20"><img src={storyImage} alt="Canvas goods being made at a Portland workshop" className="aspect-[4/3] w-full object-cover"/><div className="max-w-lg md:px-8"><p className="eyebrow">Less, but better</p><h2 className="mt-4 text-4xl leading-tight">Some things are<br/>worth holding onto.</h2><p className="mt-5 leading-relaxed text-muted-foreground">A bag that gets softer. A notebook filled with places. A tool passed down. We make simple, honest goods that earn their place in your day—and stay there for years.</p><Button asChild variant="link" className="mt-6 px-0"><Link to="/about">Our story<ArrowRight/></Link></Button></div></div></section></main>}
