@@ -82,7 +82,7 @@
   h1, h2, h3, .font-display {
     font-family: var(--font-serif);
     font-weight: 400;
-    letter-spacing: -0.01em;
+    letter-spacing: 0;
   }
 }
 
@@ -119,3 +119,5 @@
 @utility animate-pop {
   animation: pop 0.45s ease-out;
 }
+
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }

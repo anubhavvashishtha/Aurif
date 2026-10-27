@@ -1,3 +1,4 @@
+import { Button } from "@/components/ui/button";
 import { Star } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { discountPct, formatUSD } from "@/lib/catalog";
@@ -51,10 +52,10 @@ export function Price({
       <span className={cn("font-medium", size === "lg" ? "text-2xl" : "text-sm", pct && "text-sale")}>
         {formatUSD(price)}
       </span>
-      {pct > 0 && (
+      {pct > 0 && compareAt !== undefined && (
         <>
           <span className={cn("text-muted-foreground line-through", size === "lg" ? "text-base" : "text-xs")}>
-            {formatUSD(compareAt!)}
+            {formatUSD(compareAt)}
           </span>
           {size === "lg" && <DiscountBadge pct={pct} />}
         </>
@@ -86,23 +87,23 @@ export function StockNote({ stock, left }: { stock: "in" | "low" | "out"; left?:
 export function QtyStepper({ value, onChange }: { value: number; onChange: (n: number) => void }) {
   return (
     <div className="inline-flex h-10 items-center rounded-md border border-input">
-      <button
+      <Button variant="ghost"
         type="button"
-        aria-label="Decrease quantity"
+        disabled={value <= 1} aria-label="Decrease quantity"
         className="h-full w-9 text-lg hover:bg-muted"
         onClick={() => onChange(value - 1)}
       >
         −
-      </button>
+      </Button>
       <span className="w-8 text-center text-sm tabular-nums">{value}</span>
-      <button
+      <Button variant="ghost"
         type="button"
-        aria-label="Increase quantity"
+        disabled={value >= 10} aria-label="Increase quantity"
         className="h-full w-9 text-lg hover:bg-muted"
         onClick={() => onChange(value + 1)}
       >
         +
-      </button>
+      </Button>
     </div>
   );
 }
