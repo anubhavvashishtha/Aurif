@@ -7,4 +7,12 @@ venv/
 *.egg-info/
 dist/
 build/
-server/data/
+server/data/store.json
+node_modules/
+Demo-client/node_modules/
+Aurif-UI/node_modules/
+Demo-client/dist/
+Aurif-UI/dist/
+.nitro/
+.output/
+.tanstack/

@@ -12,110 +12,11 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from endpoints_default import DEFAULT_ENDPOINTS, ensure_endpoint_shape
+
 DATA_DIR = Path(__file__).resolve().parent / "data"
 STORE_PATH = DATA_DIR / "store.json"
 _lock = threading.RLock()
-
-DEFAULT_ENDPOINTS = [
-    {
-        "id": "page.home",
-        "label": "Home page",
-        "kind": "page",
-        "path": "/",
-        "agent_access": True,
-    },
-    {
-        "id": "page.products",
-        "label": "Products list",
-        "kind": "page",
-        "path": "/products",
-        "agent_access": True,
-    },
-    {
-        "id": "page.product.widget",
-        "label": "Product: Field Tote",
-        "kind": "page",
-        "path": "/products/widget",
-        "agent_access": True,
-    },
-    {
-        "id": "page.product.badge",
-        "label": "Product: Trail Notebook",
-        "kind": "page",
-        "path": "/products/badge",
-        "agent_access": True,
-    },
-    {
-        "id": "page.cart",
-        "label": "Cart page",
-        "kind": "page",
-        "path": "/cart",
-        "agent_access": True,
-    },
-    {
-        "id": "action.nav.products",
-        "label": "Action: Shop",
-        "kind": "action",
-        "action_id": "nav.products",
-        "agent_access": True,
-    },
-    {
-        "id": "action.nav.cart",
-        "label": "Action: Cart",
-        "kind": "action",
-        "action_id": "nav.cart",
-        "agent_access": True,
-    },
-    {
-        "id": "action.nav.home",
-        "label": "Action: Home",
-        "kind": "action",
-        "action_id": "nav.home",
-        "agent_access": True,
-    },
-    {
-        "id": "action.product.add.widget",
-        "label": "Action: Add Field Tote",
-        "kind": "action",
-        "action_id": "product.add:widget",
-        "agent_access": True,
-    },
-    {
-        "id": "action.product.add.badge",
-        "label": "Action: Add Trail Notebook",
-        "kind": "action",
-        "action_id": "product.add:badge",
-        "agent_access": True,
-    },
-    {
-        "id": "action.product.view.widget",
-        "label": "Action: View Field Tote",
-        "kind": "action",
-        "action_id": "product.view:widget",
-        "agent_access": True,
-    },
-    {
-        "id": "action.product.view.badge",
-        "label": "Action: View Trail Notebook",
-        "kind": "action",
-        "action_id": "product.view:badge",
-        "agent_access": True,
-    },
-    {
-        "id": "action.cart.clear",
-        "label": "Action: Clear cart",
-        "kind": "action",
-        "action_id": "cart.clear",
-        "agent_access": True,
-    },
-    {
-        "id": "action.cart.checkout",
-        "label": "Action: Checkout",
-        "kind": "action",
-        "action_id": "cart.checkout",
-        "agent_access": True,
-    },
-]
 
 
 def _hash_password(password: str, salt: str | None = None) -> tuple[str, str]:
@@ -159,14 +60,43 @@ def _seed(data: dict[str, Any]) -> dict[str, Any]:
         "id": site_id,
         "owner_id": owner_id,
         "name": "Northline Goods",
-        "url": "http://127.0.0.1:8787",
+        "url": "http://127.0.0.1:5173",
         "site_key": secrets.token_urlsafe(18),
         "agent_welcome": "You are browsing Northline Goods via permissioned AI access.",
         "blocked_agents": ["blocked"],
+        "block_anonymous_agents": True,
+        "require_human_captcha": True,
         "endpoints": deepcopy(DEFAULT_ENDPOINTS),
         "created_at": time.time(),
     }
     return data
+
+
+def _migrate(data: dict[str, Any]) -> bool:
+    changed = False
+    for site in data.get("sites", {}).values():
+        if "block_anonymous_agents" not in site:
+            site["block_anonymous_agents"] = True
+            changed = True
+        if "require_human_captcha" not in site:
+            site["require_human_captcha"] = True
+            changed = True
+        eps = site.get("endpoints") or []
+        needs = not eps or not eps[0].get("response_fields")
+        # also migrate old widget/badge product paths
+        legacy = any(
+            (e.get("path") or "").endswith("/widget")
+            or (e.get("action_id") or "").endswith(":widget")
+            or e.get("id", "").endswith(".widget")
+            for e in eps
+        )
+        if needs or legacy:
+            site["endpoints"] = ensure_endpoint_shape(eps)
+            site["name"] = site.get("name") or "Northline Goods"
+            if "127.0.0.1:8787" in (site.get("url") or ""):
+                site["url"] = "http://127.0.0.1:5173"
+            changed = True
+    return changed
 
 
 def load() -> dict[str, Any]:
@@ -174,6 +104,8 @@ def load() -> dict[str, Any]:
     with _lock:
         if STORE_PATH.exists():
             data = json.loads(STORE_PATH.read_text(encoding="utf-8"))
+            if _migrate(data):
+                _write(data)
         else:
             data = _seed(_empty())
             _write(data)
@@ -203,6 +135,8 @@ def public_site(site: dict[str, Any]) -> dict[str, Any]:
         "site_key": site["site_key"],
         "agent_welcome": site.get("agent_welcome", ""),
         "blocked_agents": site.get("blocked_agents", []),
+        "block_anonymous_agents": bool(site.get("block_anonymous_agents", True)),
+        "require_human_captcha": bool(site.get("require_human_captcha", True)),
         "endpoints": site.get("endpoints", []),
         "created_at": site.get("created_at"),
     }
@@ -318,6 +252,8 @@ def create_site(owner_id: str, name: str, url: str) -> dict[str, Any]:
             "site_key": secrets.token_urlsafe(18),
             "agent_welcome": "AI agents: you have permissioned access.",
             "blocked_agents": [],
+            "block_anonymous_agents": True,
+            "require_human_captcha": True,
             "endpoints": deepcopy(DEFAULT_ENDPOINTS),
             "created_at": time.time(),
         }
@@ -343,14 +279,38 @@ def update_site(site_id: str, owner_id: str, patch: dict[str, Any]) -> dict[str,
             s["blocked_agents"] = [
                 str(a).strip() for a in patch["blocked_agents"] if str(a).strip()
             ]
+        if "block_anonymous_agents" in patch:
+            s["block_anonymous_agents"] = bool(patch["block_anonymous_agents"])
+        if "require_human_captcha" in patch:
+            s["require_human_captcha"] = bool(patch["require_human_captcha"])
         if patch.get("rotate_site_key"):
             s["site_key"] = secrets.token_urlsafe(18)
         if "endpoints" in patch and isinstance(patch["endpoints"], list):
             by_id = {e["id"]: e for e in s.get("endpoints", [])}
             for item in patch["endpoints"]:
                 eid = item.get("id")
-                if eid in by_id and "agent_access" in item:
+                if eid not in by_id:
+                    continue
+                if "agent_access" in item:
                     by_id[eid]["agent_access"] = bool(item["agent_access"])
+                if "response_fields" in item and isinstance(item["response_fields"], list):
+                    vis = {
+                        f.get("key"): f.get("agent_visible", True)
+                        for f in item["response_fields"]
+                        if isinstance(f, dict)
+                    }
+                    for f in by_id[eid].get("response_fields", []):
+                        if f.get("key") in vis:
+                            f["agent_visible"] = bool(vis[f["key"]])
+                if "request_fields" in item and isinstance(item["request_fields"], list):
+                    allowed = {
+                        f.get("key"): f.get("agent_allowed", True)
+                        for f in item["request_fields"]
+                        if isinstance(f, dict)
+                    }
+                    for f in by_id[eid].get("request_fields", []):
+                        if f.get("key") in allowed:
+                            f["agent_allowed"] = bool(allowed[f["key"]])
             s["endpoints"] = list(by_id.values())
 
     save(mut)
@@ -361,22 +321,45 @@ def set_endpoint_access(site_id: str, owner_id: str, endpoint_id: str, allowed: 
     return update_site(site_id, owner_id, {"endpoints": [{"id": endpoint_id, "agent_access": allowed}]})
 
 
+def set_endpoint_fields(
+    site_id: str,
+    owner_id: str,
+    endpoint_id: str,
+    *,
+    response_fields: list[dict[str, Any]] | None = None,
+    request_fields: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    patch: dict[str, Any] = {"id": endpoint_id}
+    if response_fields is not None:
+        patch["response_fields"] = response_fields
+    if request_fields is not None:
+        patch["request_fields"] = request_fields
+    return update_site(site_id, owner_id, {"endpoints": [patch]})
+
+
+def find_endpoint(site: dict[str, Any], *, path: str | None = None, action_id: str | None = None) -> dict[str, Any] | None:
+    for ep in site.get("endpoints") or []:
+        if path is not None and ep.get("kind") == "page" and ep.get("path") == path:
+            return ep
+        if action_id is not None and ep.get("kind") == "action" and ep.get("action_id") == action_id:
+            return ep
+    return None
+
+
 def endpoint_allowed(site: dict[str, Any], *, path: str | None = None, action_id: str | None = None) -> bool:
-    endpoints = site.get("endpoints") or []
     if path is not None:
         norm = path if path.startswith("/") else "/" + path
         if norm != "/" and norm.endswith("/"):
             norm = norm.rstrip("/")
-        for ep in endpoints:
-            if ep.get("kind") == "page" and ep.get("path") == norm:
-                return bool(ep.get("agent_access", True))
-        # product detail fallback: unknown paths default allow unless explicitly listed
-        return True
+        ep = find_endpoint(site, path=norm)
+        if ep is None:
+            return True
+        return bool(ep.get("agent_access", True))
     if action_id is not None:
-        for ep in endpoints:
-            if ep.get("kind") == "action" and ep.get("action_id") == action_id:
-                return bool(ep.get("agent_access", True))
-        return True
+        ep = find_endpoint(site, action_id=action_id)
+        if ep is None:
+            return True
+        return bool(ep.get("agent_access", True))
     return True
 
 

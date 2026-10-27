@@ -59,7 +59,7 @@ def main() -> None:
             args.base,
             "POST",
             "/ai/actions",
-            {"action_id": "product.add:widget", "args": {}},
+            {"action_id": "product.add:field-tote", "args": {}},
             token=token,
         )
         print("action:", json.dumps(action, indent=2))
