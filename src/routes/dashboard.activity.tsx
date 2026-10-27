@@ -3,7 +3,7 @@ import { RefreshCw } from "lucide-react";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { DataTable, EventBadge, PageHeader, Panel } from "@/components/aurif/ui";
-import { isBlockedKind, useActiveSite, type AgentEvent } from "@/lib/aurif-store";
+import { isBlockedKind, refreshActivity, useActiveSite, type AgentEvent } from "@/lib/aurif-store";
 import { aurifHead } from "@/lib/aurif-meta";
 
 export const Route = createFileRoute("/dashboard/activity")({ head: () => aurifHead("Agent activity", "Audit every agent handshake, read, action, block and redaction."), component: Activity });
@@ -19,7 +19,18 @@ function Activity() {
         description="Every handshake, page read and action from AI agents, newest first."
         action={
           // API hook (activity): GET /api/sites/:id/activity
-          <Button variant="outline" size="sm" onClick={() => { setSpin(true); setTimeout(() => setSpin(false), 600); }}>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={async () => {
+              setSpin(true);
+              try {
+                await refreshActivity(site.id);
+              } finally {
+                setSpin(false);
+              }
+            }}
+          >
             <RefreshCw className={spin ? "animate-spin" : ""} /> Refresh
           </Button>
         }

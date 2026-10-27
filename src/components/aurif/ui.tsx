@@ -7,7 +7,7 @@ import { Switch } from "@/components/ui/switch";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { isBlockedKind, logout, setActiveSite, useAurif, type EventKind } from "@/lib/aurif-store";
 
-export const CUSTOMER_SITE_URL = "https://northline.example";
+export const CUSTOMER_SITE_URL = import.meta.env.VITE_CUSTOMER_SITE_URL ?? "http://127.0.0.1:5173";
 
 export function Brand({ className }: { className?: string }) {
   return (
@@ -38,7 +38,14 @@ export function Topbar({ label = "Dashboard" }: { label?: string }) {
           {email && (
             <>
               <span className="hidden font-mono text-xs text-muted-foreground lg:inline">{email}</span>
-              <Button variant="ghost" size="sm" onClick={() => { logout(); navigate({ to: "/", replace: true }); }}>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={async () => {
+                  await logout();
+                  navigate({ to: "/", replace: true });
+                }}
+              >
                 <LogOut /> <span className="hidden sm:inline">Log out</span>
               </Button>
             </>

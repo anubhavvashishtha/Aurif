@@ -6,8 +6,8 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { CUSTOMER_SITE_URL, Panel, SiteSwitcher, Topbar } from "@/components/aurif/ui";
-import { getState, logEvent, useActiveSite } from "@/lib/aurif-store";
-import { agentResponse } from "@/lib/aurif-fields";
+import { API_BASE } from "@/lib/api";
+import { refreshActivity, useActiveSite } from "@/lib/aurif-store";
 
 export const Route = createFileRoute("/console")({
   head: () => ({
@@ -24,105 +24,149 @@ export const Route = createFileRoute("/console")({
 
 function Console() {
   const site = useActiveSite();
-  const [agentId, setAgentId] = useState("test-agent/1.0");
-  const [scopes, setScopes] = useState("view");
-  const [purpose, setPurpose] = useState("Summarize product catalog");
+  const [agentId, setAgentId] = useState("third-party-agent");
+  const [scopes, setScopes] = useState("view+act");
+  const [purpose, setPurpose] = useState("Help user browse Northline and add one item");
   const [key, setKey] = useState("");
-  const [path, setPath] = useState("/products");
+  const [path, setPath] = useState("/products/field-tote");
+  const [session, setSession] = useState("");
   const [log, setLog] = useState<string[]>([]);
 
   const push = (label: string, body: unknown) =>
     setLog((l) => [`// ${new Date().toLocaleTimeString()}  ${label}\n${JSON.stringify(body, null, 2)}`, ...l]);
 
-  // API hooks (agent): GET /.well-known/aurif, POST /aurif/handshake, GET /aurif/page, POST /aurif/action, GET /aurif/audit
-  const blocked = () => site.blockedAgents.split(",").map((s) => s.trim()).filter(Boolean).includes(agentId);
-  const badKey = () => key !== "" && key !== site.siteKey;
+  const agentFetch = async (p: string, init?: RequestInit) => {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "X-Aurif-Protocol": "aurif-1",
+      ...(init?.headers as Record<string, string> | undefined),
+    };
+    if (session) headers["X-Aurif-Session"] = session;
+    if (key) headers["X-Aurif-Site-Key"] = key;
+    const res = await fetch(API_BASE + p, { ...init, headers });
+    const data = await res.json().catch(() => ({}));
+    return { res, data };
+  };
 
   const run = {
-    discover: () => push("GET /.well-known/aurif", {
-      site: site.name, version: "1",
-      endpoints: site.endpoints.filter((e) => e.agentAccess).map((e) => ({ kind: e.kind, ref: e.ref })),
-    }),
-    handshake: () => {
-      if (blocked() || badKey()) {
-        logEvent(site.id, { agentId, kind: "handshake_denied", target: blocked() ? "agent blocked by owner" : "invalid site key" });
-        return push("POST /aurif/handshake → 403", { error: blocked() ? "agent_blocked" : "invalid_site_key" });
-      }
-      logEvent(site.id, { agentId, kind: "handshake", target: `scopes=${scopes}` });
-      push("POST /aurif/handshake → 200", { agent_id: agentId, scopes: scopes.split("+"), purpose, token: "agt_" + crypto.randomUUID().slice(0, 8) });
+    discover: async () => {
+      const { res, data } = await agentFetch("/.well-known/aurif.json");
+      push(`GET /.well-known/aurif.json → ${res.status}`, data);
     },
-    page: () => {
-      const ep = site.endpoints.find((e) => e.kind === "page" && (e.ref === path || (e.ref.includes(":") && path.startsWith(e.ref.split(":")[0] ?? ""))));
-      if (!ep || !ep.agentAccess) {
-        logEvent(site.id, { agentId, kind: "page_blocked", target: path });
-        return push(`GET /aurif/page?path=${path} → 403`, { error: "agent_access_off" });
-      }
-      const raw = { ...(ep.sampleResponse as object), summary: site.welcome };
-      const hidden = ep.responseFields.filter((f) => !f.agentVisible).map((f) => f.key);
-      logEvent(site.id, hidden.length ? { agentId, kind: "field_redacted", target: path, redactedFields: hidden } : { agentId, kind: "page", target: path });
-      push(`GET /aurif/page?path=${path} → 200`, agentResponse(ep, raw).body);
+    handshake: async () => {
+      const requested = scopes.split("+").map((s) => s.trim()).filter(Boolean);
+      const { res, data } = await agentFetch("/ai/handshake", {
+        method: "POST",
+        body: JSON.stringify({
+          agent_id: agentId,
+          agent_version: "1.0",
+          requested_scopes: requested,
+          purpose,
+          ...(key ? { site_key: key } : {}),
+        }),
+      });
+      if (data.session_token) setSession(data.session_token);
+      push(`POST /ai/handshake → ${res.status}`, data);
+      await refreshActivity(site.id).catch(() => undefined);
     },
-    action: () => {
-      const ep = site.endpoints.find((e) => e.ref === "product.add:widget")!;
-      if (scopes !== "view+act" || !ep.agentAccess) {
-        logEvent(site.id, { agentId, kind: "action_blocked", target: ep.ref });
-        return push(`POST /aurif/action ${ep.ref} → 403`, { error: scopes !== "view+act" ? "scope_missing" : "agent_access_off" });
-      }
-      logEvent(site.id, { agentId, kind: "action", target: ep.ref });
-      push(`POST /aurif/action ${ep.ref} → 200`, { ok: true, cart_items: 1 });
+    page: async () => {
+      const { res, data } = await agentFetch(`/ai/page?path=${encodeURIComponent(path)}`);
+      push(`GET /ai/page?path=${path} → ${res.status}`, data);
+      await refreshActivity(site.id).catch(() => undefined);
     },
-    audit: () => {
-      const s = getState().sites.find((x) => x.id === site.id)!;
-      push("GET /aurif/audit", s.events.filter((e) => e.agentId === agentId).slice(0, 10));
+    action: async () => {
+      const { res, data } = await agentFetch("/ai/actions", {
+        method: "POST",
+        body: JSON.stringify({ action_id: "product.add:field-tote", args: {} }),
+      });
+      push(`POST /ai/actions product.add:field-tote → ${res.status}`, data);
+      await refreshActivity(site.id).catch(() => undefined);
+    },
+    audit: async () => {
+      const { res, data } = await agentFetch("/ai/audit");
+      push(`GET /ai/audit → ${res.status}`, data);
     },
   };
 
   return (
     <div className="min-h-screen bg-background bg-wash">
-      <Topbar label="Agent console" />
-      <main className="animate-rise mx-auto max-w-7xl px-4 py-8 md:px-6">
-        <div className="mb-6 flex flex-wrap items-center gap-3">
-          <Button variant="ghost" size="sm" asChild><Link to="/dashboard"><ArrowLeft /> Dashboard</Link></Button>
-          <Button variant="ghost" size="sm" asChild><a href={CUSTOMER_SITE_URL} target="_blank" rel="noreferrer">Open customer site <ExternalLink /></a></Button>
+      <Topbar />
+      <div className="mx-auto max-w-7xl space-y-6 px-4 py-8 md:px-6">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <Button variant="ghost" size="sm" asChild>
+              <Link to="/dashboard">
+                <ArrowLeft /> Back
+              </Link>
+            </Button>
+            <SiteSwitcher />
+          </div>
+          <Button variant="ghost" size="sm" asChild>
+            <a href={CUSTOMER_SITE_URL} target="_blank" rel="noreferrer">
+              Open customer site <ExternalLink />
+            </a>
+          </Button>
         </div>
-        <h1 className="text-3xl text-ink">Agent console</h1>
-        <div className="mt-4 flex items-start gap-2.5 rounded-lg border border-primary/30 bg-accent px-4 py-3 text-sm text-accent-foreground">
-          <Info className="mt-0.5 h-4 w-4 shrink-0" />
-          Aurif product tool — talks only to AI endpoints. No vision/mouse clicking on the human UI.
-        </div>
-        <div className="mt-6 grid gap-6 lg:grid-cols-[360px_1fr]">
-          <Panel className="space-y-4 self-start p-5">
-            <div className="space-y-1.5"><Label>Target site</Label><SiteSwitcher /></div>
-            <div className="space-y-1.5"><Label>Agent ID</Label><Input className="font-mono text-xs" value={agentId} onChange={(e) => setAgentId(e.target.value)} /></div>
+
+        <Panel className="flex gap-3 border-accent/30 bg-accent-soft/40 p-4 text-sm">
+          <Info className="mt-0.5 size-4 shrink-0 text-accent" />
+          <p>
+            Aurif product tool — talks only to AI endpoints on <code className="font-mono text-xs">{API_BASE}</code>.
+            No vision / mouse clicking on the customer UI.
+          </p>
+        </Panel>
+
+        <div className="grid gap-6 lg:grid-cols-2">
+          <Panel className="space-y-4 p-5">
+            <div className="space-y-1.5">
+              <Label>Agent id</Label>
+              <Input className="font-mono text-xs" value={agentId} onChange={(e) => setAgentId(e.target.value)} />
+            </div>
             <div className="space-y-1.5">
               <Label>Scopes</Label>
               <Select value={scopes} onValueChange={setScopes}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent><SelectItem value="view">view</SelectItem><SelectItem value="view+act">view + act</SelectItem></SelectContent>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="view">view</SelectItem>
+                  <SelectItem value="view+act">view+act</SelectItem>
+                </SelectContent>
               </Select>
             </div>
-            <div className="space-y-1.5"><Label>Purpose</Label><Input value={purpose} onChange={(e) => setPurpose(e.target.value)} /></div>
-            <div className="space-y-1.5"><Label>Site key (optional)</Label><Input className="font-mono text-xs" placeholder="ak_live_…" value={key} onChange={(e) => setKey(e.target.value)} /></div>
-            <div className="space-y-1.5"><Label>Page path</Label><Input className="font-mono text-xs" value={path} onChange={(e) => setPath(e.target.value)} /></div>
-            <div className="grid grid-cols-2 gap-2 pt-2">
-              <Button variant="outline" onClick={run.discover}>Discover</Button>
-              <Button onClick={run.handshake}>Handshake</Button>
-              <Button variant="outline" onClick={run.page}>Get page</Button>
-              <Button variant="outline" onClick={run.action}>Run sample action</Button>
-              <Button variant="secondary" className="col-span-2" onClick={run.audit}>Audit</Button>
+            <div className="space-y-1.5">
+              <Label>Purpose</Label>
+              <Input value={purpose} onChange={(e) => setPurpose(e.target.value)} />
+            </div>
+            <div className="space-y-1.5">
+              <Label>Site key (optional)</Label>
+              <Input className="font-mono text-xs" value={key} onChange={(e) => setKey(e.target.value)} placeholder={site?.siteKey?.slice(0, 8) + "…"} />
+            </div>
+            <div className="space-y-1.5">
+              <Label>Page path</Label>
+              <Input className="font-mono text-xs" value={path} onChange={(e) => setPath(e.target.value)} />
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Button onClick={() => void run.discover()}>Discover</Button>
+              <Button onClick={() => void run.handshake()}>Handshake</Button>
+              <Button variant="outline" onClick={() => void run.page()}>
+                Get page
+              </Button>
+              <Button variant="outline" onClick={() => void run.action()}>
+                Add Field Tote
+              </Button>
+              <Button variant="ghost" onClick={() => void run.audit()}>
+                Audit
+              </Button>
             </div>
           </Panel>
-          <Panel className="flex min-h-[480px] flex-col overflow-hidden">
-            <div className="flex items-center justify-between border-b px-5 py-3">
-              <span className="text-sm font-medium">Response log</span>
-              <Button variant="ghost" size="sm" onClick={() => setLog([])}>Clear</Button>
-            </div>
-            <pre className="flex-1 overflow-auto bg-ink p-5 font-mono text-xs leading-relaxed text-ink-foreground">
-              {log.length ? log.join("\n\n") : "// Run Discover or Handshake to begin."}
+          <Panel className="p-0">
+            <pre className="max-h-[640px] overflow-auto p-4 font-mono text-xs leading-relaxed text-muted-foreground">
+              {log.length ? log.join("\n\n") : "// Response log"}
             </pre>
           </Panel>
         </div>
-      </main>
+      </div>
     </div>
   );
 }

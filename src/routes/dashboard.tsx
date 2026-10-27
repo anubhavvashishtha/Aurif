@@ -1,7 +1,7 @@
 import { createFileRoute, Outlet, useLocation, useNavigate } from "@tanstack/react-router";
 import { useEffect } from "react";
 import { SideNav, Topbar } from "@/components/aurif/ui";
-import { getState } from "@/lib/aurif-store";
+import { bootstrap, useAurif } from "@/lib/aurif-store";
 
 export const Route = createFileRoute("/dashboard")({
   head: () => ({
@@ -19,10 +19,17 @@ export const Route = createFileRoute("/dashboard")({
 function DashboardLayout() {
   const navigate = useNavigate();
   const { pathname } = useLocation();
-  // API hook (auth): replace with a real session check
+  const user = useAurif((s) => s.user);
+  const ready = useAurif((s) => s.ready);
   useEffect(() => {
-    if (!getState().user) navigate({ to: "/", replace: true });
-  }, [navigate]);
+    void bootstrap();
+  }, []);
+  useEffect(() => {
+    if (ready && !user) navigate({ to: "/", replace: true });
+  }, [navigate, ready, user]);
+  if (!ready || !user) {
+    return <div className="flex min-h-screen items-center justify-center text-sm text-muted-foreground">Loading…</div>;
+  }
   return (
     <div className="min-h-screen bg-background bg-wash">
       <Topbar />

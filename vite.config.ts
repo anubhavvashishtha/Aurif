@@ -12,4 +12,15 @@ export default defineConfig({
     // nitro/vite builds from this
     server: { entry: "server" },
   },
+  vite: {
+    server: {
+      port: 5174,
+      strictPort: true,
+      proxy: {
+        "/api": "http://127.0.0.1:8787",
+        "/ai": "http://127.0.0.1:8787",
+        "/.well-known": "http://127.0.0.1:8787",
+      },
+    },
+  },
 });

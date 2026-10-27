@@ -1,10 +1,10 @@
 import { useSyncExternalStore } from "react";
+import { api, clearToken, getToken, setToken } from "./api";
 import type { JsonValue, RequestField, ResponseField } from "./aurif-fields";
 
 /**
- * Aurif client-side mock store.
- * Every function below marks the API it should call once a backend exists.
- * Placeholder data lives in localStorage so the UI feels complete.
+ * Aurif dashboard store — hydrated from Flask `/api/*`.
+ * Keeps the same sync React API the Lovable UI expects.
  */
 
 export type EventKind =
@@ -45,6 +45,8 @@ export interface Site {
   siteKey: string;
   welcome: string;
   blockedAgents: string;
+  blockAnonymousAgents: boolean;
+  requireHumanCaptcha: boolean;
   endpoints: Endpoint[];
   events: AgentEvent[];
 }
@@ -53,163 +55,305 @@ interface State {
   user: { email: string } | null;
   activeSiteId: string;
   sites: Site[];
+  ready: boolean;
 }
 
-const KEY = "aurif-state-v1";
-
-const randKey = () =>
-  "ak_live_" +
-  Array.from({ length: 28 }, () => "abcdefghijklmnopqrstuvwxyz0123456789"[Math.floor(Math.random() * 36)]).join("");
-
-function endpoints(): Endpoint[] {
-  const page = (id: string, label: string, ref: string, price: number, on = true): Endpoint => {
-    const cart = id === "p-cart";
-    const sampleResponse: JsonValue = {
-      title: label, summary: "Thoughtful essentials for everyday adventures.",
-      elements: [{ label: "Explore collection", action_id: "nav.products" }],
-      meta: cart ? { items: 2, products: [{ name: "Field Tote", price: 48 }, { name: "Trail Notebook", price: 16 }] }
-        : { name: label, summary: "Made to go further.", price, currency: "USD" },
-      rating: 4.8, discount: 10, reviews: [{ author: "Alex", text: "Beautifully made.", rating: 5 }],
-    };
-    const keys = cart ? ["title", "summary", "elements", "meta", "meta.items", "meta.products", "meta.products[].price", "rating", "discount", "reviews"]
-      : ["title", "summary", "elements", "meta", "meta.price", "meta.name", "meta.summary", "rating", "discount", "reviews"];
-    return { id, label, kind: "page", ref, agentAccess: on, direction: "read", sampleResponse, sampleRequest: {}, requestFields: [],
-      responseFields: keys.map((key) => ({ key, label: key.split(".").at(-1)?.replace("[]", "") ?? key,
-        type: /price|rating|discount|items/.test(key) ? "number" : /elements|products|reviews/.test(key) ? "array" : key === "meta" ? "object" : "string",
-        agentVisible: !(id === "p-product" && (key === "meta.price" || key === "discount")), })) };
-  };
-  const action = (id: string, label: string, ref: string, on = true): Endpoint => ({
-    id, label, kind: "action", ref, agentAccess: on, direction: "both",
-    responseFields: [{ key: "ok", label: "Success", type: "boolean", agentVisible: true }, { key: "summary", label: "Summary", type: "string", agentVisible: true }],
-    requestFields: [{ key: "quantity", label: "Quantity", agentAllowed: true }, { key: "args", label: "Action arguments", agentAllowed: true }, { key: "email", label: "Email address", agentAllowed: false }],
-    sampleResponse: { ok: true, summary: "Action completed." }, sampleRequest: { quantity: 1, args: { product_id: "widget" }, email: "agent@example.com" },
-  });
-  return [
-    page("p-home", "Home page", "/", 48), page("p-shop", "Shop", "/products", 48),
-    page("p-product", "Product: Field Tote", "/products/widget", 48),
-    page("p-notebook", "Product: Trail Notebook", "/products/badge", 16),
-    page("p-cart", "Cart", "/cart", 64, false),
-    action("a-shop", "Navigate to products", "nav.products"), action("a-cart", "Navigate to cart", "nav.cart"),
-    action("a-tote", "Add Field Tote", "product.add:widget"), action("a-notebook", "Add Trail Notebook", "product.add:badge"),
-    action("a-clear", "Clear cart", "cart.clear", false), action("a-checkout", "Checkout", "cart.checkout", false),
-  ];
-}
-
-function events(): AgentEvent[] {
-  const now = Date.now();
-  const rows: [string, EventKind, string][] = [
-    ["openai-operator/1.2", "handshake", "scopes=view+act"],
-    ["openai-operator/1.2", "page", "/"],
-    ["openai-operator/1.2", "page", "/products"],
-    ["openai-operator/1.2", "action", "product.add:widget"],
-    ["openai-operator/1.2", "action_blocked", "cart.checkout"],
-    ["claude-browser/0.9", "handshake", "scopes=view"],
-    ["claude-browser/0.9", "page", "/products/widget"],
-    ["claude-browser/0.9", "field_redacted", "/products/widget"],
-    ["claude-browser/0.9", "page_blocked", "/cart"],
-    ["scrapy-gpt/0.1", "handshake_denied", "agent blocked by owner"],
-    ["perplexity-agent/2.0", "handshake", "scopes=view"],
-    ["perplexity-agent/2.0", "page", "/"],
-  ];
-  return rows
-    .map(([agentId, kind, target], i) => ({
-      id: `ev-${i}`,
-      time: new Date(now - (rows.length - i) * 7 * 60_000).toISOString(),
-      agentId, kind, target, ...(kind === "field_redacted" ? { redactedFields: ["meta.price", "discount"] } : {}),
-    }))
-    .reverse();
-}
-
-function seed(): State {
-  return {
-    user: null,
-    activeSiteId: "site-1",
-    sites: [
-      {
-        id: "site-1", name: "Northline Goods", url: "https://northline.example", siteKey: randKey(),
-        welcome: "Welcome to Northline Goods. Thoughtful essentials for everyday adventures.",
-        blockedAgents: "scrapy-gpt/0.1", endpoints: endpoints(), events: events(),
-      },
-    ],
-  };
-}
-
-let state: State | null = null;
 const listeners = new Set<() => void>();
-const SERVER: State = seed();
+let state: State = { user: null, activeSiteId: "", sites: [], ready: false };
+let bootPromise: Promise<void> | null = null;
 
-function load(): State {
-  if (state) return state;
-  if (typeof window === "undefined") return SERVER;
-  try {
-    const raw = localStorage.getItem(KEY);
-    const saved = raw ? (JSON.parse(raw) as State) : null;
-    // Upgrade old demo data while preserving the signed-in owner.
-    state = saved?.sites[0]?.endpoints[0]?.responseFields ? saved : { ...seed(), user: saved?.user ?? null };
-  } catch {
-    state = seed();
-  }
-  return state;
-}
-
-function set(updater: (s: State) => State) {
-  state = updater(load());
-  localStorage.setItem(KEY, JSON.stringify(state));
+function emit() {
   listeners.forEach((l) => l());
 }
 
+function mapEndpoint(raw: any): Endpoint {
+  return {
+    id: raw.id,
+    label: raw.label,
+    kind: raw.kind === "action" ? "action" : raw.kind === "api" ? "api" : "page",
+    ref: raw.ref || raw.path || raw.action_id || raw.id,
+    agentAccess: !!raw.agent_access,
+    direction: raw.direction || (raw.kind === "action" ? "both" : "read"),
+    responseFields: (raw.response_fields || []).map((f: any) => ({
+      key: f.key,
+      label: f.label || f.key,
+      type: f.type || "string",
+      agentVisible: f.agent_visible !== false,
+    })),
+    requestFields: (raw.request_fields || []).map((f: any) => ({
+      key: f.key,
+      label: f.label || f.key,
+      agentAllowed: f.agent_allowed !== false,
+    })),
+    sampleResponse: (raw.sample_response || {}) as JsonValue,
+    sampleRequest: (raw.sample_request || {}) as JsonValue,
+  };
+}
+
+function mapEvent(raw: any): AgentEvent {
+  const kind = (raw.kind || "page") as EventKind;
+  return {
+    id: raw.id || crypto.randomUUID(),
+    time: raw.ts ? new Date(raw.ts * 1000).toISOString() : new Date().toISOString(),
+    agentId: raw.agent_id || "unknown",
+    kind,
+    target: raw.path || raw.action_id || raw.detail?.purpose || raw.detail?.reason || "—",
+    redactedFields: raw.detail?.redacted_fields,
+  };
+}
+
+function mapSite(raw: any): Site {
+  return {
+    id: raw.id,
+    name: raw.name,
+    url: raw.url || "",
+    siteKey: raw.site_key,
+    welcome: raw.agent_welcome || "",
+    blockedAgents: (raw.blocked_agents || []).join(", "),
+    blockAnonymousAgents: raw.block_anonymous_agents !== false,
+    requireHumanCaptcha: raw.require_human_captcha !== false,
+    endpoints: (raw.endpoints || []).map(mapEndpoint),
+    events: (raw.activity || []).map(mapEvent),
+  };
+}
+
+function replaceSite(site: Site) {
+  state = {
+    ...state,
+    sites: state.sites.some((s) => s.id === site.id)
+      ? state.sites.map((s) => (s.id === site.id ? site : s))
+      : [...state.sites, site],
+    activeSiteId: state.activeSiteId || site.id,
+  };
+  emit();
+}
+
+async function hydrateFromMe() {
+  const data = await api<{ user: { email: string }; sites: any[] }>("/api/auth/me");
+  const sites = (data.sites || []).map(mapSite);
+  state = {
+    user: { email: data.user.email },
+    sites,
+    activeSiteId: sites[0]?.id || "",
+    ready: true,
+  };
+  emit();
+}
+
+export async function bootstrap() {
+  if (bootPromise) return bootPromise;
+  bootPromise = (async () => {
+    if (!getToken()) {
+      state = { ...state, ready: true };
+      emit();
+      return;
+    }
+    try {
+      await hydrateFromMe();
+    } catch {
+      clearToken();
+      state = { user: null, activeSiteId: "", sites: [], ready: true };
+      emit();
+    }
+  })();
+  return bootPromise;
+}
+
+void bootstrap();
+
 export function useAurif<T>(select: (s: State) => T): T {
   return useSyncExternalStore(
-    (cb) => { listeners.add(cb); return () => listeners.delete(cb); },
-    () => select(load()),
-    () => select(SERVER),
+    (cb) => {
+      listeners.add(cb);
+      return () => listeners.delete(cb);
+    },
+    () => select(state),
+    () => select(state),
   );
 }
 
-export const getState = load;
+export const getState = () => state;
 
-const patchSite = (id: string, fn: (s: Site) => Site) =>
-  set((s) => ({ ...s, sites: s.sites.map((x) => (x.id === id ? fn(x) : x)) }));
-
-// API hook (auth): POST /api/auth/login
-export function login(email: string, password: string): string | null {
-  if (!email.includes("@") || password.length < 6) return "Enter a valid email and a password of 6+ characters.";
-  if (email === "owner@aurif.dev" && password !== "demo1234") return "Incorrect password.";
-  set((s) => ({ ...s, user: { email } }));
-  return null;
+export async function login(email: string, password: string): Promise<string | null> {
+  if (!email.includes("@") || password.length < 6) {
+    return "Enter a valid email and a password of 6+ characters.";
+  }
+  try {
+    const data = await api<{ token: string }>("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ email, password }),
+    });
+    setToken(data.token);
+    await hydrateFromMe();
+    return null;
+  } catch (e: any) {
+    return e.message || "Login failed";
+  }
 }
-// API hook (auth): POST /api/auth/signup
-export const signup = login;
-// API hook (auth): POST /api/auth/logout
-export const logout = () => set((s) => ({ ...s, user: null }));
 
-// API hook (sites): GET /api/sites
-export const setActiveSite = (id: string) => set((s) => ({ ...s, activeSiteId: id }));
-// API hook (sites): PATCH /api/sites/:id
-export const updateSite = (id: string, data: Partial<Pick<Site, "name" | "url" | "welcome" | "blockedAgents">>) =>
-  patchSite(id, (s) => ({ ...s, ...data }));
-// API hook (sites): POST /api/sites/:id/rotate-key
-export const rotateKey = (id: string) => patchSite(id, (s) => ({ ...s, siteKey: randKey() }));
+export async function signup(email: string, password: string): Promise<string | null> {
+  if (!email.includes("@") || password.length < 6) {
+    return "Enter a valid email and a password of 6+ characters.";
+  }
+  try {
+    const data = await api<{ token: string }>("/api/auth/signup", {
+      method: "POST",
+      body: JSON.stringify({ email, password, name: email.split("@")[0] }),
+    });
+    setToken(data.token);
+    // ensure at least one site
+    try {
+      await api("/api/sites", {
+        method: "POST",
+        body: JSON.stringify({ name: "My website", url: "http://127.0.0.1:5173" }),
+      });
+    } catch {
+      /* demo-shop may already exist for seeded owner only */
+    }
+    await hydrateFromMe();
+    return null;
+  } catch (e: any) {
+    return e.message || "Signup failed";
+  }
+}
 
-// API hook (endpoints): PATCH /api/sites/:id/endpoints/:endpointId { agent_access }
-export const toggleEndpoint = (siteId: string, endpointId: string, on: boolean) =>
-  patchSite(siteId, (s) => ({
-    ...s,
-    endpoints: s.endpoints.map((e) => (e.id === endpointId ? { ...e, agentAccess: on } : e)),
-  }));
+export async function logout() {
+  try {
+    await api("/api/auth/logout", { method: "POST" });
+  } catch {
+    /* ignore */
+  }
+  clearToken();
+  state = { user: null, activeSiteId: "", sites: [], ready: true };
+  emit();
+}
 
-// TODO API: PUT /api/sites/:id/endpoints/:endpointId/fields
-export const updateResponseFields = (siteId: string, endpointId: string, update: (fields: ResponseField[]) => ResponseField[]) =>
-  patchSite(siteId, (s) => ({ ...s, endpoints: s.endpoints.map((e) => e.id === endpointId ? { ...e, responseFields: update(e.responseFields) } : e) }));
-export const updateRequestField = (siteId: string, endpointId: string, key: string, agentAllowed: boolean) =>
-  patchSite(siteId, (s) => ({ ...s, endpoints: s.endpoints.map((e) => e.id === endpointId ? { ...e, requestFields: e.requestFields.map((f) => f.key === key ? { ...f, agentAllowed } : f) } : e) }));
+export const setActiveSite = (id: string) => {
+  state = { ...state, activeSiteId: id };
+  emit();
+};
 
-// API hook (activity): POST (written server-side by the Aurif edge when agents call AI endpoints)
-export const logEvent = (siteId: string, ev: Omit<AgentEvent, "id" | "time">) =>
-  patchSite(siteId, (s) => ({
-    ...s,
-    events: [{ ...ev, id: crypto.randomUUID(), time: new Date().toISOString() }, ...s.events],
-  }));
+export async function updateSite(
+  id: string,
+  data: Partial<
+    Pick<Site, "name" | "url" | "welcome" | "blockedAgents" | "blockAnonymousAgents" | "requireHumanCaptcha">
+  >,
+) {
+  const body: Record<string, unknown> = {};
+  if (data.name !== undefined) body.name = data.name;
+  if (data.url !== undefined) body.url = data.url;
+  if (data.welcome !== undefined) body.agent_welcome = data.welcome;
+  if (data.blockAnonymousAgents !== undefined) {
+    body.block_anonymous_agents = data.blockAnonymousAgents;
+  }
+  if (data.requireHumanCaptcha !== undefined) {
+    body.require_human_captcha = data.requireHumanCaptcha;
+  }
+  if (data.blockedAgents !== undefined) {
+    body.blocked_agents = data.blockedAgents
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  const res = await api<{ site: any }>(`/api/sites/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+  const current = state.sites.find((s) => s.id === id);
+  replaceSite({ ...mapSite(res.site), events: current?.events || [] });
+}
+
+export async function rotateKey(id: string) {
+  const res = await api<{ site: any }>(`/api/sites/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ rotate_site_key: true }),
+  });
+  const current = state.sites.find((s) => s.id === id);
+  replaceSite({ ...mapSite(res.site), events: current?.events || [] });
+}
+
+export async function toggleEndpoint(siteId: string, endpointId: string, on: boolean) {
+  // optimistic
+  const site = state.sites.find((s) => s.id === siteId);
+  if (site) {
+    replaceSite({
+      ...site,
+      endpoints: site.endpoints.map((e) => (e.id === endpointId ? { ...e, agentAccess: on } : e)),
+    });
+  }
+  const res = await api<{ site: any }>(`/api/sites/${siteId}/endpoints/${encodeURIComponent(endpointId)}`, {
+    method: "PUT",
+    body: JSON.stringify({ agent_access: on }),
+  });
+  const current = state.sites.find((s) => s.id === siteId);
+  replaceSite({ ...mapSite(res.site), events: current?.events || [] });
+}
+
+export async function updateResponseFields(
+  siteId: string,
+  endpointId: string,
+  update: (fields: ResponseField[]) => ResponseField[],
+) {
+  const site = state.sites.find((s) => s.id === siteId);
+  if (!site) return;
+  const ep = site.endpoints.find((e) => e.id === endpointId);
+  if (!ep) return;
+  const next = update(ep.responseFields);
+  replaceSite({
+    ...site,
+    endpoints: site.endpoints.map((e) => (e.id === endpointId ? { ...e, responseFields: next } : e)),
+  });
+  const res = await api<{ site: any }>(`/api/sites/${siteId}/endpoints/${encodeURIComponent(endpointId)}`, {
+    method: "PUT",
+    body: JSON.stringify({
+      response_fields: next.map((f) => ({ key: f.key, agent_visible: f.agentVisible })),
+    }),
+  });
+  const current = state.sites.find((s) => s.id === siteId);
+  replaceSite({ ...mapSite(res.site), events: current?.events || [] });
+}
+
+export async function updateRequestField(
+  siteId: string,
+  endpointId: string,
+  key: string,
+  agentAllowed: boolean,
+) {
+  const site = state.sites.find((s) => s.id === siteId);
+  if (!site) return;
+  const ep = site.endpoints.find((e) => e.id === endpointId);
+  if (!ep) return;
+  const next = ep.requestFields.map((f) => (f.key === key ? { ...f, agentAllowed } : f));
+  replaceSite({
+    ...site,
+    endpoints: site.endpoints.map((e) => (e.id === endpointId ? { ...e, requestFields: next } : e)),
+  });
+  const res = await api<{ site: any }>(`/api/sites/${siteId}/endpoints/${encodeURIComponent(endpointId)}`, {
+    method: "PUT",
+    body: JSON.stringify({
+      request_fields: next.map((f) => ({ key: f.key, agent_allowed: f.agentAllowed })),
+    }),
+  });
+  const current = state.sites.find((s) => s.id === siteId);
+  replaceSite({ ...mapSite(res.site), events: current?.events || [] });
+}
+
+export async function refreshActivity(siteId: string) {
+  const data = await api<{ events: any[] }>(`/api/sites/${siteId}/activity`);
+  const site = state.sites.find((s) => s.id === siteId);
+  if (!site) return;
+  replaceSite({ ...site, events: (data.events || []).map(mapEvent) });
+}
+
+/** Local-only console helper (real agent traffic is logged server-side). */
+export const logEvent = (siteId: string, ev: Omit<AgentEvent, "id" | "time">) => {
+  const site = state.sites.find((s) => s.id === siteId);
+  if (!site) return;
+  replaceSite({
+    ...site,
+    events: [{ ...ev, id: crypto.randomUUID(), time: new Date().toISOString() }, ...site.events],
+  });
+};
 
 export const useActiveSite = () =>
   useAurif((s) => (s.sites.find((x) => x.id === s.activeSiteId) ?? s.sites[0]) as Site);
