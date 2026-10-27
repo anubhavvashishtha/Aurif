@@ -59,7 +59,7 @@ type CatalogData = {
   products: Product[];
 };
 
-const data = catalogData as CatalogData;
+const data = catalogData as unknown as CatalogData;
 export const categories = data.categories;
 export const storyImage = story;
 export const products: Product[] = data.products.map((product) => ({
