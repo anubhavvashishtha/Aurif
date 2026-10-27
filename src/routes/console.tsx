@@ -7,6 +7,7 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { CUSTOMER_SITE_URL, Panel, SiteSwitcher, Topbar } from "@/components/aurif/ui";
 import { getState, logEvent, useActiveSite } from "@/lib/aurif-store";
+import { agentResponse } from "@/lib/aurif-fields";
 
 export const Route = createFileRoute("/console")({
   head: () => ({
@@ -56,11 +57,13 @@ function Console() {
         logEvent(site.id, { agentId, kind: "page_blocked", target: path });
         return push(`GET /aurif/page?path=${path} → 403`, { error: "agent_access_off" });
       }
-      logEvent(site.id, { agentId, kind: "page", target: path });
-      push(`GET /aurif/page?path=${path} → 200`, { title: ep.label, summary: site.welcome, path });
+      const raw = { ...(ep.sampleResponse as object), summary: site.welcome };
+      const hidden = ep.responseFields.filter((f) => !f.agentVisible).map((f) => f.key);
+      logEvent(site.id, hidden.length ? { agentId, kind: "field_redacted", target: path, redactedFields: hidden } : { agentId, kind: "page", target: path });
+      push(`GET /aurif/page?path=${path} → 200`, agentResponse(ep, raw).body);
     },
     action: () => {
-      const ep = site.endpoints.find((e) => e.ref === "cart.add.field_tote")!;
+      const ep = site.endpoints.find((e) => e.ref === "product.add:widget")!;
       if (scopes !== "view+act" || !ep.agentAccess) {
         logEvent(site.id, { agentId, kind: "action_blocked", target: ep.ref });
         return push(`POST /aurif/action ${ep.ref} → 403`, { error: scopes !== "view+act" ? "scope_missing" : "agent_access_off" });

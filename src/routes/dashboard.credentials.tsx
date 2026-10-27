@@ -11,8 +11,9 @@ import {
 } from "@/components/ui/alert-dialog";
 import { PageHeader, Panel } from "@/components/aurif/ui";
 import { rotateKey, updateSite, useActiveSite } from "@/lib/aurif-store";
+import { aurifHead } from "@/lib/aurif-meta";
 
-export const Route = createFileRoute("/dashboard/credentials")({ component: Credentials });
+export const Route = createFileRoute("/dashboard/credentials")({ head: () => aurifHead("Site credentials", "Manage site details, welcome message, blocked agents and site key."), component: Credentials });
 
 function Credentials() {
   const site = useActiveSite();

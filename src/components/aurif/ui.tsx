@@ -7,7 +7,7 @@ import { Switch } from "@/components/ui/switch";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { isBlockedKind, logout, setActiveSite, useAurif, type EventKind } from "@/lib/aurif-store";
 
-export const CUSTOMER_SITE_URL = "https://fieldhouse.shop";
+export const CUSTOMER_SITE_URL = "https://northline.example";
 
 export function Brand({ className }: { className?: string }) {
   return (

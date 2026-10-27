@@ -4,8 +4,9 @@ import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { DataTable, EventBadge, PageHeader, Panel } from "@/components/aurif/ui";
 import { isBlockedKind, useActiveSite, type AgentEvent } from "@/lib/aurif-store";
+import { aurifHead } from "@/lib/aurif-meta";
 
-export const Route = createFileRoute("/dashboard/activity")({ component: Activity });
+export const Route = createFileRoute("/dashboard/activity")({ head: () => aurifHead("Agent activity", "Audit every agent handshake, read, action, block and redaction."), component: Activity });
 
 function Activity() {
   const site = useActiveSite();
@@ -33,7 +34,7 @@ function Activity() {
             { header: "Time", cell: (r) => <span className="whitespace-nowrap font-mono text-xs text-muted-foreground">{new Date(r.time).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span> },
             { header: "Agent ID", cell: (r) => <span className="font-mono text-xs">{r.agentId}</span> },
             { header: "Event", cell: (r) => <EventBadge kind={r.kind} /> },
-            { header: "URL / action_id", cell: (r) => <span className="font-mono text-xs text-muted-foreground">{r.target}</span> },
+            { header: "URL / action_id", cell: (r) => <span className="font-mono text-xs text-muted-foreground">{r.target}{r.redactedFields?.length ? <span className="ml-2 rounded-full bg-accent px-2 py-0.5 text-accent-foreground">redacted: {r.redactedFields.join(", ")}</span> : null}</span> },
           ]}
         />
       </Panel>
