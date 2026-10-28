@@ -35,7 +35,9 @@ export function Header() {
   return (
     <header className="sticky top-0 z-40 border-b border-border bg-background/95 backdrop-blur">
       <div className="bg-ink py-1.5 text-center text-xs tracking-wide text-ink-foreground">
-        Free shipping over $100 · Free returns within 30 days
+        <span className="font-mono uppercase tracking-[0.16em]">Protected by Aurif</span>
+        <span className="mx-2 opacity-40">·</span>
+        Humans draw to enter · Agents use the Aurif protocol
       </div>
       <div className="mx-auto flex h-16 max-w-7xl items-center gap-6 px-4 md:px-8">
         <Button variant="ghost" size="icon" className="md:hidden" aria-expanded={open} aria-label="Menu" onClick={() => setOpen((o) => !o)}>

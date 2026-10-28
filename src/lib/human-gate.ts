@@ -4,6 +4,9 @@ const TOKEN_KEY = "aurif_human_token";
 export type Challenge = {
   required: boolean;
   challenge_id?: string;
+  type?: string;
+  kind?: string;
+  target?: string;
   prompt?: string;
   hint?: string;
 };
@@ -34,19 +37,26 @@ export async function fetchChallenge(): Promise<Challenge> {
   return res.json();
 }
 
-export async function verifyHuman(challengeId: string, answer: string) {
+export async function verifyHumanDrawing(challengeId: string, imageDataUrl: string) {
   const res = await fetch(`${API_BASE}/api/public/human-verify`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     credentials: "include",
-    body: JSON.stringify({ challenge_id: challengeId, answer }),
+    body: JSON.stringify({ challenge_id: challengeId, image: imageDataUrl }),
   });
   const data = await res.json();
   if (!res.ok || !data.ok) {
-    throw new Error(data.error || "Verification failed");
+    const detail = data.verdict?.read_as ? ` (read as “${data.verdict.read_as}”)` : "";
+    throw new Error((data.error || "Verification failed") + detail);
   }
   setHumanToken(data.human_token);
   return data;
+}
+
+/** @deprecated math CAPTCHA removed — use verifyHumanDrawing */
+export async function verifyHuman(challengeId: string, answer: string) {
+  void answer;
+  throw new Error("Use drawing verification");
 }
 
 export async function checkHuman(): Promise<boolean> {
