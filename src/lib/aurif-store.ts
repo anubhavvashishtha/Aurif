@@ -97,7 +97,13 @@ function mapEvent(raw: any): AgentEvent {
     time: raw.ts ? new Date(raw.ts * 1000).toISOString() : new Date().toISOString(),
     agentId: raw.agent_id || "unknown",
     kind,
-    target: raw.path || raw.action_id || raw.detail?.purpose || raw.detail?.reason || "—",
+    target:
+      raw.path ||
+      raw.action_id ||
+      (raw.detail?.purpose_risk
+        ? `risk:${raw.detail.purpose_risk.risk} — ${raw.detail.purpose || raw.detail.reason || ""}`
+        : raw.detail?.purpose || raw.detail?.reason) ||
+      "—",
     redactedFields: raw.detail?.redacted_fields,
   };
 }
@@ -343,6 +349,64 @@ export async function refreshActivity(siteId: string) {
   const site = state.sites.find((s) => s.id === siteId);
   if (!site) return;
   replaceSite({ ...site, events: (data.events || []).map(mapEvent) });
+}
+
+export async function proposePolicy(siteId: string, instruction: string) {
+  return api<{
+    ok: boolean;
+    proposal: {
+      summary: string;
+      patches: Array<Record<string, unknown>>;
+      blocked_agents_add?: string[];
+    };
+    model: string;
+  }>(`/api/sites/${siteId}/ai/policy-propose`, {
+    method: "POST",
+    body: JSON.stringify({ instruction }),
+  });
+}
+
+export async function applyPolicy(
+  siteId: string,
+  patches: Array<Record<string, unknown>>,
+  blockedAgentsAdd: string[] = [],
+) {
+  const res = await api<{ site: any }>(`/api/sites/${siteId}/ai/policy-apply`, {
+    method: "POST",
+    body: JSON.stringify({ patches, blocked_agents_add: blockedAgentsAdd }),
+  });
+  const current = state.sites.find((s) => s.id === siteId);
+  replaceSite({ ...mapSite(res.site), events: current?.events || [] });
+}
+
+export async function summarizeActivity(siteId: string) {
+  return api<{
+    ok: boolean;
+    summary: {
+      summary: string;
+      risks: string[];
+      suggested_blocked_agents: string[];
+    };
+    model: string;
+  }>(`/api/sites/${siteId}/ai/activity-summary`, { method: "POST", body: "{}" });
+}
+
+export async function runMuseAgent(body: {
+  goal: string;
+  purpose?: string;
+  agent_id?: string;
+  site_key?: string;
+  requested_scopes?: string[];
+  max_steps?: number;
+}) {
+  return api<{
+    ok: boolean;
+    goal: string;
+    granted_scopes: string[];
+    purpose_risk?: Record<string, unknown>;
+    steps: Array<Record<string, unknown>>;
+    model: string;
+  }>("/api/ai/agent-run", { method: "POST", body: JSON.stringify(body) });
 }
 
 /** Local-only console helper (real agent traffic is logged server-side). */

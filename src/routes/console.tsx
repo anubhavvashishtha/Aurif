@@ -1,5 +1,5 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { ArrowLeft, ExternalLink, Info } from "lucide-react";
+import { ArrowLeft, ExternalLink, Info, Sparkles } from "lucide-react";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -7,7 +7,7 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { CUSTOMER_SITE_URL, Panel, SiteSwitcher, Topbar } from "@/components/aurif/ui";
 import { API_BASE } from "@/lib/api";
-import { refreshActivity, useActiveSite } from "@/lib/aurif-store";
+import { refreshActivity, runMuseAgent, useActiveSite } from "@/lib/aurif-store";
 
 export const Route = createFileRoute("/console")({
   head: () => ({
@@ -27,9 +27,11 @@ function Console() {
   const [agentId, setAgentId] = useState("third-party-agent");
   const [scopes, setScopes] = useState("view+act");
   const [purpose, setPurpose] = useState("Help user browse Northline and add one item");
+  const [goal, setGoal] = useState("Add the Field Tote to the cart if stock allows");
   const [key, setKey] = useState("");
   const [path, setPath] = useState("/products/field-tote");
   const [session, setSession] = useState("");
+  const [busy, setBusy] = useState(false);
   const [log, setLog] = useState<string[]>([]);
 
   const push = (label: string, body: unknown) =>
@@ -86,6 +88,26 @@ function Console() {
       const { res, data } = await agentFetch("/ai/audit");
       push(`GET /ai/audit → ${res.status}`, data);
     },
+    muse: async () => {
+      setBusy(true);
+      try {
+        const requested = scopes.split("+").map((s) => s.trim()).filter(Boolean);
+        const data = await runMuseAgent({
+          goal,
+          purpose,
+          agent_id: agentId || "aurif-muse-agent",
+          site_key: key || undefined,
+          requested_scopes: requested,
+          max_steps: 8,
+        });
+        push(`POST /api/ai/agent-run (${data.model})`, data);
+        await refreshActivity(site.id).catch(() => undefined);
+      } catch (e) {
+        push("agent-run error", { error: e instanceof Error ? e.message : String(e) });
+      } finally {
+        setBusy(false);
+      }
+    },
   };
 
   return (
@@ -108,10 +130,11 @@ function Console() {
           </Button>
         </div>
 
-        <Panel className="flex gap-3 border-accent/30 bg-accent-soft/40 p-4 text-sm">
+        <Panel className="flex gap-3 border-ink/15 bg-frost p-4 text-sm">
           <Info className="mt-0.5 size-4 shrink-0 text-accent" />
           <p>
             Aurif product tool — talks only to AI endpoints on <code className="font-mono text-xs">{API_BASE}</code>.
+            Muse runs the Aurif protocol loop (discover → handshake with purpose risk → page → actions).
             No vision / mouse clicking on the customer UI.
           </p>
         </Panel>
@@ -135,8 +158,12 @@ function Console() {
               </Select>
             </div>
             <div className="space-y-1.5">
-              <Label>Purpose</Label>
+              <Label>Purpose (handshake risk scored by Muse)</Label>
               <Input value={purpose} onChange={(e) => setPurpose(e.target.value)} />
+            </div>
+            <div className="space-y-1.5">
+              <Label>Muse goal</Label>
+              <Input value={goal} onChange={(e) => setGoal(e.target.value)} />
             </div>
             <div className="space-y-1.5">
               <Label>Site key (optional)</Label>
@@ -147,8 +174,15 @@ function Console() {
               <Input className="font-mono text-xs" value={path} onChange={(e) => setPath(e.target.value)} />
             </div>
             <div className="flex flex-wrap gap-2">
-              <Button onClick={() => void run.discover()}>Discover</Button>
-              <Button onClick={() => void run.handshake()}>Handshake</Button>
+              <Button disabled={busy} onClick={() => void run.muse()}>
+                <Sparkles /> {busy ? "Muse running…" : "Run Muse agent"}
+              </Button>
+              <Button variant="outline" onClick={() => void run.discover()}>
+                Discover
+              </Button>
+              <Button variant="outline" onClick={() => void run.handshake()}>
+                Handshake
+              </Button>
               <Button variant="outline" onClick={() => void run.page()}>
                 Get page
               </Button>

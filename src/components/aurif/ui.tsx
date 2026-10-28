@@ -11,8 +11,8 @@ export const CUSTOMER_SITE_URL = import.meta.env.VITE_CUSTOMER_SITE_URL ?? "http
 
 export function Brand({ className }: { className?: string }) {
   return (
-    <span className={cn("inline-flex items-center gap-2 font-serif text-xl font-semibold tracking-tight text-ink", className)}>
-      <span className="grid h-7 w-7 place-items-center rounded-md bg-ink font-serif text-sm text-ink-foreground">A</span>
+    <span className={cn("inline-flex items-center gap-2 font-mono text-sm font-medium uppercase tracking-[0.18em] text-ink", className)}>
+      <span className="grid h-7 w-7 place-items-center border border-ink bg-ink font-mono text-[11px] text-ink-foreground">A</span>
       Aurif
     </span>
   );
@@ -22,10 +22,10 @@ export function Topbar({ label = "Dashboard" }: { label?: string }) {
   const email = useAurif((s) => s.user?.email);
   const navigate = useNavigate();
   return (
-    <header className="sticky top-0 z-20 border-b bg-background/85 backdrop-blur">
+    <header className="sticky top-0 z-20 border-b border-ink/80 bg-frost">
       <div className="mx-auto flex h-14 max-w-7xl items-center gap-4 px-4 md:px-6">
         <Link to="/dashboard"><Brand /></Link>
-        <span className="hidden text-sm text-muted-foreground sm:inline">/ {label}</span>
+        <span className="hidden font-mono text-[11px] uppercase tracking-widest text-muted-foreground sm:inline">// {label}</span>
         <div className="ml-auto flex items-center gap-1 sm:gap-2">
           <Button variant="ghost" size="sm" asChild>
             <a href={CUSTOMER_SITE_URL} target="_blank" rel="noreferrer">
@@ -79,9 +79,9 @@ export function SiteSwitcher() {
 export function SideNav() {
   return (
     <aside className="md:w-56 md:shrink-0">
-      <div className="space-y-4 md:sticky md:top-20">
+      <div className="space-y-4 rounded-sm border border-ink/15 bg-frost p-3 md:sticky md:top-20">
         <div>
-          <p className="mb-1.5 text-xs font-medium uppercase tracking-wider text-muted-foreground">Site</p>
+          <p className="mb-1.5 font-mono text-[10px] font-medium uppercase tracking-[0.2em] text-muted-foreground">Active site</p>
           <SiteSwitcher />
         </div>
         <nav className="flex gap-1 overflow-x-auto md:flex-col">
@@ -90,7 +90,7 @@ export function SideNav() {
               key={to}
               to={to}
               activeOptions={{ exact: true }}
-              className="flex items-center gap-2.5 whitespace-nowrap rounded-md px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground data-[status=active]:bg-accent data-[status=active]:font-medium data-[status=active]:text-accent-foreground"
+              className="flex items-center gap-2.5 whitespace-nowrap border border-transparent px-3 py-2 font-mono text-xs uppercase tracking-wider text-muted-foreground transition-colors hover:border-border hover:bg-secondary hover:text-foreground data-[status=active]:border-ink data-[status=active]:bg-ink data-[status=active]:font-medium data-[status=active]:text-ink-foreground"
             >
               <Icon className="h-4 w-4" /> {label}
             </Link>
@@ -103,9 +103,9 @@ export function SideNav() {
 
 export function PageHeader({ title, description, action }: { title: string; description?: ReactNode; action?: ReactNode }) {
   return (
-    <div className="mb-6 flex flex-wrap items-end justify-between gap-4">
+    <div className="mb-6 flex flex-wrap items-end justify-between gap-4 rounded-sm border border-ink/15 bg-frost px-4 py-3">
       <div>
-        <h1 className="text-3xl font-medium text-ink">{title}</h1>
+        <h1 className="font-mono text-2xl font-medium uppercase tracking-tight text-ink">{title}</h1>
         {description && <p className="mt-1.5 max-w-2xl text-sm text-muted-foreground">{description}</p>}
       </div>
       {action}
@@ -114,14 +114,14 @@ export function PageHeader({ title, description, action }: { title: string; desc
 }
 
 export function Panel({ children, className }: { children: ReactNode; className?: string }) {
-  return <div className={cn("rounded-xl border bg-card shadow-soft", className)}>{children}</div>;
+  return <div className={cn("rounded-sm border border-ink/20 bg-card shadow-soft", className)}>{children}</div>;
 }
 
 export function Stat({ label, value, hint, tone }: { label: string; value: ReactNode; hint?: string; tone?: "danger" }) {
   return (
     <div className="px-5 py-4">
       <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">{label}</p>
-      <p className={cn("mt-2 font-serif text-3xl text-ink", tone === "danger" && "text-destructive")}>{value}</p>
+      <p className={cn("mt-2 font-mono text-3xl text-ink", tone === "danger" && "text-destructive")}>{value}</p>
       {hint && <p className="mt-1 text-xs text-muted-foreground">{hint}</p>}
     </div>
   );
@@ -134,7 +134,7 @@ export function Badge({ children, tone = "neutral" }: { children: ReactNode; ton
     danger: "bg-danger-soft text-destructive",
     muted: "bg-muted text-muted-foreground",
   };
-  return <span className={cn("inline-flex items-center rounded-full px-2 py-0.5 font-mono text-[11px]", tones[tone])}>{children}</span>;
+  return <span className={cn("inline-flex items-center rounded-sm border border-current/15 px-2 py-0.5 font-mono text-[11px] uppercase tracking-wider", tones[tone])}>{children}</span>;
 }
 
 export function EventBadge({ kind }: { kind: EventKind }) {
@@ -189,21 +189,25 @@ export function ToggleRow({ label, kind, refId, checked, onChange }: {
 
 export function AuthCard({ title, subtitle, children, footer }: { title: string; subtitle: string; children: ReactNode; footer: ReactNode }) {
   return (
-    <div className="grid min-h-screen bg-background bg-wash lg:grid-cols-2">
-      <div className="hidden flex-col justify-between p-12 lg:flex">
-        <Brand className="text-2xl" />
-        <div className="animate-rise max-w-md">
-          <h2 className="font-serif text-5xl leading-[1.05] text-ink">Decide what AI agents can see on your site.</h2>
-          <p className="mt-5 text-muted-foreground">
-            Aurif is a permission layer for AI traffic. Share pages and actions with agents the way you share a document — and see every read.
+    <div className="grid min-h-screen bg-background lg:grid-cols-2">
+      <div className="relative hidden flex-col justify-between overflow-hidden bg-ink p-12 text-ink-foreground lg:flex">
+        <div className="pointer-events-none absolute inset-0 bg-wash-ink" aria-hidden />
+        <Brand className="relative text-ink-foreground [&_span]:border-ink-foreground [&_span]:bg-ink-foreground [&_span]:text-ink" />
+        <div className="animate-rise relative max-w-md bg-frost-ink px-6 py-7">
+          <p className="font-mono text-[11px] uppercase tracking-[0.28em] text-ink-foreground/70">Permissioned agent runtime</p>
+          <h2 className="mt-4 font-mono text-4xl leading-[1.1] text-ink-foreground">Decide what AI agents can see on your site.</h2>
+          <p className="mt-5 text-sm leading-relaxed text-ink-foreground/80">
+            Aurif is a control layer for AI traffic. Handshake, scoped JSON, redaction, audit — not a storefront chatbot.
           </p>
         </div>
-        <p className="font-mono text-xs text-muted-foreground">agent → handshake → scoped access → audit</p>
+        <p className="relative inline-flex w-fit bg-frost-ink px-3 py-2 font-mono text-xs tracking-wide text-ink-foreground/80">
+          agent → handshake → scoped access → audit
+        </p>
       </div>
-      <div className="flex items-center justify-center p-6">
-        <div className="animate-rise w-full max-w-sm">
+      <div className="flex items-center justify-center bg-background bg-wash p-6">
+        <div className="animate-rise w-full max-w-sm border border-ink/15 bg-frost px-6 py-8">
           <Brand className="mb-8 text-2xl lg:hidden" />
-          <h1 className="text-3xl text-ink">{title}</h1>
+          <h1 className="font-mono text-3xl text-ink">{title}</h1>
           <p className="mt-1.5 text-sm text-muted-foreground">{subtitle}</p>
           <div className="mt-8">{children}</div>
           <div className="mt-6 text-sm text-muted-foreground">{footer}</div>

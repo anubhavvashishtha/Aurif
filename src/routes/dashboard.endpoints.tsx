@@ -1,14 +1,24 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { SlidersHorizontal } from "lucide-react";
+import { SlidersHorizontal, Sparkles } from "lucide-react";
 import { useState } from "react";
 import { Badge, PageHeader, Panel } from "@/components/aurif/ui";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { agentResponse, filterRequest } from "@/lib/aurif-fields";
 import { aurifHead } from "@/lib/aurif-meta";
-import { toggleEndpoint, updateRequestField, updateResponseFields, useActiveSite, type Endpoint } from "@/lib/aurif-store";
+import {
+  applyPolicy,
+  proposePolicy,
+  toggleEndpoint,
+  updateRequestField,
+  updateResponseFields,
+  useActiveSite,
+  type Endpoint,
+} from "@/lib/aurif-store";
 
 export const Route = createFileRoute("/dashboard/endpoints")({
   head: () => aurifHead("Endpoint control", "Allow AI endpoints and choose which JSON fields agents receive."),
@@ -17,6 +27,77 @@ export const Route = createFileRoute("/dashboard/endpoints")({
 
 const DIRECTION = { read: "Returns JSON", write: "Accepts JSON", both: "Both" };
 
+function PolicyCopilot({ siteId }: { siteId: string }) {
+  const [instruction, setInstruction] = useState("Hide prices from agents and disable checkout");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [proposal, setProposal] = useState<{
+    summary: string;
+    patches: Array<Record<string, unknown>>;
+    blocked_agents_add?: string[];
+    model?: string;
+  } | null>(null);
+
+  const run = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const res = await proposePolicy(siteId, instruction);
+      setProposal({ ...res.proposal, model: res.model });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Propose failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const apply = async () => {
+    if (!proposal) return;
+    setBusy(true);
+    setError("");
+    try {
+      await applyPolicy(siteId, proposal.patches, proposal.blocked_agents_add || []);
+      setProposal(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Apply failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Panel className="mb-6 space-y-3 border-ink/15 bg-frost p-5">
+      <div className="flex items-center gap-2">
+        <Sparkles className="size-4 text-accent" />
+        <h2 className="text-lg text-ink">Muse policy co-pilot</h2>
+      </div>
+      <p className="text-sm text-muted-foreground">
+        Describe policy in plain English. Muse Spark Open proposes endpoint patches — you confirm before apply.
+      </p>
+      <div className="space-y-1.5">
+        <Label>Instruction</Label>
+        <Input value={instruction} onChange={(e) => setInstruction(e.target.value)} />
+      </div>
+      <div className="flex flex-wrap gap-2">
+        <Button disabled={busy || !instruction.trim()} onClick={() => void run()}>
+          {busy ? "Thinking…" : "Propose with Muse"}
+        </Button>
+        {proposal && (
+          <Button variant="outline" disabled={busy} onClick={() => void apply()}>
+            Apply proposal
+          </Button>
+        )}
+      </div>
+      {error && <p className="text-sm text-destructive">{error}</p>}
+      {proposal && (
+        <pre className="max-h-64 overflow-auto rounded-lg bg-ink p-4 font-mono text-xs text-ink-foreground">
+          {JSON.stringify(proposal, null, 2)}
+        </pre>
+      )}
+    </Panel>
+  );
+}
+
 function Endpoints() {
   const site = useActiveSite();
   const [openId, setOpenId] = useState<string | null>(null);
@@ -24,9 +105,10 @@ function Endpoints() {
   return (
     <>
       <PageHeader title="Endpoint control" description="Agents can use the endpoint, but only the fields you allow. Turning an endpoint off blocks agents with 403." />
+      <PolicyCopilot siteId={site.id} />
       {["page", "action"].map((kind) => (
         <section key={kind} className="mb-6">
-          <h2 className="mb-2 text-lg capitalize text-ink">{kind}s</h2>
+          <h2 className="mb-2 inline-block rounded-sm border border-ink/15 bg-frost px-2 py-0.5 font-mono text-sm uppercase tracking-wider text-ink">{kind}s</h2>
           <Panel className="divide-y">
             {site.endpoints.filter((e) => e.kind === kind).map((e) => {
               const hidden = e.responseFields.filter((f) => !f.agentVisible).length;
@@ -55,7 +137,7 @@ function FieldDrawer({ siteId, endpoint: e }: { siteId: string; endpoint: Endpoi
   return (
     <div className="space-y-5">
       <SheetHeader className="pr-8">
-        <div className="flex items-center justify-between gap-4"><SheetTitle className="font-serif text-2xl text-ink">{e.label}</SheetTitle><Switch checked={e.agentAccess} onCheckedChange={(v) => toggleEndpoint(siteId, e.id, v)} aria-label="Agent access" /></div>
+        <div className="flex items-center justify-between gap-4"><SheetTitle className="font-mono text-xl uppercase tracking-tight text-ink">{e.label}</SheetTitle><Switch checked={e.agentAccess} onCheckedChange={(v) => toggleEndpoint(siteId, e.id, v)} aria-label="Agent access" /></div>
         <SheetDescription>If access is on but price is hidden, agents still get JSON — without the price field.</SheetDescription>
       </SheetHeader>
       <Tabs defaultValue={e.direction === "write" ? "request" : "response"}>

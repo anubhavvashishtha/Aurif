@@ -73,7 +73,7 @@ function Credentials() {
           <div>
             <Label>Require human CAPTCHA on storefront</Label>
             <p className="mt-1 text-xs text-muted-foreground">
-              Humans solve a challenge before shopping. Agents are told to use Aurif endpoints instead.
+              Humans draw letters/numbers on a pad (vision-checked). Agents use Aurif endpoints instead.
             </p>
           </div>
           <Switch
