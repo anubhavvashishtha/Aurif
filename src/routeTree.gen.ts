@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ConsoleRouteImport } from './routes/console'
 import { Route as DashboardRouteImport } from './routes/dashboard'
+import { Route as GateRouteImport } from './routes/gate'
 import { Route as SignupRouteImport } from './routes/signup'
 import { Route as DashboardIndexRouteImport } from './routes/dashboard.index'
 import { Route as DashboardActivityRouteImport } from './routes/dashboard.activity'
@@ -31,6 +32,11 @@ const ConsoleRoute = ConsoleRouteImport.update({
 const DashboardRoute = DashboardRouteImport.update({
   id: '/dashboard',
   path: '/dashboard',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const GateRoute = GateRouteImport.update({
+  id: '/gate',
+  path: '/gate',
   getParentRoute: () => rootRouteImport,
 } as any)
 const SignupRoute = SignupRouteImport.update({
@@ -63,6 +69,7 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/console': typeof ConsoleRoute
   '/dashboard': typeof DashboardRouteWithChildren
+  '/gate': typeof GateRoute
   '/signup': typeof SignupRoute
   '/dashboard/activity': typeof DashboardActivityRoute
   '/dashboard/credentials': typeof DashboardCredentialsRoute
@@ -72,6 +79,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/console': typeof ConsoleRoute
+  '/gate': typeof GateRoute
   '/signup': typeof SignupRoute
   '/dashboard/activity': typeof DashboardActivityRoute
   '/dashboard/credentials': typeof DashboardCredentialsRoute
@@ -83,6 +91,7 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/console': typeof ConsoleRoute
   '/dashboard': typeof DashboardRouteWithChildren
+  '/gate': typeof GateRoute
   '/signup': typeof SignupRoute
   '/dashboard/activity': typeof DashboardActivityRoute
   '/dashboard/credentials': typeof DashboardCredentialsRoute
@@ -95,6 +104,7 @@ export interface FileRouteTypes {
     | '/'
     | '/console'
     | '/dashboard'
+    | '/gate'
     | '/signup'
     | '/dashboard/activity'
     | '/dashboard/credentials'
@@ -104,6 +114,7 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/console'
+    | '/gate'
     | '/signup'
     | '/dashboard/activity'
     | '/dashboard/credentials'
@@ -114,6 +125,7 @@ export interface FileRouteTypes {
     | '/'
     | '/console'
     | '/dashboard'
+    | '/gate'
     | '/signup'
     | '/dashboard/activity'
     | '/dashboard/credentials'
@@ -125,6 +137,7 @@ export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   ConsoleRoute: typeof ConsoleRoute
   DashboardRoute: typeof DashboardRouteWithChildren
+  GateRoute: typeof GateRoute
   SignupRoute: typeof SignupRoute
 }
 
@@ -149,6 +162,13 @@ declare module '@tanstack/react-router' {
       path: '/dashboard'
       fullPath: '/dashboard'
       preLoaderRoute: typeof DashboardRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/gate': {
+      id: '/gate'
+      path: '/gate'
+      fullPath: '/gate'
+      preLoaderRoute: typeof GateRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/signup': {
@@ -211,6 +231,7 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   ConsoleRoute: ConsoleRoute,
   DashboardRoute: DashboardRouteWithChildren,
+  GateRoute: GateRoute,
   SignupRoute: SignupRoute,
 }
 export const routeTree = rootRouteImport
