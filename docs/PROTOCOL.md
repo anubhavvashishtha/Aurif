@@ -126,16 +126,6 @@ Unknown action → `404`. Insufficient scope → `403`.
 
 Each event: `{ "ts", "session", "agent_id", "kind", "detail" }`.
 
-## Site plug
+## Help
 
-Human pages load:
-
-```html
-<script src="/sdk/aurif.js" data-aurif-site="demo-shop"></script>
-```
-
-The SDK:
-
-- Advertises `window.Aurif` for agents and tools.
-- Can decorate the page with `data-aurif-action` hooks.
-- Does not change the human layout by default.
+`GET /ai/help` is open. It lists the fields agents must send. Every other agent call needs a matching site key.

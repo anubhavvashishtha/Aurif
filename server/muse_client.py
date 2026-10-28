@@ -497,34 +497,3 @@ or
         "reason": reason,
         "model": used_model,
     }
-
-
-def choose_next_action(goal: str, page: dict[str, Any], granted_scopes: list[str]) -> dict[str, Any]:
-    """Pick next Aurif action or finish."""
-    prompt = f"""You are an AI agent using the Aurif protocol (structured JSON only — no HTML scraping).
-Goal: {goal}
-Granted scopes: {granted_scopes}
-Current page JSON:
-{json.dumps({k: page.get(k) for k in ('path','title','summary','meta','elements','blocked')}, indent=2)}
-
-Reply with ONLY valid JSON:
-{{"done":false,"action_id":"<id from elements or empty>","path":"/optional navigate via get page","reason":"why"}}
-or {{"done":true,"reason":"goal complete or impossible","action_id":""}}
-
-Rules:
-- Only use action_ids present in elements (or empty).
-- Prefer navigation links to find products, then product.add:*, then cart.checkout if goal needs it.
-- If page is blocked or required data missing, set done true and explain.
-- If goal is met (e.g. item in cart meta), done true.
-"""
-    data = extract_json(
-        complete([{"role": "user", "content": prompt}], max_tokens=900, temperature=0.15)
-    )
-    if not isinstance(data, dict):
-        return {"done": True, "action_id": "", "path": "", "reason": "invalid model decision"}
-    return {
-        "done": bool(data.get("done")),
-        "action_id": str(data.get("action_id") or "").strip(),
-        "path": str(data.get("path") or "").strip(),
-        "reason": str(data.get("reason") or "")[:400],
-    }

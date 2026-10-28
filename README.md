@@ -7,7 +7,7 @@
 | What | App | URL |
 |------|-----|-----|
 | Customer website (Northline Goods) | `Demo-client/` | http://127.0.0.1:5173 |
-| Aurif owner dashboard + agent console | `Aurif-UI/` | http://127.0.0.1:5174 |
+| Aurif owner dashboard | `Aurif-UI/` | http://127.0.0.1:5174 |
 | AI protocol + owner APIs | `server/` | http://127.0.0.1:8787 |
 
 Humans shop on Northline. AI agents use only `/.well-known/aurif.json` + `/ai/*` (no VLM / UI clicking). Owners control endpoint access and JSON field redaction in the dashboard.
@@ -23,7 +23,7 @@ Aurif product AI lives in the **server + Aurif-UI** (not Demo-client). Inference
 | Handshake purpose risk | `POST /ai/handshake` | `meta-models/muse-spark-open-1026` |
 | Policy co-pilot | Dashboard → Endpoints | same |
 | Activity summary | Dashboard → Activity | same |
-| Muse agent runner | Agent console | same |
+| Muse chat | Dashboard → Agent dashboard | same |
 
 ```bash
 # root .env (gitignored)
@@ -35,7 +35,6 @@ MODAL_TOKEN_SECRET=…
 # MODAL_VISION_MODEL=deepseek-ai/DeepSeek-V4.1-Flash
 
 cd server && source .venv/bin/activate && pip install -r requirements.txt
-PYTHONPATH=. python ../examples/baseten_smoke.py
 ```
 
 ## Run (3 terminals)
@@ -58,24 +57,17 @@ Node 22+ recommended (`nvm use 22`). Prefer `pnpm` (npm may fail on these Lovabl
 
 ## Try the loop
 
-1. Open Northline (5173) → **draw** the letter/number CAPTCHA (DeepSeek vision on Baseten) → shop.
-2. Log into Aurif dashboard (5174) → hide `meta.price` / turn off an action.
-3. Agent console → **Run Muse agent** (or Handshake → see `purpose_risk`) → Get page `/products/field-tote`.
-4. Endpoint control → Muse policy co-pilot; Activity → Muse summary.
-5. Run automated checks:
+1. Open Northline (5173) → draw the CAPTCHA → shop.
+2. Log into the Aurif dashboard (5174) → Agent dashboard. Paste the site key and ask Muse to open a page.
+3. Endpoint control → Muse policy co-pilot. Activity → click a row to see the request.
 
-```bash
-python3 examples/test_agents.py
-```
-
-Expect: UI scrapers **403**, Aurif agents see only allowed JSON.
+Expect: requests without a matching site key are denied. A matching key returns only the JSON the owner left open.
 
 ## Repo layout
 
 ```
-Demo-client/     Lovable Northline storefront
-Aurif-UI/        Lovable Aurif dashboard
+Demo-client/     Northline storefront
+Aurif-UI/        Aurif dashboard
 server/          Flask AI + owner APIs
-sdk/aurif.js     Agent/site JS helper
 docs/            Product + protocol notes
 ```

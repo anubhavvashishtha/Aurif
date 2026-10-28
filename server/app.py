@@ -5,13 +5,13 @@ Customer storefront UI: Demo-client (Vite). Dashboard UI: Aurif-UI (Vite).
 
 from __future__ import annotations
 
+import re
 import secrets
 import time
 import uuid
-from pathlib import Path
 from typing import Any
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 import muse_client
@@ -28,11 +28,6 @@ from human_gate import (
     peek_challenge,
 )
 from redact import hidden_field_keys, redact_response
-
-ROOT = Path(__file__).resolve().parents[1]
-DEMO_DIR = ROOT / "demo"
-SDK_DIR = ROOT / "sdk"
-DASH_DIR = ROOT / "dashboard"
 
 PROTOCOL = "aurif-1"
 DEFAULT_SITE_ID = "demo-shop"
@@ -97,6 +92,51 @@ def get_agent_session() -> dict[str, Any] | None:
         sessions.pop(token, None)
         return None
     return session
+
+
+def presented_site_key(body: dict | None = None) -> str:
+    body = body if isinstance(body, dict) else {}
+    return str(
+        request.headers.get("X-Aurif-Site-Key")
+        or request.args.get("site_key")
+        or body.get("site_key")
+        or ""
+    ).strip()
+
+
+def reject_without_site_key(
+    site: dict[str, Any],
+    *,
+    kind: str,
+    asked: dict[str, Any],
+    body: dict | None = None,
+    path: str | None = None,
+    action_id: str | None = None,
+):
+    """Every agent data call must present the site key. Agent id is not a block key."""
+    key = presented_site_key(body)
+    if key and key == site.get("site_key"):
+        return None
+    reason = "missing_site_key" if not key else "site_key_mismatch"
+    store.log_activity(
+        site["id"],
+        kind=kind,
+        agent_id="agent",
+        path=path,
+        action_id=action_id,
+        detail={"accepted": False, "reason": reason, "asked": asked, "navigated": []},
+    )
+    return (
+        jsonify(
+            {
+                "ok": False,
+                "error": "site_key required and must match this site",
+                "reason": reason,
+                "help": "/ai/help",
+            }
+        ),
+        403,
+    )
 
 
 def require_agent_session(*scopes: str):
@@ -348,12 +388,79 @@ def well_known():
             "protocol": PROTOCOL,
             "name": site["name"],
             "site_id": site["id"],
+            "help": "/ai/help",
             "handshake": "/ai/handshake",
             "page": "/ai/page",
             "actions": "/ai/actions",
             "audit": "/ai/audit",
+            "auth": {
+                "open": ["/ai/help", "/.well-known/aurif.json"],
+                "site_key_header": "X-Aurif-Site-Key",
+                "site_key_field": "site_key",
+                "note": "Every other agent call must send the site key. Requests without a matching key are refused. Agents are not blocked by id.",
+            },
             "scopes_supported": list(ALLOWED_SCOPES),
             "agent_welcome": site.get("agent_welcome", ""),
+        }
+    )
+
+
+@app.get("/ai/help")
+def ai_help():
+    """Open to every agent. Describes what later calls must send. No site key."""
+    site = site_record()
+    return jsonify(
+        {
+            "ok": True,
+            "protocol": PROTOCOL,
+            "open": True,
+            "site": {"id": site["id"], "name": site["name"]},
+            "auth": {
+                "header": "X-Aurif-Site-Key",
+                "body_field": "site_key",
+                "required_on": ["/ai/handshake", "/ai/page", "/ai/actions", "/ai/audit"],
+                "note": "Send the site key on every call except this one and /.well-known/aurif.json. A missing or wrong key is refused. Aurif does not block by agent id.",
+            },
+            "endpoints": [
+                {
+                    "method": "GET",
+                    "path": "/ai/help",
+                    "site_key": False,
+                    "send": {},
+                    "returns": "This document.",
+                },
+                {
+                    "method": "POST",
+                    "path": "/ai/handshake",
+                    "site_key": True,
+                    "send": {
+                        "site_key": "required string, must match the site",
+                        "purpose": "why you are visiting",
+                        "requested_scopes": ["view"],
+                    },
+                    "returns": "session_token and granted_scopes",
+                },
+                {
+                    "method": "GET",
+                    "path": "/ai/page",
+                    "site_key": True,
+                    "send": {
+                        "headers": {"X-Aurif-Site-Key": "required", "X-Aurif-Session": "session_token from handshake"},
+                        "query": {"path": "page path, for example / or /products"},
+                    },
+                    "returns": "JSON for that page. Hidden fields are omitted. A closed endpoint is 403.",
+                },
+                {
+                    "method": "POST",
+                    "path": "/ai/actions",
+                    "site_key": True,
+                    "send": {
+                        "headers": {"X-Aurif-Site-Key": "required", "X-Aurif-Session": "session_token from handshake"},
+                        "body": {"action_id": "id from the page elements", "args": {}},
+                    },
+                    "returns": "Action result, or 403 if that action is closed or act was not granted.",
+                },
+            ],
         }
     )
 
@@ -362,23 +469,20 @@ def well_known():
 def handshake():
     site = site_record()
     data = request.get_json(silent=True) or {}
-    agent_id = (data.get("agent_id") or "").strip()
-    if not agent_id:
-        return jsonify({"ok": False, "error": "agent_id required"}), 400
+    agent_id = (data.get("agent_id") or "agent").strip() or "agent"
+    asked = {
+        "method": "POST",
+        "path": "/ai/handshake",
+        "purpose": str(data.get("purpose") or ""),
+        "requested_scopes": data.get("requested_scopes") or ["view"],
+    }
+    denied = reject_without_site_key(site, kind="handshake_denied", asked=asked, body=data)
+    if denied:
+        return denied
 
     requested = data.get("requested_scopes") or ["view"]
     if not isinstance(requested, list):
         return jsonify({"ok": False, "error": "requested_scopes must be a list"}), 400
-
-    provided_key = (data.get("site_key") or request.headers.get("X-Aurif-Site-Key") or "").strip()
-    if provided_key and provided_key != site["site_key"]:
-        store.log_activity(site["id"], kind="handshake_denied", agent_id=agent_id, detail={"reason": "bad_site_key"})
-        return jsonify({"ok": False, "error": "invalid site_key"}), 403
-
-    blocked = {a.lower() for a in site.get("blocked_agents", [])}
-    if agent_id.lower() in blocked:
-        store.log_activity(site["id"], kind="handshake_denied", agent_id=agent_id, detail={"reason": "blocked_agent"})
-        return jsonify({"ok": False, "error": "agent not allowed by site policy"}), 403
 
     granted = [s for s in requested if s in ALLOWED_SCOPES]
     if not granted:
@@ -411,6 +515,10 @@ def handshake():
         kind="handshake",
         agent_id=agent_id,
         detail={
+            "accepted": True,
+            "reason": "site_key matched",
+            "asked": asked,
+            "navigated": [],
             "granted_scopes": granted,
             "purpose": purpose,
             "purpose_risk": risk,
@@ -433,16 +541,25 @@ def handshake():
 
 @app.get("/ai/page")
 def ai_page():
-    session, err = require_agent_session("view")
-    if err:
-        return err
     site = site_record()
     path = request.args.get("path") or "/"
     if path != "/" and path.endswith("/"):
         path = path.rstrip("/")
+    asked = {"method": "GET", "path": "/ai/page", "query": {"path": path}}
+    denied = reject_without_site_key(site, kind="page_blocked", asked=asked, path=path)
+    if denied:
+        return denied
+    session, err = require_agent_session("view")
+    if err:
+        return err
     if not store.endpoint_allowed(site, path=path):
         store.log_activity(
-            site["id"], kind="page_blocked", agent_id=session["agent_id"], path=path, session_token=session["token"]
+            site["id"],
+            kind="page_blocked",
+            agent_id=session["agent_id"],
+            path=path,
+            session_token=session["token"],
+            detail={"accepted": False, "reason": "endpoint closed", "asked": asked, "navigated": []},
         )
         return jsonify(deny_page(path, "Endpoint blocked for AI agents.")), 403
 
@@ -452,7 +569,13 @@ def ai_page():
         kind="page",
         agent_id=session["agent_id"],
         path=path,
-        detail={"blocked": bool(snap.get("blocked"))},
+        detail={
+            "accepted": True,
+            "reason": "site_key matched",
+            "asked": asked,
+            "navigated": [path],
+            "blocked": bool(snap.get("blocked")),
+        },
         session_token=session["token"],
     )
     snap = apply_page_redaction(site, path, snap, session)
@@ -461,12 +584,16 @@ def ai_page():
 
 @app.post("/ai/actions")
 def ai_actions():
-    session, err = require_agent_session("view")
-    if err:
-        return err
     site = site_record()
     data = request.get_json(silent=True) or {}
     action_id = (data.get("action_id") or "").strip()
+    asked = {"method": "POST", "path": "/ai/actions", "action_id": action_id, "args": data.get("args") or {}}
+    denied = reject_without_site_key(site, kind="action_blocked", asked=asked, body=data, action_id=action_id or None)
+    if denied:
+        return denied
+    session, err = require_agent_session("view")
+    if err:
+        return err
     if not action_id:
         return jsonify({"ok": False, "error": "action_id required"}), 400
     args = data.get("args") or {}
@@ -480,6 +607,7 @@ def ai_actions():
             agent_id=session["agent_id"],
             action_id=action_id,
             session_token=session["token"],
+            detail={"accepted": False, "reason": "endpoint closed", "asked": asked, "navigated": []},
         )
         return jsonify({"ok": False, "error": "action blocked for AI agents by site owner"}), 403
 
@@ -507,7 +635,13 @@ def ai_actions():
         agent_id=session["agent_id"],
         action_id=action_id,
         path=result.get("navigated"),
-        detail={"args": args},
+        detail={
+            "accepted": True,
+            "reason": "site_key matched",
+            "asked": asked,
+            "navigated": [result.get("navigated")] if result.get("navigated") else [],
+            "args": args,
+        },
         session_token=session["token"],
     )
     page = result.pop("page", None)
@@ -525,8 +659,16 @@ def ai_actions():
 
 @app.get("/ai/audit")
 def ai_audit():
-    session = get_agent_session()
     site = site_record()
+    denied = reject_without_site_key(
+        site,
+        kind="page_blocked",
+        asked={"method": "GET", "path": "/ai/audit"},
+        path="/ai/audit",
+    )
+    if denied:
+        return denied
+    session = get_agent_session()
     events = store.activity_for_site(site["id"], limit=100)
     if session:
         prefix = session["token"][:8] + "…"
@@ -757,28 +899,42 @@ def api_activity_summary(site_id: str):
     return jsonify({"ok": True, "summary": summary, "model": muse_client.DEFAULT_MODEL})
 
 
-@app.post("/api/ai/agent-run")
-def api_agent_run():
-    """Owner-facing Muse agent that drives Aurif /ai/* (product console, not Demo-client)."""
-    session, err = owner_auth()
+def _path_from_message(message: str) -> str:
+    url_match = re.search(r"https?://\S+", message)
+    if url_match:
+        raw = url_match.group(0).rstrip(".,)")
+        path = re.sub(r"^https?://[^/]+", "", raw) or "/"
+        if not path.startswith("/"):
+            path = "/" + path
+        return path.split("?")[0] or "/"
+    path_match = re.search(r"(?:^|\s)(/[A-Za-z0-9_./-]*)", message)
+    if path_match:
+        return path_match.group(1).rstrip("/") or "/"
+    lowered = message.lower()
+    for guess, token in (("/products", "shop"), ("/products", "product"), ("/cart", "cart"), ("/", "home")):
+        if token in lowered:
+            return guess
+    return "/"
+
+
+@app.post("/api/ai/agent-chat")
+def api_agent_chat():
+    """Owner chat: Muse tries the Aurif protocol with the pasted site key and reports what came back."""
+    owner, err = owner_auth()
     if err:
         return err
+    _ = owner
     data = request.get_json(silent=True) or {}
-    goal = (data.get("goal") or "").strip()
-    if not goal:
-        return jsonify({"ok": False, "error": "goal required"}), 400
-    agent_id = (data.get("agent_id") or "aurif-muse-agent").strip()
-    purpose = (data.get("purpose") or goal).strip()
-    requested = data.get("requested_scopes") or ["view", "act"]
-    if not isinstance(requested, list):
-        requested = ["view", "act"]
-    site_key = (data.get("site_key") or "").strip()
-    max_steps = min(int(data.get("max_steps") or 8), 12)
-    base = request.host_url.rstrip("/")
+    message = str(data.get("message") or "").strip()
+    if not message:
+        return jsonify({"ok": False, "error": "message required"}), 400
+    site_key = str(data.get("site_key") or "").strip()
+    path = _path_from_message(message)
+    wants_help = any(
+        word in message.lower() for word in ("help", "what to send", "what should", "documentation", "docs", "fields")
+    )
 
-    steps: list[dict[str, Any]] = []
-
-    def local_call(method: str, path: str, body: dict | None = None, token: str | None = None):
+    def local_call(method: str, call_path: str, body: dict | None = None, token: str | None = None):
         headers = {"X-Aurif-Protocol": PROTOCOL, "Content-Type": "application/json"}
         if token:
             headers["X-Aurif-Session"] = token
@@ -786,81 +942,74 @@ def api_agent_run():
             headers["X-Aurif-Site-Key"] = site_key
         with app.test_client() as client:
             if method == "GET":
-                res = client.get(path, headers=headers)
+                res = client.get(call_path, headers=headers)
             else:
-                res = client.open(path, method=method, json=body or {}, headers=headers)
-            try:
-                payload = res.get_json(silent=True) or {}
-            except Exception:
-                payload = {}
-            return res.status_code, payload
+                res = client.open(call_path, method=method, json=body or {}, headers=headers)
+            return res.status_code, res.get_json(silent=True) or {}
 
-    status, discovery = local_call("GET", "/.well-known/aurif.json")
-    steps.append({"step": "discover", "status": status, "data": discovery})
-    if status != 200:
-        return jsonify({"ok": False, "error": "discover failed", "steps": steps, "model": muse_client.DEFAULT_MODEL}), 502
-
-    status, hs = local_call(
+    _, help_doc = local_call("GET", "/ai/help")
+    hs_status, hs = local_call(
         "POST",
-        discovery.get("handshake") or "/ai/handshake",
+        "/ai/handshake",
         {
-            "agent_id": agent_id,
-            "agent_version": "muse-1.0",
-            "requested_scopes": requested,
-            "purpose": purpose,
+            "purpose": message[:240],
+            "requested_scopes": ["view"],
             **({"site_key": site_key} if site_key else {}),
         },
     )
-    steps.append({"step": "handshake", "status": status, "data": hs})
-    if status != 200 or not hs.get("session_token"):
-        return jsonify({"ok": False, "error": "handshake failed", "steps": steps, "model": muse_client.DEFAULT_MODEL}), 502
+    if hs_status != 200 or not hs.get("session_token"):
+        reply = "Access denied. The site key is missing or does not match, so Aurif returned no site data."
+        if wants_help:
+            reply += " GET /ai/help is open and lists what to send. Every other call still needs the site key."
+        return jsonify({"ok": True, "denied": True, "reply": reply, "path": path, "status": hs_status})
 
-    token = hs["session_token"]
-    granted = hs.get("granted_scopes") or ["view"]
-    path = "/"
-    status, page = local_call("GET", f"/ai/page?path={path}", token=token)
-    steps.append({"step": "page", "status": status, "path": path, "data": page})
+    page_status, page = local_call("GET", f"/ai/page?path={path}", token=hs["session_token"])
+    if page_status >= 400 or (isinstance(page, dict) and page.get("blocked")):
+        reply = f"Access denied for {path}. The site key matched, and this endpoint is closed."
+        return jsonify({"ok": True, "denied": True, "reply": reply, "path": path, "status": page_status})
 
-    for i in range(max_steps):
-        try:
-            decision = muse_client.choose_next_action(goal, page if isinstance(page, dict) else {}, granted)
-        except Exception as e:
-            steps.append({"step": "decide", "error": str(e)})
-            break
-        steps.append({"step": "decide", "decision": decision})
-        if decision.get("done"):
-            break
-        next_path = decision.get("path") or ""
-        action_id = decision.get("action_id") or ""
-        if next_path and next_path != (page or {}).get("path"):
-            status, page = local_call("GET", f"/ai/page?path={next_path}", token=token)
-            steps.append({"step": "page", "status": status, "path": next_path, "data": page})
-            continue
-        if not action_id:
-            break
-        status, action_body = local_call("POST", "/ai/actions", {"action_id": action_id, "args": {}}, token=token)
-        steps.append({"step": "action", "status": status, "action_id": action_id, "data": action_body})
-        if status >= 400:
-            break
-        if isinstance(action_body, dict) and isinstance(action_body.get("page"), dict):
-            page = action_body["page"]
-        elif isinstance(action_body, dict) and action_body.get("result", {}).get("navigated"):
-            nav = action_body["result"]["navigated"]
-            status, page = local_call("GET", f"/ai/page?path={nav}", token=token)
-            steps.append({"step": "page", "status": status, "path": nav, "data": page})
-        else:
-            status, page = local_call("GET", f"/ai/page?path={(page or {}).get('path') or '/'}", token=token)
-            steps.append({"step": "page", "status": status, "path": (page or {}).get("path"), "data": page})
-
+    title = page.get("title") if isinstance(page, dict) else ""
+    summary = page.get("summary") if isinstance(page, dict) else ""
+    labels = [
+        str(el.get("label"))
+        for el in (page.get("elements") or [])
+        if isinstance(el, dict) and el.get("label")
+    ] if isinstance(page, dict) else []
+    facts = (
+        f"Path {path}. Title: {title}. Summary: {summary}. "
+        f"The agent can see: {', '.join(labels) if labels else 'no elements'}."
+    )
+    reply = facts
+    try:
+        polished = muse_client.complete(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "You are Muse inside Aurif. Tell the site owner what this agent request returned. "
+                        "Two short sentences. Use only these facts:\n" + facts
+                    ),
+                }
+            ],
+            max_tokens=160,
+            temperature=0.2,
+        )
+        words = polished.split()
+        if polished and 6 < len(words) < 70:
+            reply = polished.strip()
+    except Exception:
+        pass
+    if wants_help:
+        reply += " GET /ai/help is open and lists the fields. Every other call needs the site key."
     return jsonify(
         {
             "ok": True,
-            "goal": goal,
-            "granted_scopes": granted,
-            "purpose_risk": hs.get("purpose_risk"),
-            "steps": steps,
-            "model": muse_client.DEFAULT_MODEL,
-            "base": base,
+            "denied": False,
+            "reply": reply,
+            "path": path,
+            "status": page_status,
+            "labels": labels,
+            "help": help_doc if wants_help else None,
         }
     )
 
@@ -996,30 +1145,6 @@ def api_products():
                     }
                 ), 401
     return jsonify({"products": [public_product(p) for p in PRODUCTS.values()]})
-
-
-# ---- Legacy static fallbacks (old HTML demos) ----
-
-
-@app.get("/sdk/<path:filename>")
-def sdk_files(filename: str):
-    return send_from_directory(SDK_DIR, filename)
-
-
-@app.get("/styles.css")
-def styles():
-    return send_from_directory(DEMO_DIR, "styles.css")
-
-
-@app.get("/dashboard")
-@app.get("/dashboard/")
-def dashboard_home():
-    return send_from_directory(DASH_DIR, "index.html")
-
-
-@app.get("/dashboard/<path:filename>")
-def dashboard_files(filename: str):
-    return send_from_directory(DASH_DIR, filename)
 
 
 @app.get("/")
