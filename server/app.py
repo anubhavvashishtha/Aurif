@@ -14,11 +14,19 @@ from typing import Any
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
+import muse_client
 import store
 from agent_gate import blocked_response_body, looks_like_anonymous_agent
 from catalog_ai import products_by_slug, public_product
 from human_gate import COOKIE_NAME as HUMAN_COOKIE
-from human_gate import HUMAN_TTL, human_session_valid, issue_challenge, verify_challenge
+from human_gate import (
+    HUMAN_TTL,
+    consume_challenge,
+    human_session_valid,
+    issue_challenge,
+    issue_human_token,
+    peek_challenge,
+)
 from redact import hidden_field_keys, redact_response
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -376,17 +384,25 @@ def handshake():
     if not granted:
         return jsonify({"ok": False, "error": "no supported scopes requested"}), 400
 
+    purpose = str(data.get("purpose") or "")
+    risk = muse_client.score_purpose(purpose)
+    if risk.get("drop_act") and "act" in granted:
+        granted = [s for s in granted if s != "act"]
+    if not granted:
+        granted = ["view"]
+
     token = secrets.token_urlsafe(24)
     session = {
         "token": token,
         "agent_id": agent_id,
         "agent_version": str(data.get("agent_version") or "0.0.0"),
-        "purpose": str(data.get("purpose") or ""),
+        "purpose": purpose,
         "scopes": granted,
         "site_id": site["id"],
         "created_at": time.time(),
         "expires_at": time.time() + SESSION_TTL,
         "id": str(uuid.uuid4()),
+        "purpose_risk": risk,
     }
     sessions[token] = session
     cart_by_session[token] = []
@@ -394,7 +410,11 @@ def handshake():
         site["id"],
         kind="handshake",
         agent_id=agent_id,
-        detail={"granted_scopes": granted, "purpose": session["purpose"]},
+        detail={
+            "granted_scopes": granted,
+            "purpose": purpose,
+            "purpose_risk": risk,
+        },
         session_token=token,
     )
     return jsonify(
@@ -406,6 +426,7 @@ def handshake():
             "site": {"id": site["id"], "name": site["name"]},
             "agent_welcome": site.get("agent_welcome", ""),
             "ai_surface": {"page": "/ai/page", "actions": "/ai/actions"},
+            "purpose_risk": risk,
         }
     )
 
@@ -648,6 +669,202 @@ def api_activity(site_id: str):
     return jsonify({"ok": True, "events": store.activity_for_site(site_id, limit=300)})
 
 
+def _owner_site(site_id: str, session: dict[str, Any]):
+    site = store.get_site(site_id)
+    if not site or site["owner_id"] != session["user"]["id"]:
+        return None, (jsonify({"ok": False, "error": "not found"}), 404)
+    return site, None
+
+
+@app.post("/api/sites/<site_id>/ai/policy-propose")
+def api_policy_propose(site_id: str):
+    session, err = owner_auth()
+    if err:
+        return err
+    site, err = _owner_site(site_id, session)
+    if err:
+        return err
+    data = request.get_json(silent=True) or {}
+    instruction = (data.get("instruction") or "").strip()
+    if not instruction:
+        return jsonify({"ok": False, "error": "instruction required"}), 400
+    try:
+        proposal = muse_client.propose_policy(instruction, site.get("endpoints") or [])
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
+    return jsonify({"ok": True, "proposal": proposal, "model": muse_client.DEFAULT_MODEL})
+
+
+@app.post("/api/sites/<site_id>/ai/policy-apply")
+def api_policy_apply(site_id: str):
+    """Apply owner-confirmed Muse policy patches via existing store mutators."""
+    session, err = owner_auth()
+    if err:
+        return err
+    site, err = _owner_site(site_id, session)
+    if err:
+        return err
+    data = request.get_json(silent=True) or {}
+    patches = data.get("patches") or []
+    if not isinstance(patches, list):
+        return jsonify({"ok": False, "error": "patches must be a list"}), 400
+    uid = session["user"]["id"]
+    try:
+        for patch in patches:
+            if not isinstance(patch, dict):
+                continue
+            eid = (patch.get("endpoint_id") or "").strip()
+            if not eid:
+                continue
+            if "agent_access" in patch:
+                site = store.set_endpoint_access(site_id, uid, eid, bool(patch["agent_access"]))
+            if "response_fields" in patch or "request_fields" in patch:
+                site = store.set_endpoint_fields(
+                    site_id,
+                    uid,
+                    eid,
+                    response_fields=patch.get("response_fields"),
+                    request_fields=patch.get("request_fields"),
+                )
+        add_blocked = data.get("blocked_agents_add") or []
+        if isinstance(add_blocked, list) and add_blocked:
+            current = list(site.get("blocked_agents") or [])
+            for a in add_blocked:
+                a = str(a).strip()
+                if a and a not in current:
+                    current.append(a)
+            site = store.update_site(site_id, uid, {"blocked_agents": current})
+    except PermissionError:
+        return jsonify({"ok": False, "error": "not found"}), 404
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    return jsonify({"ok": True, "site": store.public_site(site)})
+
+
+@app.post("/api/sites/<site_id>/ai/activity-summary")
+def api_activity_summary(site_id: str):
+    session, err = owner_auth()
+    if err:
+        return err
+    site, err = _owner_site(site_id, session)
+    if err:
+        return err
+    events = store.activity_for_site(site_id, limit=80)
+    try:
+        summary = muse_client.summarize_activity(events)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
+    return jsonify({"ok": True, "summary": summary, "model": muse_client.DEFAULT_MODEL})
+
+
+@app.post("/api/ai/agent-run")
+def api_agent_run():
+    """Owner-facing Muse agent that drives Aurif /ai/* (product console, not Demo-client)."""
+    session, err = owner_auth()
+    if err:
+        return err
+    data = request.get_json(silent=True) or {}
+    goal = (data.get("goal") or "").strip()
+    if not goal:
+        return jsonify({"ok": False, "error": "goal required"}), 400
+    agent_id = (data.get("agent_id") or "aurif-muse-agent").strip()
+    purpose = (data.get("purpose") or goal).strip()
+    requested = data.get("requested_scopes") or ["view", "act"]
+    if not isinstance(requested, list):
+        requested = ["view", "act"]
+    site_key = (data.get("site_key") or "").strip()
+    max_steps = min(int(data.get("max_steps") or 8), 12)
+    base = request.host_url.rstrip("/")
+
+    steps: list[dict[str, Any]] = []
+
+    def local_call(method: str, path: str, body: dict | None = None, token: str | None = None):
+        headers = {"X-Aurif-Protocol": PROTOCOL, "Content-Type": "application/json"}
+        if token:
+            headers["X-Aurif-Session"] = token
+        if site_key:
+            headers["X-Aurif-Site-Key"] = site_key
+        with app.test_client() as client:
+            if method == "GET":
+                res = client.get(path, headers=headers)
+            else:
+                res = client.open(path, method=method, json=body or {}, headers=headers)
+            try:
+                payload = res.get_json(silent=True) or {}
+            except Exception:
+                payload = {}
+            return res.status_code, payload
+
+    status, discovery = local_call("GET", "/.well-known/aurif.json")
+    steps.append({"step": "discover", "status": status, "data": discovery})
+    if status != 200:
+        return jsonify({"ok": False, "error": "discover failed", "steps": steps, "model": muse_client.DEFAULT_MODEL}), 502
+
+    status, hs = local_call(
+        "POST",
+        discovery.get("handshake") or "/ai/handshake",
+        {
+            "agent_id": agent_id,
+            "agent_version": "muse-1.0",
+            "requested_scopes": requested,
+            "purpose": purpose,
+            **({"site_key": site_key} if site_key else {}),
+        },
+    )
+    steps.append({"step": "handshake", "status": status, "data": hs})
+    if status != 200 or not hs.get("session_token"):
+        return jsonify({"ok": False, "error": "handshake failed", "steps": steps, "model": muse_client.DEFAULT_MODEL}), 502
+
+    token = hs["session_token"]
+    granted = hs.get("granted_scopes") or ["view"]
+    path = "/"
+    status, page = local_call("GET", f"/ai/page?path={path}", token=token)
+    steps.append({"step": "page", "status": status, "path": path, "data": page})
+
+    for i in range(max_steps):
+        try:
+            decision = muse_client.choose_next_action(goal, page if isinstance(page, dict) else {}, granted)
+        except Exception as e:
+            steps.append({"step": "decide", "error": str(e)})
+            break
+        steps.append({"step": "decide", "decision": decision})
+        if decision.get("done"):
+            break
+        next_path = decision.get("path") or ""
+        action_id = decision.get("action_id") or ""
+        if next_path and next_path != (page or {}).get("path"):
+            status, page = local_call("GET", f"/ai/page?path={next_path}", token=token)
+            steps.append({"step": "page", "status": status, "path": next_path, "data": page})
+            continue
+        if not action_id:
+            break
+        status, action_body = local_call("POST", "/ai/actions", {"action_id": action_id, "args": {}}, token=token)
+        steps.append({"step": "action", "status": status, "action_id": action_id, "data": action_body})
+        if status >= 400:
+            break
+        if isinstance(action_body, dict) and isinstance(action_body.get("page"), dict):
+            page = action_body["page"]
+        elif isinstance(action_body, dict) and action_body.get("result", {}).get("navigated"):
+            nav = action_body["result"]["navigated"]
+            status, page = local_call("GET", f"/ai/page?path={nav}", token=token)
+            steps.append({"step": "page", "status": status, "path": nav, "data": page})
+        else:
+            status, page = local_call("GET", f"/ai/page?path={(page or {}).get('path') or '/'}", token=token)
+            steps.append({"step": "page", "status": status, "path": (page or {}).get("path"), "data": page})
+
+    return jsonify(
+        {
+            "ok": True,
+            "goal": goal,
+            "granted_scopes": granted,
+            "purpose_risk": hs.get("purpose_risk"),
+            "steps": steps,
+            "model": muse_client.DEFAULT_MODEL,
+            "base": base,
+        }
+    )
+
+
 def _reject_anonymous_agent_if_needed():
     """Demo gate: block curl/scrapers/bot UAs unless they hold an Aurif session."""
     site = site_record()
@@ -705,10 +922,48 @@ def api_human_verify():
         resp = jsonify({"ok": True, "human_token": token, "expires_in": HUMAN_TTL})
         resp.set_cookie(HUMAN_COOKIE, token, max_age=HUMAN_TTL, httponly=False, samesite="Lax")
         return resp
-    token = verify_challenge(str(data.get("challenge_id") or ""), str(data.get("answer") or ""))
-    if not token:
-        return jsonify({"ok": False, "error": "challenge failed"}), 403
-    resp = jsonify({"ok": True, "human_token": token, "expires_in": HUMAN_TTL})
+
+    challenge_id = str(data.get("challenge_id") or "").strip()
+    image = str(data.get("image") or data.get("drawing") or "").strip()
+    row = peek_challenge(challenge_id)
+    if not row:
+        return jsonify({"ok": False, "error": "challenge expired — refresh and try again"}), 403
+    if not image.startswith("data:image/"):
+        return jsonify({"ok": False, "error": "drawing image required"}), 400
+
+    try:
+        verdict = muse_client.verify_drawing(image, str(row.get("target") or ""))
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"vision check failed: {e}"}), 502
+
+    if not verdict.get("ok"):
+        # Keep challenge so they can redraw once; only consume on success
+        return jsonify(
+            {
+                "ok": False,
+                "error": verdict.get("reason") or "drawing did not match",
+                "verdict": {
+                    "read_as": verdict.get("read_as"),
+                    "match": verdict.get("match"),
+                    "human_like": verdict.get("human_like"),
+                    "model": verdict.get("model"),
+                },
+            }
+        ), 403
+
+    consume_challenge(challenge_id)
+    token = issue_human_token()
+    resp = jsonify(
+        {
+            "ok": True,
+            "human_token": token,
+            "expires_in": HUMAN_TTL,
+            "verdict": {
+                "read_as": verdict.get("read_as"),
+                "model": verdict.get("model"),
+            },
+        }
+    )
     resp.set_cookie(HUMAN_COOKIE, token, max_age=HUMAN_TTL, httponly=False, samesite="Lax", path="/")
     return resp
 
