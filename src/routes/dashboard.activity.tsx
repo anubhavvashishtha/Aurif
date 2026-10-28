@@ -7,7 +7,6 @@ import {
   isBlockedKind,
   refreshActivity,
   summarizeActivity,
-  updateSite,
   useActiveSite,
   type AgentEvent,
 } from "@/lib/aurif-store";
@@ -23,10 +22,11 @@ function Activity() {
   const [aiSummary, setAiSummary] = useState<{
     summary: string;
     risks: string[];
-    suggested_blocked_agents: string[];
     model?: string;
   } | null>(null);
+  const [openId, setOpenId] = useState<string | null>(null);
   const rows = [...site.events].sort((a, b) => b.time.localeCompare(a.time));
+  const open = rows.find((r) => r.id === openId) || null;
 
   const runSummary = async () => {
     setBusy(true);
@@ -41,21 +41,11 @@ function Activity() {
     }
   };
 
-  const applyBlocks = async () => {
-    if (!aiSummary?.suggested_blocked_agents?.length) return;
-    const existing = site.blockedAgents
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const merged = [...new Set([...existing, ...aiSummary.suggested_blocked_agents])];
-    await updateSite(site.id, { blockedAgents: merged.join(", ") });
-  };
-
   return (
     <>
       <PageHeader
         title="Agent activity"
-        description="Every handshake, page read and action from AI agents, newest first."
+        description="Click a row to see what the request asked for and where it went. A matching site key is what gets accepted."
         action={
           <div className="flex flex-wrap gap-2">
             <Button
@@ -94,16 +84,6 @@ function Activity() {
               ))}
             </ul>
           )}
-          {!!aiSummary.suggested_blocked_agents?.length && (
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="font-mono text-xs">
-                Suggest block: {aiSummary.suggested_blocked_agents.join(", ")}
-              </span>
-              <Button size="sm" variant="outline" onClick={() => void applyBlocks()}>
-                Apply blocks
-              </Button>
-            </div>
-          )}
           {aiSummary.model && (
             <p className="text-xs text-muted-foreground">Model: {aiSummary.model}</p>
           )}
@@ -113,15 +93,26 @@ function Activity() {
         <DataTable<AgentEvent>
           rows={rows}
           rowKey={(r) => r.id}
-          rowClass={(r) => (isBlockedKind(r.kind) ? "bg-danger-soft/40" : "")}
-          empty="No agent activity yet. Run an agent against your site."
+          onRowClick={(r) => setOpenId((id) => (id === r.id ? null : r.id))}
+          rowClass={(r) => (openId === r.id ? "bg-secondary" : isBlockedKind(r.kind) || r.accepted === false ? "bg-danger-soft/40" : "")}
+          empty="No agent activity yet. Ask Muse to try the site."
           columns={[
             { header: "Time", cell: (r) => <span className="whitespace-nowrap font-mono text-xs text-muted-foreground">{new Date(r.time).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span> },
-            { header: "Agent ID", cell: (r) => <span className="font-mono text-xs">{r.agentId}</span> },
+            { header: "Result", cell: (r) => <span className="font-mono text-xs uppercase">{r.accepted === false || isBlockedKind(r.kind) ? "Denied" : r.accepted ? "Accepted" : "Logged"}</span> },
             { header: "Event", cell: (r) => <EventBadge kind={r.kind} /> },
-            { header: "URL / action_id", cell: (r) => <span className="font-mono text-xs text-muted-foreground">{r.target}{r.redactedFields?.length ? <span className="ml-2 rounded-sm border border-ink bg-ink px-2 py-0.5 text-ink-foreground">redacted: {r.redactedFields.join(", ")}</span> : null}</span> },
+            { header: "Asked", cell: (r) => <span className="font-mono text-xs text-muted-foreground">{r.target}{r.redactedFields?.length ? <span className="ml-2 rounded-sm border border-ink bg-ink px-2 py-0.5 text-ink-foreground">redacted: {r.redactedFields.join(", ")}</span> : null}</span> },
           ]}
         />
+        {open && (
+          <div className="border-t border-ink/10 px-5 py-4 text-sm">
+            <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-muted-foreground">Request</p>
+            <p className="mt-1 text-ink">{open.reason || "No reason recorded."}</p>
+            <p className="mt-3 font-mono text-[10px] uppercase tracking-[0.16em] text-muted-foreground">Asked</p>
+            <pre className="mt-1 overflow-auto bg-ink p-3 font-mono text-xs text-ink-foreground">{JSON.stringify(open.asked ?? open.target, null, 2)}</pre>
+            <p className="mt-3 font-mono text-[10px] uppercase tracking-[0.16em] text-muted-foreground">Navigated</p>
+            <p className="mt-1 font-mono text-xs">{open.navigated?.length ? open.navigated.join(" → ") : "Did not navigate."}</p>
+          </div>
+        )}
       </Panel>
     </>
   );

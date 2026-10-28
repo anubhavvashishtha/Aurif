@@ -14,7 +14,7 @@ import { PageHeader, Panel } from "@/components/aurif/ui";
 import { rotateKey, updateSite, useActiveSite } from "@/lib/aurif-store";
 import { aurifHead } from "@/lib/aurif-meta";
 
-export const Route = createFileRoute("/dashboard/credentials")({ head: () => aurifHead("Site credentials", "Manage site details, welcome message, blocked agents and site key."), component: Credentials });
+export const Route = createFileRoute("/dashboard/credentials")({ head: () => aurifHead("Site credentials", "Manage site details, welcome message and the site key agents must send."), component: Credentials });
 
 function Credentials() {
   const site = useActiveSite();
@@ -22,7 +22,6 @@ function Credentials() {
     name: "",
     url: "",
     welcome: "",
-    blockedAgents: "",
     blockAnonymousAgents: true,
     requireHumanCaptcha: true,
   });
@@ -31,12 +30,11 @@ function Credentials() {
       name: site.name,
       url: site.url,
       welcome: site.welcome,
-      blockedAgents: site.blockedAgents,
       blockAnonymousAgents: site.blockAnonymousAgents,
       requireHumanCaptcha: site.requireHumanCaptcha,
     });
   }, [site.id]); // eslint-disable-line react-hooks/exhaustive-deps
-  const f = (k: "name" | "url" | "welcome" | "blockedAgents") => ({
+  const f = (k: "name" | "url" | "welcome") => ({
     value: form[k],
     onChange: (e: { target: { value: string } }) => setForm({ ...form, [k]: e.target.value }),
   });
@@ -50,17 +48,11 @@ function Credentials() {
           <div className="space-y-1.5"><Label>Site URL</Label><Input {...f("url")} /></div>
         </div>
         <div className="space-y-1.5"><Label>Agent welcome message</Label><Textarea rows={3} {...f("welcome")} /></div>
-        <div className="space-y-1.5">
-          <Label>Blocked agent IDs</Label>
-          <Input className="font-mono text-xs" placeholder="agent-a/1.0, agent-b/2.1" {...f("blockedAgents")} />
-          <p className="text-xs text-muted-foreground">Comma-separated. These agents are denied at handshake.</p>
-        </div>
         <div className="flex items-start justify-between gap-4 rounded-lg border p-4">
           <div>
             <Label>Block anonymous AI scrapers</Label>
             <p className="mt-1 text-xs text-muted-foreground">
-              When on, curl / Playwright / bot user-agents hitting the customer site or product API get 403.
-              They must use Aurif handshake + <code className="font-mono">/ai/*</code>.
+              Bot user-agents hitting the shop or product API get 403. Agent data calls are separate: they must send the site key, or Aurif refuses them.
             </p>
           </div>
           <Switch
@@ -119,7 +111,7 @@ function Credentials() {
             </AlertDialogContent>
           </AlertDialog>
         </div>
-        <p className="mt-2 text-xs text-muted-foreground">Rotating the key rejects agents sending the old key.</p>
+        <p className="mt-2 text-xs text-muted-foreground">Every agent data call must send this key. GET /ai/help stays open so agents can read what to send. Rotating the key rejects the old one.</p>
       </Panel>
     </>
   );

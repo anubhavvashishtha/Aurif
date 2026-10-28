@@ -1,9 +1,8 @@
 import { Link, useNavigate } from "@tanstack/react-router";
-import { Activity, ExternalLink, KeyRound, LayoutGrid, LogOut, SlidersHorizontal, Terminal } from "lucide-react";
+import { Activity, Bot, ExternalLink, KeyRound, LayoutGrid, LogOut, SlidersHorizontal } from "lucide-react";
 import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { Switch } from "@/components/ui/switch";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { isBlockedKind, logout, setActiveSite, useAurif, type EventKind } from "@/lib/aurif-store";
 
@@ -32,9 +31,6 @@ export function Topbar({ label = "Dashboard" }: { label?: string }) {
               <span className="hidden sm:inline">Customer site</span><ExternalLink />
             </a>
           </Button>
-          <Button variant="outline" size="sm" asChild>
-            <Link to="/console"><Terminal /> <span className="hidden sm:inline">Agent console</span></Link>
-          </Button>
           {email && (
             <>
               <span className="hidden font-mono text-xs text-muted-foreground lg:inline">{email}</span>
@@ -58,6 +54,7 @@ export function Topbar({ label = "Dashboard" }: { label?: string }) {
 
 const NAV = [
   { to: "/dashboard", label: "Overview", icon: LayoutGrid },
+  { to: "/dashboard/agent", label: "Agent dashboard", icon: Bot },
   { to: "/dashboard/activity", label: "Agent activity", icon: Activity },
   { to: "/dashboard/endpoints", label: "Endpoint control", icon: SlidersHorizontal },
   { to: "/dashboard/credentials", label: "Site credentials", icon: KeyRound },
@@ -141,12 +138,13 @@ export function EventBadge({ kind }: { kind: EventKind }) {
   return <Badge tone={isBlockedKind(kind) ? "danger" : kind === "handshake" ? "neutral" : "ok"}>{kind}</Badge>;
 }
 
-export function DataTable<T>({ columns, rows, rowKey, rowClass, empty }: {
+export function DataTable<T>({ columns, rows, rowKey, rowClass, empty, onRowClick }: {
   columns: { header: string; cell: (r: T) => ReactNode; className?: string }[];
   rows: T[];
   rowKey: (r: T) => string;
   rowClass?: (r: T) => string;
   empty?: ReactNode;
+  onRowClick?: (r: T) => void;
 }) {
   if (!rows.length) return <div className="px-6 py-16 text-center text-sm text-muted-foreground">{empty}</div>;
   return (
@@ -159,30 +157,16 @@ export function DataTable<T>({ columns, rows, rowKey, rowClass, empty }: {
         </thead>
         <tbody>
           {rows.map((r) => (
-            <tr key={rowKey(r)} className={cn("border-b last:border-0 transition-colors hover:bg-muted/50", rowClass?.(r))}>
+            <tr
+              key={rowKey(r)}
+              onClick={onRowClick ? () => onRowClick(r) : undefined}
+              className={cn("border-b last:border-0 transition-colors hover:bg-muted/50", onRowClick && "cursor-pointer", rowClass?.(r))}
+            >
               {columns.map((c) => <td key={c.header} className={cn("px-5 py-3", c.className)}>{c.cell(r)}</td>)}
             </tr>
           ))}
         </tbody>
       </table>
-    </div>
-  );
-}
-
-export function ToggleRow({ label, kind, refId, checked, onChange }: {
-  label: string; kind: "page" | "action"; refId: string; checked: boolean; onChange: (v: boolean) => void;
-}) {
-  return (
-    <div className="flex items-center gap-4 px-5 py-3.5">
-      <div className="min-w-0 flex-1">
-        <p className="font-medium text-foreground">{label}</p>
-        <p className="truncate font-mono text-xs text-muted-foreground">{refId}</p>
-      </div>
-      <Badge tone="muted">{kind}</Badge>
-      <span className={cn("hidden w-8 text-right font-mono text-xs sm:inline", checked ? "text-primary" : "text-muted-foreground")}>
-        {checked ? "ON" : "OFF"}
-      </span>
-      <Switch checked={checked} onCheckedChange={onChange} aria-label={`Agent access for ${label}`} />
     </div>
   );
 }

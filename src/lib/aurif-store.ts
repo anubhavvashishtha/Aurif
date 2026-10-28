@@ -23,6 +23,10 @@ export interface AgentEvent {
   kind: EventKind;
   target: string;
   redactedFields?: string[];
+  accepted?: boolean;
+  reason?: string;
+  asked?: unknown;
+  navigated?: string[];
 }
 
 export interface Endpoint {
@@ -92,19 +96,23 @@ function mapEndpoint(raw: any): Endpoint {
 
 function mapEvent(raw: any): AgentEvent {
   const kind = (raw.kind || "page") as EventKind;
+  const detail = raw.detail || {};
+  const asked = detail.asked;
+  const askedLabel =
+    asked && typeof asked === "object"
+      ? [asked.method, asked.path || asked.action_id, asked.query?.path].filter(Boolean).join(" ")
+      : "";
   return {
     id: raw.id || crypto.randomUUID(),
     time: raw.ts ? new Date(raw.ts * 1000).toISOString() : new Date().toISOString(),
-    agentId: raw.agent_id || "unknown",
+    agentId: raw.agent_id || "agent",
     kind,
-    target:
-      raw.path ||
-      raw.action_id ||
-      (raw.detail?.purpose_risk
-        ? `risk:${raw.detail.purpose_risk.risk} — ${raw.detail.purpose || raw.detail.reason || ""}`
-        : raw.detail?.purpose || raw.detail?.reason) ||
-      "—",
-    redactedFields: raw.detail?.redacted_fields,
+    target: askedLabel || raw.path || raw.action_id || detail.reason || "—",
+    redactedFields: detail.redacted_fields,
+    accepted: typeof detail.accepted === "boolean" ? detail.accepted : undefined,
+    reason: detail.reason,
+    asked,
+    navigated: Array.isArray(detail.navigated) ? detail.navigated.filter(Boolean) : raw.path ? [raw.path] : [],
   };
 }
 
@@ -391,33 +399,15 @@ export async function summarizeActivity(siteId: string) {
   }>(`/api/sites/${siteId}/ai/activity-summary`, { method: "POST", body: "{}" });
 }
 
-export async function runMuseAgent(body: {
-  goal: string;
-  purpose?: string;
-  agent_id?: string;
-  site_key?: string;
-  requested_scopes?: string[];
-  max_steps?: number;
-}) {
+export async function chatWithMuse(body: { message: string; site_key?: string }) {
   return api<{
     ok: boolean;
-    goal: string;
-    granted_scopes: string[];
-    purpose_risk?: Record<string, unknown>;
-    steps: Array<Record<string, unknown>>;
-    model: string;
-  }>("/api/ai/agent-run", { method: "POST", body: JSON.stringify(body) });
+    denied: boolean;
+    reply: string;
+    path?: string;
+    status?: number;
+  }>("/api/ai/agent-chat", { method: "POST", body: JSON.stringify(body) });
 }
-
-/** Local-only console helper (real agent traffic is logged server-side). */
-export const logEvent = (siteId: string, ev: Omit<AgentEvent, "id" | "time">) => {
-  const site = state.sites.find((s) => s.id === siteId);
-  if (!site) return;
-  replaceSite({
-    ...site,
-    events: [{ ...ev, id: crypto.randomUUID(), time: new Date().toISOString() }, ...site.events],
-  });
-};
 
 export const useActiveSite = () =>
   useAurif((s) => (s.sites.find((x) => x.id === s.activeSiteId) ?? s.sites[0]) as Site);

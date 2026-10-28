@@ -266,12 +266,13 @@ export function HumanGate({ embed = false }: { embed?: boolean }) {
           </div>
           <div>
             <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-white/45">Agents</p>
+            <p className="mt-1 text-xs leading-relaxed text-white/80">Read the open help API, then send the site key on every other call.</p>
             <ol className="mt-1 list-decimal space-y-0.5 pl-4 font-mono text-[10px] leading-relaxed text-white/80">
-              <li>GET /.well-known/aurif.json</li>
-              <li>POST /ai/handshake</li>
-              <li>GET /ai/page · POST /ai/actions</li>
+              <li>GET /ai/help</li>
+              <li>POST /ai/handshake with site_key</li>
+              <li>GET /ai/page · header X-Aurif-Site-Key</li>
             </ol>
-            <p className="mt-1 font-mono text-[10px] text-white/40">{API_BASE}</p>
+            <p className="mt-1 font-mono text-[10px] text-white/40">{API_BASE}/ai/help</p>
           </div>
         </div>
       </div>

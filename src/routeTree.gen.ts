@@ -10,23 +10,18 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
-import { Route as ConsoleRouteImport } from './routes/console'
 import { Route as DashboardRouteImport } from './routes/dashboard'
 import { Route as GateRouteImport } from './routes/gate'
 import { Route as SignupRouteImport } from './routes/signup'
 import { Route as DashboardIndexRouteImport } from './routes/dashboard.index'
 import { Route as DashboardActivityRouteImport } from './routes/dashboard.activity'
+import { Route as DashboardAgentRouteImport } from './routes/dashboard.agent'
 import { Route as DashboardCredentialsRouteImport } from './routes/dashboard.credentials'
 import { Route as DashboardEndpointsRouteImport } from './routes/dashboard.endpoints'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const ConsoleRoute = ConsoleRouteImport.update({
-  id: '/console',
-  path: '/console',
   getParentRoute: () => rootRouteImport,
 } as any)
 const DashboardRoute = DashboardRouteImport.update({
@@ -54,6 +49,11 @@ const DashboardActivityRoute = DashboardActivityRouteImport.update({
   path: '/activity',
   getParentRoute: () => DashboardRoute,
 } as any)
+const DashboardAgentRoute = DashboardAgentRouteImport.update({
+  id: '/agent',
+  path: '/agent',
+  getParentRoute: () => DashboardRoute,
+} as any)
 const DashboardCredentialsRoute = DashboardCredentialsRouteImport.update({
   id: '/credentials',
   path: '/credentials',
@@ -67,21 +67,21 @@ const DashboardEndpointsRoute = DashboardEndpointsRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
-  '/console': typeof ConsoleRoute
   '/dashboard': typeof DashboardRouteWithChildren
   '/gate': typeof GateRoute
   '/signup': typeof SignupRoute
   '/dashboard/activity': typeof DashboardActivityRoute
+  '/dashboard/agent': typeof DashboardAgentRoute
   '/dashboard/credentials': typeof DashboardCredentialsRoute
   '/dashboard/endpoints': typeof DashboardEndpointsRoute
   '/dashboard/': typeof DashboardIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
-  '/console': typeof ConsoleRoute
   '/gate': typeof GateRoute
   '/signup': typeof SignupRoute
   '/dashboard/activity': typeof DashboardActivityRoute
+  '/dashboard/agent': typeof DashboardAgentRoute
   '/dashboard/credentials': typeof DashboardCredentialsRoute
   '/dashboard/endpoints': typeof DashboardEndpointsRoute
   '/dashboard': typeof DashboardIndexRoute
@@ -89,11 +89,11 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
-  '/console': typeof ConsoleRoute
   '/dashboard': typeof DashboardRouteWithChildren
   '/gate': typeof GateRoute
   '/signup': typeof SignupRoute
   '/dashboard/activity': typeof DashboardActivityRoute
+  '/dashboard/agent': typeof DashboardAgentRoute
   '/dashboard/credentials': typeof DashboardCredentialsRoute
   '/dashboard/endpoints': typeof DashboardEndpointsRoute
   '/dashboard/': typeof DashboardIndexRoute
@@ -102,32 +102,32 @@ export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
-    | '/console'
     | '/dashboard'
     | '/gate'
     | '/signup'
     | '/dashboard/activity'
+    | '/dashboard/agent'
     | '/dashboard/credentials'
     | '/dashboard/endpoints'
     | '/dashboard/'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
-    | '/console'
     | '/gate'
     | '/signup'
     | '/dashboard/activity'
+    | '/dashboard/agent'
     | '/dashboard/credentials'
     | '/dashboard/endpoints'
     | '/dashboard'
   id:
     | '__root__'
     | '/'
-    | '/console'
     | '/dashboard'
     | '/gate'
     | '/signup'
     | '/dashboard/activity'
+    | '/dashboard/agent'
     | '/dashboard/credentials'
     | '/dashboard/endpoints'
     | '/dashboard/'
@@ -135,7 +135,6 @@ export interface FileRouteTypes {
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
-  ConsoleRoute: typeof ConsoleRoute
   DashboardRoute: typeof DashboardRouteWithChildren
   GateRoute: typeof GateRoute
   SignupRoute: typeof SignupRoute
@@ -148,13 +147,6 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/console': {
-      id: '/console'
-      path: '/console'
-      fullPath: '/console'
-      preLoaderRoute: typeof ConsoleRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/dashboard': {
@@ -192,6 +184,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof DashboardActivityRouteImport
       parentRoute: typeof DashboardRoute
     }
+    '/dashboard/agent': {
+      id: '/dashboard/agent'
+      path: '/agent'
+      fullPath: '/dashboard/agent'
+      preLoaderRoute: typeof DashboardAgentRouteImport
+      parentRoute: typeof DashboardRoute
+    }
     '/dashboard/credentials': {
       id: '/dashboard/credentials'
       path: '/credentials'
@@ -211,6 +210,7 @@ declare module '@tanstack/react-router' {
 
 interface DashboardRouteChildren {
   DashboardActivityRoute: typeof DashboardActivityRoute
+  DashboardAgentRoute: typeof DashboardAgentRoute
   DashboardCredentialsRoute: typeof DashboardCredentialsRoute
   DashboardEndpointsRoute: typeof DashboardEndpointsRoute
   DashboardIndexRoute: typeof DashboardIndexRoute
@@ -218,6 +218,7 @@ interface DashboardRouteChildren {
 
 const DashboardRouteChildren: DashboardRouteChildren = {
   DashboardActivityRoute: DashboardActivityRoute,
+  DashboardAgentRoute: DashboardAgentRoute,
   DashboardCredentialsRoute: DashboardCredentialsRoute,
   DashboardEndpointsRoute: DashboardEndpointsRoute,
   DashboardIndexRoute: DashboardIndexRoute,
@@ -229,7 +230,6 @@ const DashboardRouteWithChildren = DashboardRoute._addFileChildren(
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
-  ConsoleRoute: ConsoleRoute,
   DashboardRoute: DashboardRouteWithChildren,
   GateRoute: GateRoute,
   SignupRoute: SignupRoute,
