@@ -5,6 +5,7 @@ Customer storefront UI: Demo-client (Vite). Dashboard UI: Aurif-UI (Vite).
 
 from __future__ import annotations
 
+import json
 import re
 import secrets
 import time
@@ -14,6 +15,7 @@ from typing import Any
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
+import muse_browse
 import muse_client
 import store
 from agent_gate import blocked_response_body, looks_like_anonymous_agent
@@ -56,6 +58,7 @@ CORS(
         "X-Aurif-Agent",
         "X-Aurif-Site-Key",
         "X-Aurif-Human",
+        "X-Demo-As-Agent",
     ],
 )
 
@@ -900,26 +903,228 @@ def api_activity_summary(site_id: str):
 
 
 def _path_from_message(message: str) -> str:
-    url_match = re.search(r"https?://\S+", message)
-    if url_match:
-        raw = url_match.group(0).rstrip(".,)")
-        path = re.sub(r"^https?://[^/]+", "", raw) or "/"
-        if not path.startswith("/"):
-            path = "/" + path
-        return path.split("?")[0] or "/"
-    path_match = re.search(r"(?:^|\s)(/[A-Za-z0-9_./-]*)", message)
-    if path_match:
-        return path_match.group(1).rstrip("/") or "/"
-    lowered = message.lower()
-    for guess, token in (("/products", "shop"), ("/products", "product"), ("/cart", "cart"), ("/", "home")):
-        if token in lowered:
-            return guess
-    return "/"
+    return muse_browse.shop_path_from_message(message, PRODUCTS)
+
+
+def _fmt_money(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    try:
+        return f"${float(value):g}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _fmt_field_value(key: str, value: Any) -> str | None:
+    if value is None or value == "" or value == [] or value == {}:
+        return None
+    key_l = key.lower()
+    if key_l in ("price", "compare_at", "compareat") or key_l.endswith("_price"):
+        money = _fmt_money(value)
+        return money
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        if all(isinstance(x, (str, int, float)) for x in value):
+            return ", ".join(str(x) for x in value)
+        parts = []
+        for item in value[:8]:
+            if isinstance(item, dict):
+                label = (
+                    item.get("name")
+                    or item.get("title")
+                    or item.get("label")
+                    or item.get("author")
+                    or item.get("slug")
+                )
+                extra = []
+                if item.get("price") is not None:
+                    money = _fmt_money(item.get("price"))
+                    if money:
+                        extra.append(money)
+                if item.get("rating") is not None:
+                    extra.append(f"rating {item.get('rating')}")
+                if label:
+                    parts.append(f"{label}" + (f" ({', '.join(extra)})" if extra else ""))
+                else:
+                    parts.append(json.dumps(item, ensure_ascii=True))
+            else:
+                parts.append(str(item))
+        return "; ".join(parts) if parts else None
+    if isinstance(value, dict):
+        bits = []
+        for k, v in value.items():
+            rendered = _fmt_field_value(str(k), v)
+            if rendered:
+                bits.append(f"{str(k).replace('_', ' ')}: {rendered}")
+        return "; ".join(bits) if bits else None
+    return str(value)
+
+
+def _collect_visible_fields(page: dict[str, Any]) -> list[tuple[str, str]]:
+    """Turn the page JSON Muse received into plain label/value pairs."""
+    fields: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def add(label: str, value: Any) -> None:
+        key = label.lower()
+        if key in seen:
+            return
+        rendered = _fmt_field_value(label, value)
+        if not rendered:
+            return
+        seen.add(key)
+        fields.append((label.replace("_", " ").capitalize(), rendered))
+
+    add("title", page.get("title"))
+    add("summary", page.get("summary"))
+    meta = page.get("meta") if isinstance(page.get("meta"), dict) else {}
+    preferred = (
+        "name",
+        "summary",
+        "price",
+        "compare_at",
+        "rating",
+        "discount",
+        "sku",
+        "category",
+        "tagline",
+        "highlights",
+        "stock",
+        "review_count",
+        "items",
+        "products",
+    )
+    for key in preferred:
+        if key in meta:
+            add(key, meta.get(key))
+    for key, value in meta.items():
+        if key in preferred or key in ("description",):
+            continue
+        add(str(key), value)
+    for key in ("rating", "discount", "reviews"):
+        if key in page:
+            add(key, page.get(key))
+    return fields
+
+
+def _describe_page_for_owner(page: dict[str, Any]) -> str:
+    """Deterministic plain-English report of what Muse could see."""
+    if page.get("blocked"):
+        reason = page.get("summary") or page.get("error") or "This page is blocked for agents."
+        return f"The site did not show me page details. It said: {reason}"
+
+    fields = _collect_visible_fields(page)
+    product_rows: list[str] = []
+    for el in page.get("elements") or []:
+        if not isinstance(el, dict):
+            continue
+        meta = el.get("meta") if isinstance(el.get("meta"), dict) else {}
+        label = str(el.get("label") or "")
+        if not label.lower().startswith("view ") or not meta:
+            continue
+        name = label[5:].strip()
+        bits = [name]
+        if meta.get("price") is not None:
+            money = _fmt_money(meta.get("price"))
+            if money:
+                bits.append(f"price {money}")
+        if meta.get("rating") is not None:
+            bits.append(f"rating {meta.get('rating')}")
+        product_rows.append(" — ".join(bits))
+
+    actions = [
+        str(el.get("label"))
+        for el in (page.get("elements") or [])
+        if isinstance(el, dict) and el.get("label") and not str(el.get("label")).lower().startswith("view ")
+    ]
+
+    lines: list[str] = ["Here's what the site showed me:"]
+    if fields:
+        for label, value in fields:
+            lines.append(f"- {label}: {value}")
+    if product_rows:
+        lines.append("- Products:")
+        for row in product_rows:
+            lines.append(f"  • {row}")
+    if actions:
+        lines.append("- Available actions: " + ", ".join(actions))
+    if len(lines) == 1:
+        lines.append("- No visible fields were returned for this page.")
+    return "\n".join(lines)
+
+
+def _describe_denied_for_owner(body: dict[str, Any]) -> str:
+    error = body.get("error") or body.get("summary") or body.get("reason")
+    reason = body.get("reason")
+    if error and reason and reason != error:
+        detail = f"{error} ({str(reason).replace('_', ' ')})"
+    elif error:
+        detail = str(error)
+    else:
+        detail = json.dumps(body, ensure_ascii=True)
+    return f"The site did not share page data with me. Its response was: {detail}."
+
+
+def _muse_report_site_response(fallback: str, *, seen_fields: list[tuple[str, str]] | None = None) -> str:
+    """Ask Muse to explain what it saw; keep the deterministic fallback if polish fails."""
+    field_block = ""
+    if seen_fields:
+        field_block = "Visible fields Muse received:\n" + "\n".join(f"- {k}: {v}" for k, v in seen_fields)
+    prompt = (
+        "You are Muse inside Aurif, talking to the site owner.\n"
+        "Explain what you could see on the website in plain English.\n"
+        "Rules:\n"
+        "- Do NOT mention HTTP status, path, JSON, endpoints, or protocol jargon.\n"
+        "- Describe the fields you received: name, title, price, rating, and so on.\n"
+        "- Write a short natural answer, like: I can see this product. Its name is …, price is …\n"
+        "- If nothing was shared, say the site did not show you page details and quote what it said.\n"
+        "- Use only the facts below.\n\n"
+        f"{field_block}\n\nFallback draft:\n{fallback}"
+    )
+    try:
+        polished = muse_client.complete(
+            [{"role": "user", "content": prompt}],
+            max_tokens=320,
+            temperature=0.25,
+        )
+        cleaned = polished.strip()
+        words = cleaned.split()
+        bad = any(token in cleaned.lower() for token in ("http ", "path ", "json", "status code"))
+        if cleaned and 8 < len(words) < 180 and not bad:
+            return cleaned
+    except Exception:
+        pass
+    return fallback
+
+
+@app.get("/api/ai/models")
+def api_ai_models():
+    """Models available in the Agent dashboard dropdown."""
+    owner, err = owner_auth()
+    if err:
+        return err
+    _ = owner
+    models = muse_client.list_agent_models()
+    current = next((m for m in models if m.get("default")), models[0] if models else None)
+    return jsonify(
+        {
+            "ok": True,
+            "models": models,
+            "current": current,
+            "providers": {
+                "baseten": {"base_url": muse_client.BASETEN_BASE_URL},
+                "modal": {"base_url": muse_client.MODAL_BASE_URL},
+            },
+        }
+    )
 
 
 @app.post("/api/ai/agent-chat")
 def api_agent_chat():
-    """Owner chat: Muse tries the Aurif protocol with the pasted site key and reports what came back."""
+    """Owner chat: Muse browses the real storefront like a normal agent (no /ai/* protocol)."""
     owner, err = owner_auth()
     if err:
         return err
@@ -928,88 +1133,54 @@ def api_agent_chat():
     message = str(data.get("message") or "").strip()
     if not message:
         return jsonify({"ok": False, "error": "message required"}), 400
-    site_key = str(data.get("site_key") or "").strip()
-    path = _path_from_message(message)
-    wants_help = any(
-        word in message.lower() for word in ("help", "what to send", "what should", "documentation", "docs", "fields")
+
+    site = site_record()
+    path = muse_browse.shop_path_from_message(message, PRODUCTS)
+    # Owner toggle: only attach site key when explicitly enabled in the Agent dashboard.
+    use_site_key = bool(data.get("use_site_key"))
+    site_key = str(data.get("site_key") or "").strip() if use_site_key else ""
+    model_info = muse_client.resolve_model(str(data.get("model") or "").strip() or None)
+    result = muse_browse.browse_as_agent(
+        site=site,
+        path=path,
+        products=PRODUCTS,
+        message=message,
+        site_key=site_key or None,
+        model=model_info["id"],
+        provider=model_info["provider"],
     )
 
-    def local_call(method: str, call_path: str, body: dict | None = None, token: str | None = None):
-        headers = {"X-Aurif-Protocol": PROTOCOL, "Content-Type": "application/json"}
-        if token:
-            headers["X-Aurif-Session"] = token
-        if site_key:
-            headers["X-Aurif-Site-Key"] = site_key
-        with app.test_client() as client:
-            if method == "GET":
-                res = client.get(call_path, headers=headers)
-            else:
-                res = client.open(call_path, method=method, json=body or {}, headers=headers)
-            return res.status_code, res.get_json(silent=True) or {}
-
-    _, help_doc = local_call("GET", "/ai/help")
-    hs_status, hs = local_call(
-        "POST",
-        "/ai/handshake",
-        {
-            "purpose": message[:240],
-            "requested_scopes": ["view"],
-            **({"site_key": site_key} if site_key else {}),
+    kind = "page_blocked" if result.get("denied") else "page"
+    store.log_activity(
+        site["id"],
+        kind=kind,
+        agent_id="muse-dashboard/1.0",
+        path=path,
+        detail={
+            "accepted": not bool(result.get("denied")),
+            "reason": "muse_storefront_browse",
+            "asked": {"method": "GET", "url": result.get("url"), "purpose": message[:240]},
+            "navigated": [path],
+            "captcha": result.get("captcha"),
+            "storefront_status": result.get("status"),
+            "site_key_used": bool(site_key),
+            "model": model_info,
         },
     )
-    if hs_status != 200 or not hs.get("session_token"):
-        reply = "Access denied. The site key is missing or does not match, so Aurif returned no site data."
-        if wants_help:
-            reply += " GET /ai/help is open and lists what to send. Every other call still needs the site key."
-        return jsonify({"ok": True, "denied": True, "reply": reply, "path": path, "status": hs_status})
 
-    page_status, page = local_call("GET", f"/ai/page?path={path}", token=hs["session_token"])
-    if page_status >= 400 or (isinstance(page, dict) and page.get("blocked")):
-        reply = f"Access denied for {path}. The site key matched, and this endpoint is closed."
-        return jsonify({"ok": True, "denied": True, "reply": reply, "path": path, "status": page_status})
-
-    title = page.get("title") if isinstance(page, dict) else ""
-    summary = page.get("summary") if isinstance(page, dict) else ""
-    labels = [
-        str(el.get("label"))
-        for el in (page.get("elements") or [])
-        if isinstance(el, dict) and el.get("label")
-    ] if isinstance(page, dict) else []
-    facts = (
-        f"Path {path}. Title: {title}. Summary: {summary}. "
-        f"The agent can see: {', '.join(labels) if labels else 'no elements'}."
-    )
-    reply = facts
-    try:
-        polished = muse_client.complete(
-            [
-                {
-                    "role": "user",
-                    "content": (
-                        "You are Muse inside Aurif. Tell the site owner what this agent request returned. "
-                        "Two short sentences. Use only these facts:\n" + facts
-                    ),
-                }
-            ],
-            max_tokens=160,
-            temperature=0.2,
-        )
-        words = polished.split()
-        if polished and 6 < len(words) < 70:
-            reply = polished.strip()
-    except Exception:
-        pass
-    if wants_help:
-        reply += " GET /ai/help is open and lists the fields. Every other call needs the site key."
     return jsonify(
         {
             "ok": True,
-            "denied": False,
-            "reply": reply,
+            "denied": bool(result.get("denied")),
+            "reply": result.get("reply"),
+            "steps": result.get("steps") or [],
             "path": path,
-            "status": page_status,
-            "labels": labels,
-            "help": help_doc if wants_help else None,
+            "status": result.get("status"),
+            "fields": result.get("fields") or [],
+            "site_response": result.get("site_response"),
+            "captcha": result.get("captcha"),
+            "url": result.get("url"),
+            "model": model_info,
         }
     )
 
@@ -1086,11 +1257,34 @@ def api_human_verify():
         return jsonify({"ok": False, "error": f"vision check failed: {e}"}), 502
 
     if not verdict.get("ok"):
-        # Keep challenge so they can redraw once; only consume on success
+        # Keep challenge so they can redraw once; only consume on success.
+        # Rejected drawings (often agents) get directed to the credentialed API path.
         return jsonify(
             {
                 "ok": False,
                 "error": verdict.get("reason") or "drawing did not match",
+                "agent_access": {
+                    "title": "Use the API with a site key",
+                    "message": (
+                        "In order to access this page as an agent, send a request to the Aurif API "
+                        "with the required site key. The human storefront stays closed."
+                    ),
+                    "steps": [
+                        {"method": "GET", "path": "/ai/help", "note": "Open help — no site key"},
+                        {
+                            "method": "POST",
+                            "path": "/ai/handshake",
+                            "note": "Body must include site_key (or header X-Aurif-Site-Key)",
+                        },
+                        {
+                            "method": "GET",
+                            "path": "/ai/page?path=/",
+                            "note": "Send X-Aurif-Site-Key and X-Aurif-Session from handshake",
+                        },
+                    ],
+                    "api_base": "http://127.0.0.1:8787",
+                    "site_key_header": "X-Aurif-Site-Key",
+                },
                 "verdict": {
                     "read_as": verdict.get("read_as"),
                     "match": verdict.get("match"),

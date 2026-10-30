@@ -20,12 +20,74 @@ BASETEN_BASE_URL = "https://inference.baseten.co/v1"
 # Hackathon model id — plain muse-spark-open returns 403 with participant keys
 DEFAULT_MODEL = os.environ.get("BASETEN_MODEL", "meta-models/muse-spark-open-1026")
 
-# Modal DeepSeek vision endpoint (draw CAPTCHA)
+# Modal DeepSeek vision endpoint (draw CAPTCHA) + optional text inference
 MODAL_BASE_URL = os.environ.get(
     "MODAL_BASE_URL",
     "https://anubhavvashishtha-iitd--ep-deepseek-v4-1-flash-server.us-west.modal.direct/v1",
 ).rstrip("/")
 VISION_MODEL = os.environ.get("MODAL_VISION_MODEL", "deepseek-ai/DeepSeek-V4.1-Flash")
+
+# Models the Agent dashboard can switch between (Baseten Meta + Modal).
+AGENT_MODELS: list[dict[str, str]] = [
+    {
+        "id": "meta-models/muse-spark-open-1026",
+        "label": "Muse Spark Open",
+        "provider": "baseten",
+    },
+    {
+        "id": VISION_MODEL,
+        "label": "DeepSeek V4.1 Flash",
+        "provider": "modal",
+    },
+]
+
+
+def list_agent_models() -> list[dict[str, Any]]:
+    """Catalog for the Agent dashboard model dropdown."""
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    if DEFAULT_MODEL:
+        out.append(
+            {
+                "id": DEFAULT_MODEL,
+                "label": "Muse Spark Open" if "muse-spark" in DEFAULT_MODEL else DEFAULT_MODEL.split("/")[-1],
+                "provider": "baseten",
+                "default": True,
+            }
+        )
+        seen.add(DEFAULT_MODEL)
+    for row in AGENT_MODELS:
+        if row["id"] in seen:
+            continue
+        out.append(
+            {
+                "id": row["id"],
+                "label": row["label"],
+                "provider": row["provider"],
+                "default": False,
+            }
+        )
+        seen.add(row["id"])
+    if not out:
+        out.append(
+            {
+                "id": "meta-models/muse-spark-open-1026",
+                "label": "Muse Spark Open",
+                "provider": "baseten",
+                "default": True,
+            }
+        )
+    return out
+
+
+def resolve_model(model_id: str | None) -> dict[str, str]:
+    mid = (model_id or "").strip() or DEFAULT_MODEL
+    for row in list_agent_models():
+        if row["id"] == mid:
+            return {"id": row["id"], "provider": row["provider"], "label": row["label"]}
+    if mid == VISION_MODEL or mid.startswith("deepseek"):
+        return {"id": mid, "provider": "modal", "label": mid}
+    return {"id": mid, "provider": "baseten", "label": mid}
 
 
 def _api_key() -> str:
@@ -67,15 +129,23 @@ def complete(
     max_tokens: int = 1200,
     temperature: float = 0.2,
     model: str | None = None,
+    provider: str | None = None,
 ) -> str:
-    client = get_client()
-    response = client.chat.completions.create(
-        model=model or DEFAULT_MODEL,
-        messages=messages,
-        stream=False,
-        max_tokens=max_tokens,
-        temperature=temperature,
-    )
+    resolved = resolve_model(model)
+    mid = resolved["id"]
+    prov = (provider or resolved["provider"] or "baseten").lower()
+    client = get_modal_client() if prov == "modal" else get_client()
+    kwargs: dict[str, Any] = {
+        "model": mid,
+        "messages": messages,
+        "stream": False,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if prov == "modal":
+        # Modal DeepSeek endpoint accepts OpenAI-compatible chat; keep extras light.
+        pass
+    response = client.chat.completions.create(**kwargs)
     return _message_text(response.choices[0].message)
 
 
@@ -133,6 +203,13 @@ Purpose: {purpose}
             "suggested_scopes": ["view"],
             "drop_act": True,
             "error": str(e),
+        }
+    if not isinstance(data, dict):
+        return {
+            "risk": "medium",
+            "reason": "risk model returned a non-object payload",
+            "suggested_scopes": ["view"],
+            "drop_act": True,
         }
     risk = str(data.get("risk") or "medium").lower()
     if risk not in ("low", "medium", "high"):
@@ -408,12 +485,20 @@ def verify_drawing(image_data_url: str, target: str) -> dict[str, Any]:
     prompt = f"""CAPTCHA check. Target to draw: "{target}"
 
 Look at the image. Decide if a human roughly hand-drew "{target}".
-Imperfect strokes OK. Reject blank, wrong chars, or typed/screenshot text.
+Imperfect strokes OK.
+
+Rules:
+- match=true only if the drawing shows "{target}"
+- human_like=true only for messy hand strokes (mouse/finger sketch)
+- human_like=false for typed fonts, perfect glyphs, screenshots, blank, or bot-rendered text
+- Reject blank or wrong characters with match=false
 
 End your reply with ONE JSON object (no markdown):
 {{"match":true,"human_like":true,"read_as":"{target}","reason":"ok"}}
 or
 {{"match":false,"human_like":false,"read_as":"","reason":"blank"}}
+or
+{{"match":true,"human_like":false,"read_as":"{target}","reason":"typed_or_machine"}}
 """
     messages = [
         {
@@ -483,12 +568,16 @@ or
         return {"ok": False, "reason": "invalid vision response", "model": used_model}
 
     match = bool(data.get("match"))
-    human_like = bool(data.get("human_like", True))
+    # Default False: missing human_like must not accidentally pass bots.
+    human_like = bool(data.get("human_like")) if "human_like" in data else False
     read_as = str(data.get("read_as") or "").strip().upper().replace(" ", "")
     reason = str(data.get("reason") or "")[:200]
-    if not match and read_as == target:
+    # Correct glyph alone is not enough — typed/bot renders often match the target.
+    if not match and read_as == target and human_like:
         match = True
-    ok = match
+    ok = bool(match and human_like)
+    if match and not human_like and not reason:
+        reason = "looks machine-made, not hand-drawn"
     return {
         "ok": ok,
         "match": match,
