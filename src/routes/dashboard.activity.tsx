@@ -100,7 +100,7 @@ function Activity() {
             { header: "Time", cell: (r) => <span className="whitespace-nowrap font-mono text-xs text-muted-foreground">{new Date(r.time).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span> },
             { header: "Result", cell: (r) => <span className="font-mono text-xs uppercase">{r.accepted === false || isBlockedKind(r.kind) ? "Denied" : r.accepted ? "Accepted" : "Logged"}</span> },
             { header: "Event", cell: (r) => <EventBadge kind={r.kind} /> },
-            { header: "Asked", cell: (r) => <span className="font-mono text-xs text-muted-foreground">{r.target}{r.redactedFields?.length ? <span className="ml-2 rounded-sm border border-ink bg-ink px-2 py-0.5 text-ink-foreground">redacted: {r.redactedFields.join(", ")}</span> : null}</span> },
+            { header: "Asked", cell: (r) => <span className="font-mono text-xs text-muted-foreground">{r.target}</span> },
           ]}
         />
         {open && (
@@ -108,7 +108,7 @@ function Activity() {
             <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-muted-foreground">Request</p>
             <p className="mt-1 text-ink">{open.reason || "No reason recorded."}</p>
             <p className="mt-3 font-mono text-[10px] uppercase tracking-[0.16em] text-muted-foreground">Asked</p>
-            <pre className="mt-1 overflow-auto bg-ink p-3 font-mono text-xs text-ink-foreground">{JSON.stringify(open.asked ?? open.target, null, 2)}</pre>
+            <pre className="mt-1 overflow-auto border border-ink/10 bg-frost p-3 font-mono text-xs text-ink">{JSON.stringify(open.asked ?? open.target, null, 2)}</pre>
             <p className="mt-3 font-mono text-[10px] uppercase tracking-[0.16em] text-muted-foreground">Navigated</p>
             <p className="mt-1 font-mono text-xs">{open.navigated?.length ? open.navigated.join(" → ") : "Did not navigate."}</p>
           </div>

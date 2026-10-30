@@ -5,11 +5,26 @@ import {
   clearHumanToken,
   fetchChallenge,
   fetchGate,
+  HumanVerifyError,
   verifyHumanDrawing,
+  type AgentAccessHint,
   type Challenge,
 } from "@/lib/human-gate";
 
 const API_BASE = import.meta.env.VITE_AURIF_API ?? "http://127.0.0.1:8787";
+
+const DEFAULT_AGENT_HINT: AgentAccessHint = {
+  title: "Use the API with a site key",
+  message:
+    "In order to access this page as an agent, send a GET or POST request to the Aurif API with the required site key. The human storefront will not open from a failed drawing.",
+  steps: [
+    { method: "GET", path: "/ai/help", note: "Open help — no site key" },
+    { method: "POST", path: "/ai/handshake", note: "Include site_key in the body or X-Aurif-Site-Key header" },
+    { method: "GET", path: "/ai/page?path=/", note: "Send X-Aurif-Site-Key and the session from handshake" },
+  ],
+  api_base: API_BASE,
+  site_key_header: "X-Aurif-Site-Key",
+};
 
 export function HumanGate({ embed = false }: { embed?: boolean }) {
   const [ready, setReady] = useState(false);
@@ -20,6 +35,7 @@ export function HumanGate({ embed = false }: { embed?: boolean }) {
   const [siteName, setSiteName] = useState("this site");
   const [hasInk, setHasInk] = useState(false);
   const [required, setRequired] = useState(true);
+  const [agentModal, setAgentModal] = useState<AgentAccessHint | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const drawing = useRef(false);
@@ -149,7 +165,10 @@ export function HumanGate({ embed = false }: { embed?: boolean }) {
       const data = await verifyHumanDrawing(challenge.challenge_id, image);
       release(data.human_token);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Verification failed");
+      const verifyErr = err instanceof HumanVerifyError ? err : null;
+      setError(verifyErr?.message || (err instanceof Error ? err.message : "Verification failed"));
+      // Failed drawing → do not open the site. Show agent API / site-key instructions.
+      setAgentModal(verifyErr?.agentAccess || DEFAULT_AGENT_HINT);
       try {
         const ch = await fetchChallenge();
         setChallenge(ch);
@@ -258,24 +277,55 @@ export function HumanGate({ embed = false }: { embed?: boolean }) {
         )}
 
         {!challenge?.prompt && error && <p className="mt-4 text-sm text-red-300">{error}</p>}
+      </div>
 
-        <div className="mt-5 grid gap-3 border border-white/15 p-3 sm:grid-cols-2">
-          <div>
-            <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-white/45">Humans</p>
-            <p className="mt-1 text-xs leading-relaxed text-white/80">Draw on this Aurif pad. The shop opens only after the vision check.</p>
-          </div>
-          <div>
-            <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-white/45">Agents</p>
-            <p className="mt-1 text-xs leading-relaxed text-white/80">Read the open help API, then send the site key on every other call.</p>
-            <ol className="mt-1 list-decimal space-y-0.5 pl-4 font-mono text-[10px] leading-relaxed text-white/80">
-              <li>GET /ai/help</li>
-              <li>POST /ai/handshake with site_key</li>
-              <li>GET /ai/page · header X-Aurif-Site-Key</li>
+      {agentModal && (
+        <div
+          className="fixed inset-0 z-50 grid place-items-center bg-black/70 px-4"
+          role="dialog"
+          aria-modal="true"
+          data-testid="aurif-agent-access-modal"
+        >
+          <div className="w-full max-w-md border border-white/20 bg-[#111] p-5 text-white shadow-2xl">
+            <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-white/50">Access denied</p>
+            <h2 className="mt-2 font-mono text-2xl text-white">{agentModal.title || DEFAULT_AGENT_HINT.title}</h2>
+            <p className="mt-3 text-sm leading-relaxed text-white/75">
+              {agentModal.message || DEFAULT_AGENT_HINT.message}
+            </p>
+            <ol className="mt-4 space-y-2 border border-white/15 bg-black/40 p-3 font-mono text-[11px] text-white/85">
+              {(agentModal.steps || DEFAULT_AGENT_HINT.steps || []).map((step) => (
+                <li key={`${step.method}-${step.path}`}>
+                  <span className="text-white">{step.method}</span>{" "}
+                  <span className="text-white/90">{(agentModal.api_base || API_BASE) + step.path}</span>
+                  {step.note ? <span className="mt-0.5 block text-white/50">{step.note}</span> : null}
+                </li>
+              ))}
             </ol>
-            <p className="mt-1 font-mono text-[10px] text-white/40">{API_BASE}/ai/help</p>
+            <p className="mt-3 font-mono text-[10px] text-white/45">
+              Required credential header: {agentModal.site_key_header || "X-Aurif-Site-Key"}
+            </p>
+            <div className="mt-5 flex gap-2">
+              <button
+                type="button"
+                className="inline-flex h-10 flex-1 items-center justify-center border border-white/25 font-mono text-xs uppercase tracking-wider"
+                onClick={() => {
+                  setAgentModal(null);
+                  clearPad();
+                }}
+              >
+                Try drawing again
+              </button>
+              <button
+                type="button"
+                className="inline-flex h-10 flex-1 items-center justify-center bg-white font-mono text-xs uppercase tracking-wider text-black"
+                onClick={() => setAgentModal(null)}
+              >
+                Got it
+              </button>
+            </div>
           </div>
         </div>
-      </div>
+      )}
     </AurifShell>
   );
 }

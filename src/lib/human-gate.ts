@@ -45,6 +45,26 @@ export async function fetchChallenge(): Promise<Challenge> {
   return res.json();
 }
 
+export type AgentAccessHint = {
+  title?: string;
+  message?: string;
+  steps?: { method: string; path: string; note?: string }[];
+  api_base?: string;
+  site_key_header?: string;
+};
+
+export class HumanVerifyError extends Error {
+  agentAccess?: AgentAccessHint;
+  verdict?: { read_as?: string; human_like?: boolean; match?: boolean; model?: string };
+
+  constructor(message: string, extra?: { agentAccess?: AgentAccessHint; verdict?: HumanVerifyError["verdict"] }) {
+    super(message);
+    this.name = "HumanVerifyError";
+    this.agentAccess = extra?.agentAccess;
+    this.verdict = extra?.verdict;
+  }
+}
+
 export async function verifyHumanDrawing(challengeId: string, imageDataUrl: string) {
   const res = await fetch(`${API_BASE}/api/public/human-verify`, {
     method: "POST",
@@ -55,7 +75,10 @@ export async function verifyHumanDrawing(challengeId: string, imageDataUrl: stri
   const data = await res.json();
   if (!res.ok || !data.ok) {
     const detail = data.verdict?.read_as ? ` (read as “${data.verdict.read_as}”)` : "";
-    throw new Error((data.error || "Verification failed") + detail);
+    throw new HumanVerifyError((data.error || "Verification failed") + detail, {
+      agentAccess: data.agent_access,
+      verdict: data.verdict,
+    });
   }
   if (data.human_token) setHumanToken(data.human_token);
   return data as { ok: boolean; human_token: string; verdict?: { read_as?: string; model?: string } };

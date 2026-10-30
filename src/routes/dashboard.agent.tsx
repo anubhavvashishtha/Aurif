@@ -2,38 +2,78 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { PageHeader, Panel } from "@/components/aurif/ui";
-import { chatWithMuse, refreshActivity, useActiveSite } from "@/lib/aurif-store";
+import {
+  chatWithMuse,
+  fetchAgentModels,
+  refreshActivity,
+  useActiveSite,
+  type AgentModel,
+} from "@/lib/aurif-store";
 import { aurifHead } from "@/lib/aurif-meta";
 
 export const Route = createFileRoute("/dashboard/agent")({
-  head: () => aurifHead("Agent dashboard", "Ask Muse to try an Aurif site with a site key."),
+  head: () =>
+    aurifHead("Agent dashboard", "Ask Muse a question about a page — pick a model and site-key mode."),
   component: AgentDashboard,
 });
 
-type ChatMessage = { id: string; role: "user" | "muse"; text: string; denied?: boolean };
+type ChatMessage = {
+  id: string;
+  role: "user" | "muse";
+  text: string;
+  denied?: boolean;
+  modelLabel?: string;
+};
 
 function AgentDashboard() {
   const site = useActiveSite();
-  const [siteKey, setSiteKey] = useState(site.siteKey);
-  const [draft, setDraft] = useState("Try the shop page and tell me what you can see.");
+  const [useSiteKey, setUseSiteKey] = useState(false);
+  const [models, setModels] = useState<AgentModel[]>([]);
+  const [modelId, setModelId] = useState("");
+  const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       id: "intro",
       role: "muse",
-      text: "I am Muse. Paste the site key, then tell me which page to open. If the key is missing or wrong, I will say access denied.",
+      text: "Hello, I am Muse. Send a link and ask a question — I'll summarize what happened and answer if I can get the data.",
     },
   ]);
   const endRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    setSiteKey(site.siteKey);
-  }, [site.id, site.siteKey]);
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetchAgentModels();
+        if (cancelled) return;
+        const list = res.models || [];
+        setModels(list);
+        const current = res.current || list.find((m) => m.default) || list[0];
+        if (current?.id) setModelId(current.id);
+      } catch {
+        /* keep empty; user can still chat with server default */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, busy]);
+
+  const selected = models.find((m) => m.id === modelId);
 
   const send = async () => {
     const text = draft.trim();
@@ -42,10 +82,27 @@ function AgentDashboard() {
     setMessages((prev) => [...prev, { id: crypto.randomUUID(), role: "user", text }]);
     setBusy(true);
     try {
-      const res = await chatWithMuse({ message: text, site_key: siteKey.trim() });
+      const res = await chatWithMuse({
+        message: text,
+        use_site_key: useSiteKey,
+        site_key: useSiteKey ? site.siteKey : undefined,
+        model: modelId || undefined,
+      });
+      const used =
+        res.model?.label ||
+        selected?.label ||
+        res.model?.id ||
+        modelId ||
+        undefined;
       setMessages((prev) => [
         ...prev,
-        { id: crypto.randomUUID(), role: "muse", text: res.reply, denied: res.denied },
+        {
+          id: crypto.randomUUID(),
+          role: "muse",
+          text: res.reply,
+          denied: res.denied,
+          modelLabel: used,
+        },
       ]);
       await refreshActivity(site.id);
     } catch (err) {
@@ -55,7 +112,7 @@ function AgentDashboard() {
           id: crypto.randomUUID(),
           role: "muse",
           denied: true,
-          text: err instanceof Error ? err.message : "Muse could not reach Aurif.",
+          text: err instanceof Error ? err.message : "Muse could not reach the site.",
         },
       ]);
     } finally {
@@ -67,21 +124,43 @@ function AgentDashboard() {
     <>
       <PageHeader
         title="Agent dashboard"
-        description="Chat with Muse. It calls Aurif with the site key you paste and reports what the site returned."
+        description="Ask Muse about a page. Pick a model, optionally send a site key, and get a short answer."
       />
       <Panel className="flex h-[calc(100vh-14rem)] min-h-[28rem] flex-col">
-        <div className="border-b border-ink/10 px-4 py-3">
-          <label className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground" htmlFor="site-key">
-            Site key
-          </label>
-          <Input
-            id="site-key"
-            className="mt-1.5 font-mono text-xs"
-            value={siteKey}
-            onChange={(e) => setSiteKey(e.target.value)}
-            placeholder="Paste the site key"
-            autoComplete="off"
-          />
+        <div className="grid grid-cols-1 gap-4 border-b border-ink/10 px-4 py-3 sm:grid-cols-2 sm:items-start">
+          <div className="min-w-0">
+            <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">Model</p>
+            <div className="mt-1.5 flex h-9 items-center">
+              <Select value={modelId || undefined} onValueChange={setModelId}>
+                <SelectTrigger className="w-full" aria-label="Inference model">
+                  <SelectValue placeholder="Select a model" />
+                </SelectTrigger>
+                <SelectContent>
+                  {models.map((m) => (
+                    <SelectItem key={m.id} value={m.id}>
+                      {m.label} · {m.provider}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {selected ? `Using ${selected.label} via ${selected.provider}` : "Server default model"}
+            </p>
+          </div>
+          <div className="min-w-0">
+            <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">Site key</p>
+            <div className="mt-1.5 flex h-9 items-center justify-between gap-3">
+              <p className="truncate text-xs text-muted-foreground">
+                {useSiteKey ? "On — send site key with requests" : "Off — browse without a site key"}
+              </p>
+              <Switch
+                checked={useSiteKey}
+                onCheckedChange={setUseSiteKey}
+                aria-label="Send site key with Muse requests"
+              />
+            </div>
+          </div>
         </div>
         <div className="flex-1 space-y-3 overflow-y-auto px-4 py-4">
           {messages.map((m) => (
@@ -96,13 +175,15 @@ function AgentDashboard() {
                 }
               >
                 {m.role === "muse" && (
-                  <p className="mb-1 font-mono text-[10px] uppercase tracking-[0.16em] text-muted-foreground">Muse</p>
+                  <p className="mb-1 font-mono text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
+                    Muse{m.modelLabel ? ` · ${m.modelLabel}` : ""}
+                  </p>
                 )}
                 <p className="whitespace-pre-wrap">{m.text}</p>
               </div>
             </div>
           ))}
-          {busy && <p className="font-mono text-xs uppercase tracking-wider text-muted-foreground">Muse is requesting…</p>}
+          {busy && <p className="font-mono text-xs uppercase tracking-wider text-muted-foreground">Muse is browsing…</p>}
           <div ref={endRef} />
         </div>
         <form
@@ -115,7 +196,7 @@ function AgentDashboard() {
           <Input
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
-            placeholder="Ask Muse to open a page, or clear the key and try again"
+            placeholder="Paste a link and ask a question"
             disabled={busy}
           />
           <Button type="submit" disabled={busy || !draft.trim()}>

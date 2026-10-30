@@ -399,13 +399,49 @@ export async function summarizeActivity(siteId: string) {
   }>(`/api/sites/${siteId}/ai/activity-summary`, { method: "POST", body: "{}" });
 }
 
-export async function chatWithMuse(body: { message: string; site_key?: string }) {
+export type MuseStep = {
+  step?: number;
+  action?: string;
+  result?: string;
+  detail?: string;
+  url?: string;
+  method?: string;
+  status?: number;
+  saw?: unknown;
+  [key: string]: unknown;
+};
+
+export type AgentModel = {
+  id: string;
+  label: string;
+  provider: string;
+  default?: boolean;
+};
+
+export async function fetchAgentModels() {
+  return api<{
+    ok: boolean;
+    models: AgentModel[];
+    current?: AgentModel;
+  }>("/api/ai/models");
+}
+
+export async function chatWithMuse(body: {
+  message: string;
+  site_key?: string;
+  use_site_key?: boolean;
+  model?: string;
+}) {
   return api<{
     ok: boolean;
     denied: boolean;
     reply: string;
+    steps?: MuseStep[];
     path?: string;
     status?: number;
+    fields?: { label: string; value: string }[];
+    url?: string;
+    model?: { id: string; provider: string; label: string };
   }>("/api/ai/agent-chat", { method: "POST", body: JSON.stringify(body) });
 }
 
