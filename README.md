@@ -26,11 +26,13 @@ Today, agents either:
 
 ## Where things live
 
-| Surface | Folder | Port | What it is |
-|---------|--------|------|------------|
+| Surface | Folder | Local URL | What it is |
+|---------|--------|-----------|------------|
 | **Customer website** (Northline Goods) | `Demo-client/` | [http://127.0.0.1:5173](http://127.0.0.1:5173) | Human storefront — shop, cart, human CAPTCHA gate |
 | **Owner dashboard** | `Aurif-UI/` | [http://127.0.0.1:5174](http://127.0.0.1:5174) | Login, endpoints, Muse agent chat, activity |
 | **API** | `server/` | [http://127.0.0.1:8787](http://127.0.0.1:8787) | Flask — `/ai/*`, owner APIs, Muse, CAPTCHA, store |
+
+Those URLs are the local defaults. Hosted origins come from env vars. See [DEPLOY.md](DEPLOY.md).
 
 ```
 Aurif/
@@ -38,7 +40,9 @@ Aurif/
 ├── Aurif-UI/      # Aurif dashboard — owners + Muse demo agent
 ├── server/        # Protocol + policy + Muse backend
 ├── docs/          # Extra product / protocol notes
-└── .env           # API keys (gitignored)
+├── DEPLOY.md      # Vercel + Render steps and env vars
+├── render.yaml    # Render blueprint for the API (gunicorn)
+└── .env.example   # Copy to .env for keys (gitignored once copied)
 ```
 
 Keep the three surfaces separate on purpose: customer site ≠ owner console ≠ AI API.
@@ -49,37 +53,63 @@ Keep the three surfaces separate on purpose: customer site ≠ owner console ≠
 
 ## How to run
 
-Need **Node 22+** (prefer `pnpm`) and **Python 3.11+**.
+Need **Node 22+** and **Python 3.11+**. No `.env` is required to boot. Copy [`.env.example`](.env.example) to `.env` only when you have model keys.
 
-### 1. Env (repo root)
+The API process reads the **repo-root** `.env` (and `server/.env` if you add one). Run it from `server/` so the local imports resolve.
 
-```bash
-# .env (gitignored) — see .env.example and docs/MODELS.md
-# Either a Meta Model API key:
-MODEL_API_KEY=…
-# or the existing Baseten key (Muse Spark Open, text and vision):
-BASETEN_API_KEY=…
-# BASETEN_MODEL=meta-models/muse-spark-open-1026
-```
-
-### 2. Three terminals
+### 1. API
 
 ```bash
-# Terminal 1 — API
 cd server
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python app.py
-# → http://127.0.0.1:8787
-
-# Terminal 2 — customer site
-cd Demo-client && pnpm install && pnpm dev
-# → http://127.0.0.1:5173
-
-# Terminal 3 — dashboard
-cd Aurif-UI && pnpm install && pnpm dev
-# → http://127.0.0.1:5174
 ```
+
+The log prints the API URL, the demo login, and the site key (`Site key → …`). CLI calls need that key. It is also on the dashboard after you log in. A zero-config start listens on `127.0.0.1:8787` with the debugger on. Production is gunicorn with the debugger off — [DEPLOY.md](DEPLOY.md).
+
+### 2. Customer site and dashboard
+
+Prefer **pnpm** (each app commits a `pnpm-lock.yaml`):
+
+```bash
+# Terminal 2 — customer site → http://127.0.0.1:5173
+cd Demo-client && pnpm install && pnpm dev
+
+# Terminal 3 — dashboard → http://127.0.0.1:5174
+cd Aurif-UI && pnpm install && pnpm dev
+```
+
+If you use npm: **npm 10 fails** with `Cannot read properties of null (reading 'edgesOut')`. Use **npm 11+**, or npm 10 with `npm install --legacy-peer-deps`. Both apps set `legacy-peer-deps=true` in `.npmrc`, so a plain `npm install` works on npm 10 as well. Then `npm run dev`.
+
+### Without model keys
+
+The API still starts. Two demo paths do not until you set `MODEL_API_KEY`, `META_API_KEY`, or `BASETEN_API_KEY`:
+
+- **Drawing CAPTCHA.** `POST /api/public/human-verify` returns a vision-provider error, so a human cannot pass the storefront gate.
+- **`act` scope.** Handshake still returns `view`, then drops `act`, because the risk model errors. `product.add:*` returns 403 `scope 'act' not granted`.
+
+Turn the human gate off for a local walkthrough (owner token from the login response):
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"owner@aurif.dev","password":"demo1234"}'
+
+curl -s -X PATCH http://127.0.0.1:8787/api/sites/demo-shop \
+  -H 'Content-Type: application/json' \
+  -H "X-Aurif-Owner: TOKEN_FROM_LOGIN" \
+  -d '{"require_human_captcha":false}'
+```
+
+Browsing pages with `view` works without keys. Adding to the cart needs a working model key so handshake can grant `act`.
+
+Set **one** key in the repo-root `.env`. See [`.env.example`](.env.example) and [docs/MODELS.md](docs/MODELS.md).
+
+- `MODEL_API_KEY` or `META_API_KEY` — Muse Spark 1.3 on the Meta Model API (text and CAPTCHA vision).
+- Or `BASETEN_API_KEY` alone — Muse Spark Open (`BASETEN_MODEL`, default `meta-models/muse-spark-open-1026`) for both. Optional `META_*` overrides are in `docs/MODELS.md`.
+
+`MODAL_*` is not read. A DeepSeek model id is refused. Startup prints the active provider and model (not the key).
 
 ---
 
@@ -87,7 +117,7 @@ cd Aurif-UI && pnpm install && pnpm dev
 
 ### Pages (read)
 
-A **page** is the JSON snapshot an agent gets for a URL (`GET`-style via `POST /ai/page`).
+A **page** is the JSON snapshot an agent gets for a URL (`GET /ai/page?path=`). There is no `POST /ai/page`.
 
 | Endpoint | Path | Rough shape |
 |----------|------|-------------|
@@ -123,16 +153,25 @@ Configure fields on actions = mostly **request** allowlists (quantity, args, ema
 
 Without a matching site key (when the site requires one), protocol calls are denied. With a key, the agent only receives the JSON and actions the owner left open.
 
-### Quick action test (curl)
+### Quick page test (curl)
+
+This works on a fresh boot with no model keys. The site key is the `Site key →` line from `python app.py` (and on the dashboard after login). Handshake first; `/ai/actions` and `/ai/page` both require `X-Aurif-Session`.
 
 ```bash
-curl -s -X POST http://127.0.0.1:8787/ai/actions \
-  -H "Content-Type: application/json" \
-  -H "X-Aurif-Site-Key: YOUR_SITE_KEY" \
-  -d '{"action_id":"product.add:field-tote","args":{"quantity":1}}'
+KEY='paste-site-key'
+
+curl -s -X POST http://127.0.0.1:8787/ai/handshake \
+  -H 'Content-Type: application/json' \
+  -H "X-Aurif-Site-Key: $KEY" \
+  -d '{"requested_scopes":["view"],"purpose":"browse the catalog"}'
+# copy session_token from the JSON
+
+curl -s "http://127.0.0.1:8787/ai/page?path=/products" \
+  -H "X-Aurif-Site-Key: $KEY" \
+  -H "X-Aurif-Session: SESSION_TOKEN"
 ```
 
-Site key is on the dashboard (Settings / site detail).
+`POST /ai/actions` with `product.add:field-tote` also needs that session header, the site key, and a handshake that actually granted `act` (a Meta or Baseten key present). Without the session the API returns 401 `missing or invalid session`.
 
 ---
 

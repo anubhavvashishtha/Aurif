@@ -9,7 +9,8 @@ type ServerEntry = {
 
 let serverEntryPromise: Promise<ServerEntry> | undefined;
 
-const API_BASE = process.env.AURIF_API_URL ?? "http://127.0.0.1:8787";
+const API_BASE =
+  process.env.AURIF_API_URL || process.env.VITE_AURIF_API || "http://127.0.0.1:8787";
 
 const BOT_UA_HINTS = [
   "curl/",

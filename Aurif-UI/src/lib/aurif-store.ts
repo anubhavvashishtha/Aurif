@@ -219,7 +219,10 @@ export async function signup(email: string, password: string): Promise<string | 
     try {
       await api("/api/sites", {
         method: "POST",
-        body: JSON.stringify({ name: "My website", url: "http://127.0.0.1:5173" }),
+        body: JSON.stringify({
+          name: "My website",
+          url: import.meta.env.VITE_CUSTOMER_SITE_URL ?? "http://127.0.0.1:5173",
+        }),
       });
     } catch {
       /* demo-shop may already exist for seeded owner only */

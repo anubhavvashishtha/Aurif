@@ -12,9 +12,13 @@ import urllib.request
 from html.parser import HTMLParser
 from typing import Any
 
+import config
 import muse_client
 
-API_BASE = "http://127.0.0.1:8787"
+
+def api_base() -> str:
+    """Origin for Muse's own API calls. Local default is http://127.0.0.1:8787."""
+    return config.api_public_url()
 
 
 class _PageParser(HTMLParser):
@@ -213,7 +217,7 @@ def _fields_from_product(product: dict[str, Any]) -> list[dict[str, str]]:
 def _try_captcha() -> dict[str, Any]:
     """Attempt human verification like a bot. Returns passed/token/steps/agent_access."""
     out: dict[str, Any] = {"passed": False, "human_token": None, "steps": [], "agent_access": None}
-    gate_status, _, gate_raw = _request(f"{API_BASE}/api/public/gate", headers=agent_headers())
+    gate_status, _, gate_raw = _request(f"{api_base()}/api/public/gate", headers=agent_headers())
     gate = _json_body(gate_raw) if gate_status else {}
     if isinstance(gate, dict) and gate.get("require_human_captcha") is False:
         out["passed"] = True
@@ -222,7 +226,7 @@ def _try_captcha() -> dict[str, Any]:
         )
         return out
 
-    ch_status, _, ch_raw = _request(f"{API_BASE}/api/public/human-challenge", headers=agent_headers())
+    ch_status, _, ch_raw = _request(f"{api_base()}/api/public/human-challenge", headers=agent_headers())
     challenge = _json_body(ch_raw) if ch_status else {}
     if not isinstance(challenge, dict):
         out["steps"].append({"action": "fetch_captcha", "result": "failed", "detail": "No challenge returned"})
@@ -251,7 +255,7 @@ def _try_captcha() -> dict[str, Any]:
     wrong = "X" if target.upper() != "X" else "Y"
     drawing = make_captcha_drawing(wrong)
     v_status, _, v_raw = _request(
-        f"{API_BASE}/api/public/human-verify",
+        f"{api_base()}/api/public/human-verify",
         method="POST",
         headers=agent_headers(),
         body={"challenge_id": challenge.get("challenge_id"), "image": drawing},
@@ -320,9 +324,10 @@ def browse_as_agent(
     provider: str | None = None,
 ) -> dict[str, Any]:
     """Browse/scrape like a normal agent and return structured steps for the dashboard."""
-    base = (site.get("url") or "http://127.0.0.1:5173").rstrip("/")
-    if ":8787" in base:
-        base = "http://127.0.0.1:5173"
+    base = (site.get("url") or config.customer_site_url()).rstrip("/")
+    # Older seeds stored the API origin in the site URL. Send Muse to the storefront.
+    if ":8787" in base or base == config.api_public_url().rstrip("/"):
+        base = config.customer_site_url()
     target_url = f"{base}{path if path.startswith('/') else '/' + path}"
     site_key = (site_key or "").strip() or None
     model_info = muse_client.resolve_model(model)
@@ -413,10 +418,10 @@ def browse_as_agent(
                 detail="Site key is on — trying credentialed API after failed human check",
             )
             actions = [
-                {"method": "GET", "url": f"{API_BASE}/ai/help", "use_site_key": False},
+                {"method": "GET", "url": f"{api_base()}/ai/help", "use_site_key": False},
                 {
                     "method": "POST",
-                    "url": f"{API_BASE}/ai/handshake",
+                    "url": f"{api_base()}/ai/handshake",
                     "use_site_key": True,
                     "body": {
                         "purpose": message[:240],
@@ -426,14 +431,14 @@ def browse_as_agent(
                 },
                 {
                     "method": "GET",
-                    "url": f"{API_BASE}/ai/page?path={urllib.parse.quote(path)}",
+                    "url": f"{api_base()}/ai/page?path={urllib.parse.quote(path)}",
                     "use_site_key": True,
                 },
             ]
         else:
             add("follow_up", result="started", detail="Trying follow-up fetches for product data")
             actions = [
-                {"method": "GET", "url": f"{API_BASE}/api/products", "use_site_key": bool(site_key)},
+                {"method": "GET", "url": f"{api_base()}/api/products", "use_site_key": bool(site_key)},
             ]
 
         for action in actions:
@@ -442,7 +447,7 @@ def browse_as_agent(
                 continue
             if url.startswith("/"):
                 if url.startswith("/api") or url.startswith("/ai") or url.startswith("/.well-known"):
-                    url = _absolute(url, API_BASE)
+                    url = _absolute(url, api_base())
                 else:
                     url = _absolute(url, base)
             method = str(action.get("method") or "GET").upper()

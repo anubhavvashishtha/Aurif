@@ -15,6 +15,7 @@ from typing import Any
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
+import config
 import muse_browse
 import muse_client
 import store
@@ -39,16 +40,7 @@ ALLOWED_SCOPES = ("view", "act")
 app = Flask(__name__)
 CORS(
     app,
-    resources={
-        r"/*": {
-            "origins": [
-                "http://127.0.0.1:5173",
-                "http://127.0.0.1:5174",
-                "http://localhost:5173",
-                "http://localhost:5174",
-            ]
-        }
-    },
+    resources={r"/*": {"origins": config.cors_origins()}},
     supports_credentials=True,
     allow_headers=[
         "Content-Type",
@@ -1228,7 +1220,7 @@ def api_public_gate():
             "handshake": "/ai/handshake",
             "ai_page": "/ai/page",
             "ai_actions": "/ai/actions",
-            "api_base": "http://127.0.0.1:8787",
+            "api_base": config.api_public_url(),
         }
     )
 
@@ -1302,7 +1294,7 @@ def api_human_verify():
                             "note": "Send X-Aurif-Site-Key and X-Aurif-Session from handshake",
                         },
                     ],
-                    "api_base": "http://127.0.0.1:8787",
+                    "api_base": config.api_public_url(),
                     "site_key_header": "X-Aurif-Site-Key",
                 },
                 "verdict": {
@@ -1367,8 +1359,8 @@ def home():
         {
             "ok": True,
             "message": "Aurif API server",
-            "customer_site": "http://127.0.0.1:5173",
-            "dashboard": "http://127.0.0.1:5174",
+            "customer_site": config.customer_site_url(),
+            "dashboard": config.dashboard_url(),
             "well_known": "/.well-known/aurif.json",
         }
     )
@@ -1376,10 +1368,13 @@ def home():
 
 if __name__ == "__main__":
     site = site_record()
-    print("Aurif API        → http://127.0.0.1:8787")
-    print("Customer site    → http://127.0.0.1:5173  (Demo-client)")
-    print("Aurif dashboard  → http://127.0.0.1:5174  (Aurif-UI)")
+    debug = config.flask_debug()
+    print(f"Aurif API        → {config.api_public_url()}")
+    print(f"Customer site    → {config.customer_site_url()}  (Demo-client)")
+    print(f"Aurif dashboard  → {config.dashboard_url()}  (Aurif-UI)")
     print("Demo login       → owner@aurif.dev / demo1234")
     print(f"Site key         → {site['site_key']}")
     muse_client.log_active_models(echo=True)
-    app.run(host="127.0.0.1", port=8787, debug=True)
+    if debug:
+        print("Debugger         → on (local python app.py). Production uses gunicorn with FLASK_DEBUG=0.")
+    app.run(host=config.bind_host(), port=config.port(), debug=debug, use_reloader=debug)

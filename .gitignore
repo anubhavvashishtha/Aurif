@@ -17,4 +17,5 @@ Demo-client/dist/
 Aurif-UI/dist/
 .nitro/
 .output/
+.vercel/
 .tanstack/

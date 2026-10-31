@@ -73,7 +73,7 @@ export function HumanGate({ embed = false }: { embed?: boolean }) {
         setReady(true);
       } catch {
         if (!cancelled) {
-          setError("Could not reach the Aurif API. Is the server running on :8787?");
+          setError(`Could not reach the Aurif API at ${API_BASE}. Is the server running?`);
           setReady(true);
         }
       }

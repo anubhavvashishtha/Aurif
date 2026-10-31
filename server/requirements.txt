@@ -1,5 +1,7 @@
 flask==3.0.3
 flask-cors==4.0.1
-openai>=1.40.0
+gunicorn==23.0.0
+# Stay on the 1.x client. An unpinned install resolved openai 3.x and can drift again before the demo.
+openai>=1.40.0,<2
 python-dotenv>=1.0.0
 Pillow>=10.0.0
