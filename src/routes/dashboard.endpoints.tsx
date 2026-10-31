@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { SlidersHorizontal, Sparkles } from "lucide-react";
+import { ChevronRight, SlidersHorizontal, Sparkles } from "lucide-react";
 import { useState } from "react";
 import { Badge, PageHeader, Panel } from "@/components/aurif/ui";
 import { Button } from "@/components/ui/button";
@@ -8,7 +8,7 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { agentResponse, filterRequest } from "@/lib/aurif-fields";
+import { agentResponse, buildFieldTree, collectExpandableKeys, filterRequest, type FieldTreeNode } from "@/lib/aurif-fields";
 import { aurifHead } from "@/lib/aurif-meta";
 import {
   applyPolicy,
@@ -134,6 +134,22 @@ function Endpoints() {
 
 function FieldDrawer({ siteId, endpoint: e }: { siteId: string; endpoint: Endpoint }) {
   const hidden = e.responseFields.filter((f) => !f.agentVisible).length;
+  const tree = buildFieldTree(e.responseFields);
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set(collectExpandableKeys(tree)));
+
+  const toggleExpand = (key: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  const setVisible = (key: string, visible: boolean) => {
+    updateResponseFields(siteId, e.id, (fs) => fs.map((x) => (x.key === key ? { ...x, agentVisible: visible } : x)));
+  };
+
   return (
     <div className="space-y-5">
       <SheetHeader className="pr-8">
@@ -145,7 +161,11 @@ function FieldDrawer({ siteId, endpoint: e }: { siteId: string; endpoint: Endpoi
         <TabsContent value="response" className="space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-2"><p className="text-sm text-muted-foreground">{hidden ? `${hidden} fields omitted from agent responses.` : "All fields are visible to agents."}</p>
             <div className="flex gap-2"><Button size="sm" variant="outline" onClick={() => updateResponseFields(siteId, e.id, (fs) => fs.map((f) => /price/.test(f.key) ? { ...f, agentVisible: false } : f))}>Hide all prices</Button><Button size="sm" variant="ghost" onClick={() => updateResponseFields(siteId, e.id, (fs) => fs.map((f) => ({ ...f, agentVisible: true })))}>Show all</Button></div></div>
-          <Panel className="divide-y">{e.responseFields.map((f) => <div key={f.key} className="grid grid-cols-[1fr_auto_auto] items-center gap-3 px-4 py-2.5"><div><p className="font-mono text-xs">{f.key}</p><p className="text-xs text-muted-foreground">{f.label}</p></div><Badge tone="muted">{f.type}</Badge><Switch checked={f.agentVisible} onCheckedChange={(v) => updateResponseFields(siteId, e.id, (fs) => fs.map((x) => x.key === f.key ? { ...x, agentVisible: v } : x))} aria-label={`Visible to agents: ${f.key}`} /></div>)}</Panel>
+          <Panel className="divide-y">
+            {tree.map((node) => (
+              <FieldTreeRows key={node.key} node={node} depth={0} expanded={expanded} onToggleExpand={toggleExpand} onToggleVisible={setVisible} />
+            ))}
+          </Panel>
           <JsonSplit left={e.sampleResponse} right={agentResponse(e, e.sampleResponse).body} rightTitle="What the agent receives" />
         </TabsContent>
         <TabsContent value="request" className="space-y-4">
@@ -155,6 +175,69 @@ function FieldDrawer({ siteId, endpoint: e }: { siteId: string; endpoint: Endpoi
         </TabsContent>
       </Tabs>
     </div>
+  );
+}
+
+function FieldTreeRows({
+  node,
+  depth,
+  expanded,
+  onToggleExpand,
+  onToggleVisible,
+}: {
+  node: FieldTreeNode;
+  depth: number;
+  expanded: Set<string>;
+  onToggleExpand: (key: string) => void;
+  onToggleVisible: (key: string, visible: boolean) => void;
+}) {
+  const hasChildren = node.children.length > 0;
+  const open = hasChildren && expanded.has(node.key);
+  return (
+    <>
+      <div className="grid grid-cols-[1fr_auto_auto] items-center gap-3 px-4 py-2.5" style={{ paddingLeft: `${16 + depth * 16}px` }}>
+        <div className="flex min-w-0 items-start gap-1.5">
+          {hasChildren ? (
+            <button
+              type="button"
+              className="mt-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-frost hover:text-ink"
+              onClick={() => onToggleExpand(node.key)}
+              aria-expanded={open}
+              aria-label={open ? `Collapse ${node.key}` : `Expand ${node.key}`}
+            >
+              <ChevronRight className={`h-3.5 w-3.5 transition-transform ${open ? "rotate-90" : ""}`} />
+            </button>
+          ) : (
+            <span className="inline-block h-5 w-5 shrink-0" aria-hidden />
+          )}
+          <div className="min-w-0">
+            <p className="font-mono text-xs">{node.segment}</p>
+            <p className="truncate text-xs text-muted-foreground">
+              {hasChildren
+                ? `${node.type} · ${node.children.map((c) => c.segment).join(", ")}`
+                : node.key}
+            </p>
+          </div>
+        </div>
+        <Badge tone="muted">{node.type}</Badge>
+        <Switch
+          checked={node.agentVisible}
+          onCheckedChange={(v) => onToggleVisible(node.key, v)}
+          aria-label={`Visible to agents: ${node.key}`}
+        />
+      </div>
+      {open &&
+        node.children.map((child) => (
+          <FieldTreeRows
+            key={child.key}
+            node={child}
+            depth={depth + 1}
+            expanded={expanded}
+            onToggleExpand={onToggleExpand}
+            onToggleVisible={onToggleVisible}
+          />
+        ))}
+    </>
   );
 }
 
