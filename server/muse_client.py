@@ -4,10 +4,12 @@ Text (handshake risk, policy co-pilot, activity summaries, Muse chat) stays on
 a Meta model: Muse Spark 1.3 on the Meta Model API, or Muse Spark Open on
 Baseten when only BASETEN_API_KEY is set.
 
-Draw-CAPTCHA vision is separate. It defaults to DeepSeek V4.1 Flash on
-Baseten's OpenAI-compatible endpoint and uses BASETEN_API_KEY. VISION_* (and
-the older META_VISION_* names, when the matching VISION_* var is unset) can
-point that call at another host later. Modal is not used. A non-Meta id is
+Draw-CAPTCHA vision is separate. When MODAL_TOKEN_ID and MODAL_TOKEN_SECRET
+are set, vision calls DeepSeek V4.1 Flash on Modal (api key is
+"{token_id}.{token_secret}", the same scheme as the earlier Modal client).
+Otherwise VISION_* (and the older META_VISION_* names, when the matching
+VISION_* var is unset) apply, then the Baseten DeepSeek default. An optional
+VISION_FALLBACK_MODEL is empty unless the owner sets it. A non-Meta id is
 refused for text only.
 """
 
@@ -42,6 +44,12 @@ BASETEN_DEFAULT_MODEL = "meta-models/muse-spark-open-1026"
 # Draw-CAPTCHA only. Text never reads these defaults.
 VISION_DEFAULT_MODEL = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
 VISION_DEFAULT_BASE_URL = BASETEN_BASE_URL
+
+# Modal DeepSeek, used only when both Modal token vars are set.
+MODAL_DEFAULT_BASE_URL = (
+    "https://anubhavvashishtha-iitd--ep-deepseek-v4-1-flash-server.us-west.modal.direct/v1"
+)
+MODAL_DEFAULT_VISION_MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 
 log = logging.getLogger("aurif.models")
 
@@ -127,15 +135,35 @@ def text_settings() -> dict[str, str]:
     }
 
 
+def _modal_vision_settings() -> dict[str, str] | None:
+    """Modal DeepSeek when both token vars are set. Auth is token_id.token_secret."""
+    token_id = _first_env("MODAL_TOKEN_ID")
+    token_secret = _first_env("MODAL_TOKEN_SECRET")
+    if not token_id or not token_secret:
+        return None
+    base_url = (_first_env("MODAL_BASE_URL") or MODAL_DEFAULT_BASE_URL).rstrip("/")
+    model = _first_env("MODAL_VISION_MODEL") or MODAL_DEFAULT_VISION_MODEL
+    return {
+        "provider": "modal",
+        "base_url": base_url,
+        "model": model,
+        "api_key": f"{token_id}.{token_secret}",
+    }
+
+
 def vision_settings() -> dict[str, str]:
     """Draw-CAPTCHA endpoint. Does not inherit the text model.
 
-    VISION_MODEL / VISION_BASE_URL / VISION_API_KEY / VISION_PROVIDER are the
-    canonical knobs. Each META_VISION_* var still applies when the matching
-    VISION_* var is unset, so an existing vision override keeps working.
-    The default is DeepSeek on Baseten, authenticated with BASETEN_API_KEY.
+    Modal wins when MODAL_TOKEN_ID and MODAL_TOKEN_SECRET are both set.
+    Otherwise VISION_MODEL / VISION_BASE_URL / VISION_API_KEY / VISION_PROVIDER
+    are the knobs. Each META_VISION_* var still applies when the matching
+    VISION_* var is unset. The last default is DeepSeek on Baseten with
+    BASETEN_API_KEY.
     """
     _refresh_env()
+    modal = _modal_vision_settings()
+    if modal:
+        return modal
     model = _first_env("VISION_MODEL", "META_VISION_MODEL") or VISION_DEFAULT_MODEL
     base_url = (
         _first_env("VISION_BASE_URL", "META_VISION_BASE_URL") or VISION_DEFAULT_BASE_URL
@@ -150,6 +178,28 @@ def vision_settings() -> dict[str, str]:
         "base_url": base_url,
         "model": model,
         "api_key": _vision_api_key(base_url, model),
+    }
+
+
+def vision_fallback_settings() -> dict[str, str] | None:
+    """Optional second vision host. Unset VISION_FALLBACK_MODEL means no retry.
+
+    VISION_FALLBACK_BASE_URL and VISION_FALLBACK_API_KEY default to the Baseten
+    host and BASETEN_API_KEY. Nothing calls this host unless the model is set.
+    """
+    _refresh_env()
+    model = _first_env("VISION_FALLBACK_MODEL")
+    if not model:
+        return None
+    base_url = (_first_env("VISION_FALLBACK_BASE_URL") or BASETEN_BASE_URL).rstrip("/")
+    provider = _infer_vision_provider(base_url)
+    if _model_family(model) != "meta" and provider.lower() == "meta":
+        provider = _infer_vision_provider(base_url)
+    return {
+        "provider": provider,
+        "base_url": base_url,
+        "model": model,
+        "api_key": _first_env("VISION_FALLBACK_API_KEY", "BASETEN_API_KEY"),
     }
 
 
@@ -297,11 +347,14 @@ def _model_label(model_id: str) -> str:
     return tail or model_id
 
 
-def _public_model_label(model_id: str) -> str:
+def _public_model_label(model_id: str, provider: str = "") -> str:
     mid = model_id or ""
     low = mid.lower()
     if "deepseek" in low and "flash" in low:
-        return "DeepSeek V4.1 Flash"
+        label = "DeepSeek V4.1 Flash"
+        if (provider or "").lower() == "modal":
+            return f"{label} (Modal)"
+        return label
     if "deepseek" in low:
         tail = mid.split("/")[-1]
         return tail or "DeepSeek"
@@ -312,7 +365,7 @@ def _public_card(cfg: dict[str, str]) -> dict[str, str]:
     """Safe model card. `powered_by` already includes "Meta" only for Meta models."""
     model = cfg.get("model") or ""
     family = _model_family(model)
-    label = _public_model_label(model)
+    label = _public_model_label(model, cfg.get("provider") or "")
     powered = f"Meta {label}" if family == "meta" else label
     return {
         "id": model,
@@ -363,15 +416,20 @@ def log_active_models(*, echo: bool = False) -> None:
 def api_providers() -> dict[str, Any]:
     """Model-catalog providers. `text` and `vision` are the live endpoints.
 
-    Text is a Meta model. Vision defaults to DeepSeek on Baseten and is not
-    described as Meta. `baseten.base_url` is the previous response field.
-    `modal` is omitted: Modal is not a vision host.
+    Text is a Meta model. Vision is Modal DeepSeek when those credentials are
+    set, otherwise the VISION_* host (Baseten DeepSeek by default). It is not
+    described as Meta. `baseten.base_url` stays. `modal` is present only when
+    Modal is the active vision provider, and it carries the base URL only.
     """
-    return {
+    vision = vision_settings()
+    providers: dict[str, Any] = {
         "text": public_settings(text_settings()),
-        "vision": public_settings(vision_settings()),
+        "vision": public_settings(vision),
         "baseten": {"base_url": BASETEN_BASE_URL},
     }
+    if vision.get("provider") == "modal":
+        providers["modal"] = {"base_url": vision.get("base_url") or ""}
+    return providers
 
 
 def list_agent_models() -> list[dict[str, Any]]:
@@ -399,7 +457,7 @@ def resolve_model(model_id: str | None) -> dict[str, str]:
     return {"id": mid, "provider": cfg["provider"], "label": _model_label(mid)}
 
 
-def _client(cfg: dict[str, str], *, kind: str) -> OpenAI:
+def _client(cfg: dict[str, str], *, kind: str, timeout: float | None = None) -> OpenAI:
     if not cfg.get("api_key"):
         raise RuntimeError(
             f"{kind} provider misconfigured: set META_API_KEY, MODEL_API_KEY, "
@@ -420,7 +478,7 @@ def _client(cfg: dict[str, str], *, kind: str) -> OpenAI:
     return OpenAI(
         api_key=cfg["api_key"],
         base_url=cfg["base_url"],
-        timeout=_timeout_seconds(kind),
+        timeout=_timeout_seconds(kind) if timeout is None else timeout,
         max_retries=0,
     )
 
@@ -456,8 +514,55 @@ def _max_retries() -> int:
     return min(max(value, 0), 2)
 
 
-def _public_model_error(exc: BaseException) -> str:
-    """Short status for APIs and health. Details stay in the server log."""
+def _provider_access_name(provider: str | None) -> str:
+    key = (provider or "").strip().lower()
+    names = {
+        "baseten": "Baseten",
+        "modal": "Modal",
+        "meta": "Meta",
+    }
+    if key in names:
+        return names[key]
+    cleaned = (provider or "").strip()
+    return cleaned or "the vision host"
+
+
+def _vision_access_failure(exc: BaseException) -> str | None:
+    """Cause string for 401, 403, 404, or model-not-found. None otherwise."""
+    text = str(exc).lower()
+    status = getattr(exc, "status_code", None)
+    try:
+        code = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        code = None
+    model_missing = any(
+        phrase in text for phrase in ("model not found", "model_not_found", "no such model")
+    ) or ("does not exist" in text and "model" in text)
+    if code == 401:
+        return "401 unauthorized"
+    if code == 403:
+        return "403 forbidden"
+    if code == 404:
+        return "model not found" if model_missing else "404 not found"
+    if model_missing:
+        return "model not found"
+    return None
+
+
+def _public_model_error(
+    exc: BaseException,
+    *,
+    kind: str = "text",
+    model: str | None = None,
+    provider: str | None = None,
+) -> str:
+    """Short status for APIs and health. Never includes a key or the raw exception."""
+    if kind == "vision":
+        access = _vision_access_failure(exc)
+        if access:
+            model_name = model or "unconfigured"
+            host = _provider_access_name(provider)
+            return f"vision model {model_name}: {access}, check {host} model access or slug"
     name = type(exc).__name__
     text = str(exc).lower()
     if "timeout" in name.lower() or "timed out" in text:
@@ -488,22 +593,42 @@ def note_model_success(kind: str) -> None:
     _model_status[kind] = {"ok": True, "error": None, "checked_at": time.time()}
 
 
-def note_model_failure(kind: str, exc: BaseException) -> None:
-    summary = _public_model_error(exc)
-    log.error("Aurif %s model failed: %s (%s)", kind, summary, exc)
+def note_model_failure(
+    kind: str,
+    exc: BaseException,
+    *,
+    model: str | None = None,
+    provider: str | None = None,
+) -> None:
+    summary = _public_model_error(exc, kind=kind, model=model, provider=provider)
+    # Log the summary and the exception type only. Provider errors can echo a key.
+    log.error("Aurif %s model failed: %s (%s)", kind, summary, type(exc).__name__)
     _model_status[kind] = {"ok": False, "error": summary, "checked_at": time.time()}
 
 
-def _chat(cfg: dict[str, str], *, kind: str, **kwargs: Any) -> Any:
-    client = _client(cfg, kind=kind)
-    attempts = 1 + _max_retries()
+def _chat(
+    cfg: dict[str, str],
+    *,
+    kind: str,
+    timeout: float | None = None,
+    retries: int | None = None,
+    **kwargs: Any,
+) -> Any:
+    client = _client(cfg, kind=kind, timeout=timeout)
+    extra = _max_retries() if retries is None else max(0, retries)
+    attempts = 1 + extra
     last: BaseException | None = None
     for attempt in range(attempts):
         try:
             response = client.chat.completions.create(**kwargs)
         except Exception as exc:
             last = exc
-            note_model_failure(kind, exc)
+            note_model_failure(
+                kind,
+                exc,
+                model=cfg.get("model"),
+                provider=cfg.get("provider"),
+            )
             if attempt + 1 >= attempts or not _retryable(exc):
                 raise
             log.warning(
@@ -622,13 +747,23 @@ def reset_model_status() -> None:
 
 
 def health_snapshot() -> dict[str, Any]:
-    """Operator view of model config and the last call. No API key material."""
+    """Operator view of model config and the last call. No API key material.
+
+    `ok` follows the text model only, so a vision-only outage stays HTTP 200.
+    `degraded` is true when either side is down. `partial` is a vision outage
+    with text still up: the same 200 + degraded shape as a keyword-rules
+    handshake. Text down is not partial; `/api/health` returns 503.
+    A successful vision fallback keeps `vision.last_ok` true and leaves the
+    primary 401/403/404 text in `vision.last_error`.
+    """
     text = _status_side("text", text_settings())
     vision = _status_side("vision", vision_settings())
-    degraded = bool(text["degraded"] or vision["degraded"])
+    text_down = bool(text["degraded"])
+    vision_down = bool(vision["degraded"])
     return {
-        "ok": not degraded,
-        "degraded": degraded,
+        "ok": not text_down,
+        "degraded": text_down or vision_down,
+        "partial": vision_down and not text_down,
         "text": text,
         "vision": vision,
         "fallbacks": {
@@ -1417,6 +1552,69 @@ Return ONLY JSON: {{"summary":"...","risks":["..."],"suggested_blocked_agents":[
     return stamped
 
 
+def _complete_vision(
+    cfg: dict[str, str],
+    messages: list[dict[str, Any]],
+    *,
+    timeout: float,
+    retries: int | None = None,
+) -> str:
+    kwargs: dict[str, Any] = {
+        "model": cfg["model"],
+        "messages": messages,
+        "stream": False,
+        "max_tokens": _output_tokens(2048, cfg["base_url"]),
+        "temperature": 0.1,
+    }
+    extra = _meta_extra(cfg["base_url"])
+    if extra:
+        kwargs["extra_body"] = extra
+    response = _chat(cfg, kind="vision", timeout=timeout, retries=retries, **kwargs)
+    return _message_text(response.choices[0].message)
+
+
+def _drawing_too_small(image_data_url: str) -> bool:
+    """True when the sketch decodes and the ink is only a speck.
+
+    An image that cannot be decoded is left to the vision judge. A pass still
+    needs a stroke long enough to be a character, not a dot.
+    """
+    import base64
+    from io import BytesIO
+
+    raw_url = (image_data_url or "").strip()
+    if not raw_url.startswith("data:image/"):
+        return False
+    _, _, b64 = raw_url.partition(",")
+    if not b64:
+        return False
+    try:
+        from PIL import Image
+
+        blob = base64.b64decode(b64, validate=False)
+        image = Image.open(BytesIO(blob)).convert("L")
+    except Exception:
+        return False
+    width, height = image.size
+    if width < 1 or height < 1:
+        return True
+    if width > 800 or height > 800:
+        image.thumbnail((800, 800))
+        width, height = image.size
+    xs: list[int] = []
+    ys: list[int] = []
+    pixels = image.get_flattened_data() if hasattr(image, "get_flattened_data") else image.getdata()
+    for index, pixel in enumerate(pixels):
+        if pixel < 220:
+            xs.append(index % width)
+            ys.append(index // width)
+    if len(xs) < 24:
+        return True
+    box_w = max(xs) - min(xs) + 1
+    box_h = max(ys) - min(ys) + 1
+    return max(box_w, box_h) < 12
+
+
 def _vision_config_error(cfg: dict[str, str]) -> str | None:
     if not cfg.get("api_key"):
         return (
@@ -1513,10 +1711,13 @@ def _judge_drawing(data: dict[str, Any], target: str) -> dict[str, Any]:
 def verify_drawing(image_data_url: str, target: str) -> dict[str, Any]:
     """Vision check: does the sketch show the requested characters?
 
-    Calls the configured vision model (DeepSeek on Baseten by default).
-    A missing key or an upstream error is returned as unavailable so the
-    human gate can open the storefront without granting agent act.
-    A readable judgement that does not match is a hard rejection.
+    Calls the configured vision model. Modal wins when its tokens are set;
+    otherwise VISION_* then Baseten DeepSeek. A 401, 403, 404, or
+    model-not-found retries once on VISION_FALLBACK_MODEL when that var is
+    set, inside the same vision time budget. The returned label is the model
+    that judged. A missing key or an upstream error is unavailable so the
+    human gate can open the storefront without granting agent act. A readable
+    judgement that does not match, including a tiny speck, is a hard rejection.
     """
     cfg = vision_settings()
     identity = _vision_identity(cfg)
@@ -1529,7 +1730,12 @@ def verify_drawing(image_data_url: str, target: str) -> dict[str, Any]:
 
     problem = _vision_config_error(cfg)
     if problem:
-        note_model_failure("vision", RuntimeError(problem))
+        note_model_failure(
+            "vision",
+            RuntimeError(problem),
+            model=cfg.get("model"),
+            provider=cfg.get("provider"),
+        )
         return {"ok": False, "unavailable": True, "reason": problem, **identity}
 
     prompt = f"""CAPTCHA check. The required drawing is exactly "{target}".
@@ -1573,26 +1779,54 @@ or, only for a clear hand drawing of "{target}":
         },
     ]
 
+    budget = _timeout_seconds("vision")
+    started = time.perf_counter()
+    used = cfg
     try:
-        kwargs: dict[str, Any] = {
-            "model": cfg["model"],
-            "messages": messages,
-            "stream": False,
-            "max_tokens": _output_tokens(2048, cfg["base_url"]),
-            "temperature": 0.1,
-        }
-        extra = _meta_extra(cfg["base_url"])
-        if extra:
-            kwargs["extra_body"] = extra
-        response = _chat(cfg, kind="vision", **kwargs)
-        text = _message_text(response.choices[0].message)
+        text = _complete_vision(cfg, messages, timeout=budget)
     except Exception as err:
-        return {
-            "ok": False,
-            "unavailable": True,
-            "reason": f"vision provider error ({identity['provider']} {identity['model']}): {err}",
-            **identity,
-        }
+        fallback = vision_fallback_settings()
+        remaining = budget - (time.perf_counter() - started)
+        access = _vision_access_failure(err)
+        primary = _public_model_error(
+            err,
+            kind="vision",
+            model=cfg.get("model"),
+            provider=cfg.get("provider"),
+        )
+        if fallback and access and remaining >= 0.2:
+            log.warning(
+                "Aurif vision primary failed (%s); one fallback attempt on %s",
+                primary,
+                fallback.get("model"),
+            )
+            try:
+                text = _complete_vision(fallback, messages, timeout=remaining, retries=0)
+            except Exception as fallback_err:
+                summary = _public_model_error(
+                    fallback_err,
+                    kind="vision",
+                    model=fallback.get("model"),
+                    provider=fallback.get("provider"),
+                )
+                return {
+                    "ok": False,
+                    "unavailable": True,
+                    "reason": summary,
+                    **_vision_identity(fallback),
+                }
+            used = fallback
+            # The fallback judged, and the primary access error stays in health.
+            state = _model_status["vision"]
+            if state.get("ok") is True:
+                state["error"] = primary
+        else:
+            return {
+                "ok": False,
+                "unavailable": True,
+                "reason": primary,
+                **identity,
+            }
 
     try:
         data = extract_json(text)
@@ -1605,22 +1839,36 @@ or, only for a clear hand drawing of "{target}":
             except Exception:
                 data = None
         if not isinstance(data, dict):
-            note_model_failure("vision", RuntimeError("vision model returned unreadable result"))
+            note_model_failure(
+                "vision",
+                RuntimeError("vision model returned unreadable result"),
+                model=used.get("model"),
+                provider=used.get("provider"),
+            )
             return {
                 "ok": False,
                 "unavailable": True,
                 "reason": "vision model returned unreadable result",
                 "raw": text[:200],
-                **identity,
+                **_vision_identity(used),
             }
     if not isinstance(data, dict):
-        note_model_failure("vision", RuntimeError("invalid vision response"))
+        note_model_failure(
+            "vision",
+            RuntimeError("invalid vision response"),
+            model=used.get("model"),
+            provider=used.get("provider"),
+        )
         return {
             "ok": False,
             "unavailable": True,
             "reason": "invalid vision response",
-            **identity,
+            **_vision_identity(used),
         }
 
     judged = _judge_drawing(data, target)
-    return {"unavailable": False, **judged, **identity}
+    if judged["ok"] and _drawing_too_small(raw):
+        judged["ok"] = False
+        judged["match"] = False
+        judged["reason"] = "drawing too small"
+    return {"unavailable": False, **judged, **_vision_identity(used)}

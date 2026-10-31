@@ -1391,7 +1391,12 @@ def api_public_gate():
 
 @app.get("/api/health")
 def api_health():
-    """Model configuration and the last text/vision call. No API keys."""
+    """Per-model status. No API keys.
+
+    HTTP 200 when text is up, including a vision-only outage (`degraded` and
+    `partial` are true). HTTP 503 when text is down. That matches the other
+    partial-outage responses, which stay 200 and set `degraded`.
+    """
     snap = muse_client.health_snapshot()
     return jsonify(snap), (200 if snap["ok"] else 503)
 
@@ -1497,13 +1502,15 @@ def api_human_verify():
                 "degraded": True,
                 "error": (
                     "Vision model unavailable. Draw on the pad and submit again, or send "
-                    "answer set to the characters in the prompt. This does not grant agent act."
+                    "answer set to the characters in the challenge image. This does not grant agent act."
                 ),
                 "fallback": {
                     "challenge_id": challenge_id,
                     "type": "type",
-                    "target": target,
-                    "prompt": f'Type these characters to continue: {target}',
+                    "prompt": (
+                        "Type the characters shown in the challenge image to continue. "
+                        "This does not grant agent act."
+                    ),
                 },
                 "model_status": muse_client.health_snapshot()["vision"],
             }
@@ -1512,24 +1519,27 @@ def api_human_verify():
     if not verdict or not verdict.get("ok"):
         if verdict is None:
             return jsonify({"ok": False, "error": "drawing image required"}), 400
-        # A vision-provider result that is not marked unavailable stays a hard
-        # failure and does not spend a drawing attempt. Real outages set
-        # unavailable and already took the storefront-only fallback above.
+        # A provider failure that is not marked unavailable does not spend an attempt.
+        # Real outages set unavailable and already took the storefront-only path.
         reason = str(verdict.get("reason") or "")
         if reason.startswith("vision provider") and not verdict.get("unavailable"):
             return jsonify(
                 {
                     "ok": False,
-                    "error": reason,
+                    "error": "vision provider misconfigured",
                     "model": verdict.get("model"),
                     "provider": verdict.get("provider"),
                 }
             ), 502
-        # One redraw, then the challenge is consumed. Wrong drawings are sent to the API path.
+        # One redraw, then the challenge is consumed. The client error stays generic
+        # so a model reason cannot echo the expected characters.
         state = register_failed_attempt(challenge_id)
-        error = verdict.get("reason") or "drawing did not match"
+        error = "drawing did not match"
         if state == "exhausted":
             error = "too many attempts — refresh and try again"
+        read_as = verdict.get("read_as")
+        if read_as and answer_matches(target, str(read_as)):
+            read_as = ""
         return jsonify(
             {
                 "ok": False,
@@ -1557,7 +1567,7 @@ def api_human_verify():
                     "site_key_header": "X-Aurif-Site-Key",
                 },
                 "verdict": {
-                    "read_as": verdict.get("read_as"),
+                    "read_as": read_as,
                     "match": verdict.get("match"),
                     "human_like": verdict.get("human_like"),
                     "model": verdict.get("model"),

@@ -1,5 +1,6 @@
 import { createFileRoute, Outlet, useLocation, useNavigate } from "@tanstack/react-router";
 import { useEffect } from "react";
+import { ModelStatusBanner } from "@/components/aurif/model-status-banner";
 import { SideNav, Topbar } from "@/components/aurif/ui";
 import { bootstrap, useAurif } from "@/lib/aurif-store";
 
@@ -35,7 +36,10 @@ function DashboardLayout() {
       <Topbar />
       <div className="mx-auto flex max-w-7xl flex-col gap-6 px-4 py-6 md:flex-row md:gap-10 md:px-6 md:py-10">
         <SideNav />
-        <main key={pathname} className="animate-rise min-w-0 flex-1"><Outlet /></main>
+        <main key={pathname} className="animate-rise min-w-0 flex-1">
+          <ModelStatusBanner />
+          <Outlet />
+        </main>
       </div>
     </div>
   );
