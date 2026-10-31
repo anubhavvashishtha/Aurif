@@ -1498,6 +1498,4 @@ if __name__ == "__main__":
     print("Demo login       → owner@aurif.dev / demo1234")
     print(f"Site key         → {site['site_key']}")
     muse_client.log_active_models(echo=True)
-    if debug:
-        print("Debugger         → on (local python app.py). Production uses gunicorn with FLASK_DEBUG=0.")
     app.run(host=config.bind_host(), port=config.port(), debug=debug, use_reloader=debug)
