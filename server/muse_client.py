@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,27 @@ BASETEN_BASE_URL = "https://inference.baseten.co/v1"
 BASETEN_DEFAULT_MODEL = "meta-models/muse-spark-open-1026"
 
 log = logging.getLogger("aurif.models")
+
+# Text calls should fail in a few seconds. Vision gets a little longer for image upload.
+# Retries are extra attempts after the first, and read timeouts are not retried.
+_DEFAULT_TEXT_TIMEOUT = 8.0
+_DEFAULT_VISION_TIMEOUT = 15.0
+_DEFAULT_MAX_RETRIES = 1
+
+_HIGH_RISK = re.compile(
+    r"\b(scrape|scraping|harvest|harvesting|resale|resell|reseller|competitor|competitors|bypass|exfil|dump|crawl|crawler|bulk)\b",
+    re.I,
+)
+_SHOPPER = re.compile(
+    r"\b(buy|purchase|shop|shopping|cart|checkout|browse|order|help|find|add|product|customer)\b",
+    re.I,
+)
+
+# kind -> last call outcome. None means this process has not called the model yet.
+_model_status: dict[str, dict[str, Any]] = {
+    "text": {"ok": None, "error": None, "checked_at": None},
+    "vision": {"ok": None, "error": None, "checked_at": None},
+}
 
 # Families we will not call. Llama and Muse ids are Meta models and are allowed
 # even when the name also contains another token (for example a gateway prefix).
@@ -254,7 +276,196 @@ def _client(cfg: dict[str, str], *, kind: str) -> OpenAI:
     if not cfg.get("model"):
         raise RuntimeError(f"{kind} provider misconfigured: model name is empty")
     _reject_non_meta_target(cfg["model"], cfg["base_url"], kind=kind)
-    return OpenAI(api_key=cfg["api_key"], base_url=cfg["base_url"])
+    return OpenAI(
+        api_key=cfg["api_key"],
+        base_url=cfg["base_url"],
+        timeout=_timeout_seconds(kind),
+        max_retries=0,
+    )
+
+
+def _bounded_float(raw: str, default: float, *, lo: float, hi: float) -> float:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = default
+    return min(max(value, lo), hi)
+
+
+def _timeout_seconds(kind: str) -> float:
+    if kind == "vision":
+        raw = _first_env("META_VISION_TIMEOUT_SECONDS", "META_TIMEOUT_SECONDS")
+        default = _DEFAULT_VISION_TIMEOUT
+    else:
+        raw = _first_env("META_TIMEOUT_SECONDS")
+        default = _DEFAULT_TEXT_TIMEOUT
+    return _bounded_float(raw or str(default), default, lo=0.2, hi=60.0)
+
+
+def _max_retries() -> int:
+    raw = _first_env("META_MAX_RETRIES") or str(_DEFAULT_MAX_RETRIES)
+    try:
+        value = int(raw)
+    except ValueError:
+        value = _DEFAULT_MAX_RETRIES
+    return min(max(value, 0), 2)
+
+
+def _public_model_error(exc: BaseException) -> str:
+    """Short status for APIs and health. Details stay in the server log."""
+    name = type(exc).__name__
+    text = str(exc).lower()
+    if "timeout" in name.lower() or "timed out" in text:
+        return "model timed out"
+    if "misconfigured" in text or "api_key" in text or "key missing" in text or "not set" in text:
+        return "model key missing or provider misconfigured"
+    if "deepseek" in text or "not a meta model" in text:
+        return "non-Meta model refused"
+    status = getattr(exc, "status_code", None)
+    if status:
+        return f"model request failed ({status})"
+    return "model request failed"
+
+
+def _retryable(exc: BaseException) -> bool:
+    """One more try for a dropped connection or a gateway error, not for a hung read."""
+    if "timeout" in type(exc).__name__.lower():
+        return False
+    status = getattr(exc, "status_code", None)
+    if status in (408, 429, 500, 502, 503, 504):
+        return True
+    return type(exc).__name__ in {"APIConnectionError", "ConnectError", "ConnectionError"}
+
+
+def note_model_success(kind: str) -> None:
+    _model_status[kind] = {"ok": True, "error": None, "checked_at": time.time()}
+
+
+def note_model_failure(kind: str, exc: BaseException) -> None:
+    summary = _public_model_error(exc)
+    log.error("Aurif %s model failed: %s (%s)", kind, summary, exc)
+    _model_status[kind] = {"ok": False, "error": summary, "checked_at": time.time()}
+
+
+def _chat(cfg: dict[str, str], *, kind: str, **kwargs: Any) -> Any:
+    client = _client(cfg, kind=kind)
+    attempts = 1 + _max_retries()
+    last: BaseException | None = None
+    for attempt in range(attempts):
+        try:
+            response = client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            last = exc
+            note_model_failure(kind, exc)
+            if attempt + 1 >= attempts or not _retryable(exc):
+                raise
+            log.warning(
+                "Aurif %s model call failed (%s); retry %s/%s",
+                kind,
+                _public_model_error(exc),
+                attempt + 1,
+                attempts - 1,
+            )
+            continue
+        note_model_success(kind)
+        return response
+    assert last is not None
+    raise last
+
+
+def rule_score_purpose(purpose: str) -> dict[str, Any]:
+    """Conservative keyword score used only when the Meta model cannot answer.
+
+    Shopping language may keep act. Anything else, including an empty purpose,
+    is view-only. This does not grant act just because the model is down.
+    """
+    text = (purpose or "").strip()
+    if not text or text == "(empty)":
+        return {
+            "risk": "medium",
+            "reason": "keyword rule: empty purpose, view only",
+            "suggested_scopes": ["view"],
+            "drop_act": True,
+            "source": "rules",
+            "degraded": True,
+        }
+    if _HIGH_RISK.search(text):
+        return {
+            "risk": "high",
+            "reason": "keyword rule: purpose looks like scraping or bypass",
+            "suggested_scopes": ["view"],
+            "drop_act": True,
+            "source": "rules",
+            "degraded": True,
+        }
+    if _SHOPPER.search(text):
+        return {
+            "risk": "low",
+            "reason": "keyword rule: purpose looks like shopping help",
+            "suggested_scopes": ["view", "act"],
+            "drop_act": False,
+            "source": "rules",
+            "degraded": True,
+        }
+    return {
+        "risk": "medium",
+        "reason": "keyword rule: purpose is not clearly a shopper task, view only",
+        "suggested_scopes": ["view"],
+        "drop_act": True,
+        "source": "rules",
+        "degraded": True,
+    }
+
+
+def _status_side(kind: str, cfg: dict[str, str]) -> dict[str, Any]:
+    state = _model_status[kind]
+    key_ok = bool(cfg.get("api_key"))
+    configured = _vision_config_error(cfg) is None if kind == "vision" else key_ok
+    if kind == "text" and key_ok:
+        try:
+            _reject_non_meta_target(cfg["model"], cfg["base_url"], kind="text")
+        except RuntimeError:
+            configured = False
+    last_ok = state["ok"]
+    degraded = (not configured) or last_ok is False
+    return {
+        "provider": cfg.get("provider") or "",
+        "model": cfg.get("model") or "",
+        "base_url": cfg.get("base_url") or "",
+        "key_configured": key_ok,
+        "timeout_seconds": _timeout_seconds(kind),
+        "max_retries": _max_retries(),
+        "last_ok": last_ok,
+        "last_error": state["error"],
+        "checked_at": state["checked_at"],
+        "degraded": degraded,
+    }
+
+
+def vision_configured() -> bool:
+    return _vision_config_error(vision_settings()) is None
+
+
+def reset_model_status() -> None:
+    for kind in _model_status:
+        _model_status[kind] = {"ok": None, "error": None, "checked_at": None}
+
+
+def health_snapshot() -> dict[str, Any]:
+    """Operator view of model config and the last call. No API key material."""
+    text = _status_side("text", text_settings())
+    vision = _status_side("vision", vision_settings())
+    degraded = bool(text["degraded"] or vision["degraded"])
+    return {
+        "ok": not degraded,
+        "degraded": degraded,
+        "text": text,
+        "vision": vision,
+        "fallbacks": {
+            "handshake": "keyword_rules",
+            "captcha": "typed_code_or_ink",
+        },
+    }
 
 
 def _message_text(msg: Any) -> str:
@@ -278,7 +489,6 @@ def complete(
     # Provider is a label (meta, baseten, llama-api, …). The host is the base URL.
     # A mismatched label must not switch the request onto another vendor.
     _ = provider or resolved["provider"]
-    client = _client(cfg, kind="text")
     kwargs: dict[str, Any] = {
         "model": resolved["id"],
         "messages": messages,
@@ -291,7 +501,7 @@ def complete(
     extra = _meta_extra(cfg["base_url"])
     if extra:
         kwargs["extra_body"] = extra
-    response = client.chat.completions.create(**kwargs)
+    response = _chat(cfg, kind="text", **kwargs)
     return _message_text(response.choices[0].message)
 
 
@@ -342,21 +552,16 @@ Purpose: {purpose}
         data = extract_json(
             complete([{"role": "user", "content": prompt}], max_tokens=800, temperature=0.1)
         )
-    except Exception as e:
-        return {
-            "risk": "medium",
-            "reason": f"risk model unavailable: {e}",
-            "suggested_scopes": ["view"],
-            "drop_act": True,
-            "error": str(e),
-        }
+    except Exception as exc:
+        log.warning(
+            "handshake risk model unavailable (%s); using keyword rules",
+            _public_model_error(exc),
+        )
+        return rule_score_purpose(purpose)
     if not isinstance(data, dict):
-        return {
-            "risk": "medium",
-            "reason": "risk model returned a non-object payload",
-            "suggested_scopes": ["view"],
-            "drop_act": True,
-        }
+        log.warning("handshake risk model returned a non-object payload; using keyword rules")
+        note_model_failure("text", RuntimeError("risk model returned a non-object payload"))
+        return rule_score_purpose(purpose)
     risk = str(data.get("risk") or "medium").lower()
     if risk not in ("low", "medium", "high"):
         risk = "medium"
@@ -374,6 +579,8 @@ Purpose: {purpose}
         "reason": str(data.get("reason") or "")[:300],
         "suggested_scopes": scopes,
         "drop_act": drop_act,
+        "source": "model",
+        "degraded": False,
     }
 
 
@@ -652,7 +859,14 @@ def verify_drawing(image_data_url: str, target: str) -> dict[str, Any]:
 
     problem = _vision_config_error(cfg)
     if problem:
-        return {"ok": False, "reason": problem, "model": model, "provider": provider}
+        note_model_failure("vision", RuntimeError(problem))
+        return {
+            "ok": False,
+            "unavailable": True,
+            "reason": problem,
+            "model": model,
+            "provider": provider,
+        }
 
     prompt = f"""CAPTCHA check. Target to draw: "{target}"
 
@@ -688,7 +902,6 @@ or
     ]
 
     try:
-        client = _client(cfg, kind="vision")
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -699,11 +912,12 @@ or
         extra = _meta_extra(cfg["base_url"])
         if extra:
             kwargs["extra_body"] = extra
-        response = client.chat.completions.create(**kwargs)
+        response = _chat(cfg, kind="vision", **kwargs)
         text = _message_text(response.choices[0].message)
     except Exception as err:
         return {
             "ok": False,
+            "unavailable": True,
             "reason": f"vision provider error ({provider} {model}): {err}",
             "model": model,
             "provider": provider,
@@ -720,16 +934,20 @@ or
             except Exception:
                 data = None
         if not isinstance(data, dict):
+            note_model_failure("vision", RuntimeError("vision model returned unreadable result"))
             return {
                 "ok": False,
+                "unavailable": True,
                 "reason": "vision model returned unreadable result",
                 "raw": text[:200],
                 "model": model,
                 "provider": provider,
             }
     if not isinstance(data, dict):
+        note_model_failure("vision", RuntimeError("invalid vision response"))
         return {
             "ok": False,
+            "unavailable": True,
             "reason": "invalid vision response",
             "model": model,
             "provider": provider,
@@ -748,6 +966,7 @@ or
         reason = "looks machine-made, not hand-drawn"
     return {
         "ok": ok,
+        "unavailable": False,
         "match": match,
         "human_like": human_like,
         "read_as": read_as,

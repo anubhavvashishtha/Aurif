@@ -167,6 +167,50 @@ def human_session_valid(token: str | None) -> bool:
     return True
 
 
+def answer_matches(target: str, answer: str) -> bool:
+    """Typed fallback: same characters, ignoring spaces and case."""
+
+    def norm(value: str) -> str:
+        return "".join(ch for ch in (value or "").upper() if ch.isalnum())
+
+    expected = norm(target)
+    given = norm(answer)
+    return bool(expected) and expected == given
+
+
+def drawing_has_ink(image_data_url: str) -> bool:
+    """True when a sketch has real strokes, not a blank canvas.
+
+    Used only after the vision model is unavailable, so a human on the existing
+    drawing pad can still enter the storefront.
+    """
+    import base64
+    from io import BytesIO
+
+    from PIL import Image
+
+    raw_url = (image_data_url or "").strip()
+    if not raw_url.startswith("data:image/"):
+        return False
+    _, _, b64 = raw_url.partition(",")
+    if not b64:
+        return False
+    try:
+        blob = base64.b64decode(b64, validate=False)
+    except Exception:
+        return False
+    if len(blob) < 32:
+        return False
+    try:
+        image = Image.open(BytesIO(blob)).convert("L")
+    except Exception:
+        return False
+    image.thumbnail((160, 160))
+    pixels = image.get_flattened_data() if hasattr(image, "get_flattened_data") else image.getdata()
+    ink = sum(1 for pixel in pixels if pixel < 220)
+    return ink >= 24
+
+
 def _prune() -> None:
     now = time.time()
     for cid in [k for k, v in _challenges.items() if v["expires_at"] < now]:

@@ -39,6 +39,7 @@ function AgentDashboard() {
   const [useSiteKey, setUseSiteKey] = useState(false);
   const [models, setModels] = useState<AgentModel[]>([]);
   const [modelId, setModelId] = useState("");
+  const [modelWarning, setModelWarning] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([
@@ -60,6 +61,17 @@ function AgentDashboard() {
         setModels(list);
         const current = res.current || list.find((m) => m.default) || list[0];
         if (current?.id) setModelId(current.id);
+        const health = res.health;
+        if (health?.degraded) {
+          const detail = [health.text?.last_error, health.vision?.last_error].filter(Boolean).join("; ");
+          setModelWarning(
+            detail
+              ? `Model degraded (${detail}). Handshake uses keyword rules. The human gate can fall back without vision. Act is not granted automatically.`
+              : "Model key missing or the last call failed. Handshake uses keyword rules. The human gate can fall back without vision. Act is not granted automatically.",
+          );
+        } else {
+          setModelWarning(null);
+        }
       } catch {
         /* keep empty; user can still chat with server default */
       }
@@ -126,6 +138,11 @@ function AgentDashboard() {
         title="Agent dashboard"
         description="Ask Muse about a page. Pick a model, optionally send a site key, and get a short answer."
       />
+      {modelWarning && (
+        <p className="mb-3 border border-ink/20 bg-frost px-3 py-2 text-sm text-ink" role="status">
+          {modelWarning}
+        </p>
+      )}
       <Panel className="flex h-[calc(100vh-14rem)] min-h-[28rem] flex-col">
         <div className="grid grid-cols-1 gap-4 border-b border-ink/10 px-4 py-3 sm:grid-cols-2 sm:items-start">
           <div className="min-w-0">
