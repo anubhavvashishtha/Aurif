@@ -245,6 +245,117 @@ class MetaModelCallSites(unittest.TestCase):
         self.assertEqual(rec.clients[0]["api_key"], "official-meta-key")
         self.assertEqual(rec.calls[0]["model"], "muse-spark-1.3")
 
+    def _use_baseten_only(self, model: str | None = None) -> None:
+        for key in (
+            "META_API_KEY",
+            "MODEL_API_KEY",
+            "META_BASE_URL",
+            "META_MODEL",
+            "META_PROVIDER",
+            "META_VISION_API_KEY",
+            "META_VISION_BASE_URL",
+            "META_VISION_MODEL",
+            "META_VISION_PROVIDER",
+        ):
+            os.environ.pop(key, None)
+        os.environ["BASETEN_API_KEY"] = "baseten-key"
+        if model is None:
+            os.environ.pop("BASETEN_MODEL", None)
+        else:
+            os.environ["BASETEN_MODEL"] = model
+
+    def test_baseten_key_serves_text_and_vision(self):
+        self._use_baseten_only()
+        os.environ["MODAL_VISION_MODEL"] = "deepseek-ai/DeepSeek-V4.1-Flash"
+        os.environ["MODAL_BASE_URL"] = (
+            "https://anubhavvashishtha-iitd--ep-deepseek-v4-1-flash-server.us-west.modal.direct/v1"
+        )
+        image = "data:image/png;base64,iVBORw0KGgo="
+        with _Recorder(
+            '{"match":true,"human_like":true,"read_as":"A","reason":"ok"}'
+        ) as rec:
+            verdict = muse_client.verify_drawing(image, "A")
+        self.assertTrue(verdict["ok"])
+        self.assertEqual(verdict["provider"], "baseten")
+        self.assertEqual(verdict["model"], "meta-models/muse-spark-open-1026")
+        self.assert_meta_request(
+            rec,
+            model="meta-models/muse-spark-open-1026",
+            base_url="https://inference.baseten.co/v1",
+            api_key="baseten-key",
+        )
+        self.assertNotIn("extra_body", rec.calls[0])
+        with _Recorder(
+            '{"risk":"low","reason":"ok","suggested_scopes":["view"],"drop_act":false}'
+        ) as text_rec:
+            muse_client.score_purpose("help a shopper")
+        self.assert_meta_request(
+            text_rec,
+            model="meta-models/muse-spark-open-1026",
+            base_url="https://inference.baseten.co/v1",
+            api_key="baseten-key",
+        )
+        catalog = muse_client.list_agent_models()
+        self.assertEqual(catalog[0]["label"], "Muse Spark Open")
+        self.assertEqual(catalog[0]["provider"], "baseten")
+
+    def test_baseten_model_env_overrides_the_dated_default(self):
+        self._use_baseten_only("meta-models/muse-spark-open")
+        with _Recorder(
+            '{"risk":"low","reason":"ok","suggested_scopes":["view"],"drop_act":false}'
+        ) as rec:
+            muse_client.score_purpose("browse")
+        self.assertEqual(rec.calls[0]["model"], "meta-models/muse-spark-open")
+        self.assertEqual(rec.clients[0]["base_url"], "https://inference.baseten.co/v1")
+
+    def test_baseten_deepseek_model_is_refused(self):
+        self._use_baseten_only("deepseek-ai/DeepSeek-V4.1-Flash")
+        image = "data:image/png;base64,iVBORw0KGgo="
+        with _Recorder('{"match":true}') as rec:
+            verdict = muse_client.verify_drawing(image, "A")
+            scored = muse_client.score_purpose("browse")
+        self.assertFalse(verdict["ok"])
+        self.assertIn("DeepSeek", verdict["reason"])
+        self.assertIn("DeepSeek", scored["reason"])
+        self.assertEqual(rec.calls, [])
+
+    def test_meta_key_wins_over_baseten_key(self):
+        os.environ.pop("META_BASE_URL", None)
+        os.environ.pop("META_MODEL", None)
+        os.environ.pop("META_PROVIDER", None)
+        os.environ["META_API_KEY"] = "meta-key"
+        os.environ["BASETEN_API_KEY"] = "baseten-key"
+        os.environ["BASETEN_MODEL"] = "meta-models/muse-spark-open-1026"
+        with _Recorder(
+            '{"risk":"low","reason":"ok","suggested_scopes":["view"],"drop_act":false}'
+        ) as rec:
+            muse_client.score_purpose("browse")
+        self.assert_meta_request(
+            rec,
+            model="muse-spark-1.3",
+            base_url="https://api.meta.ai/v1",
+            api_key="meta-key",
+        )
+
+    def test_startup_log_and_providers_keep_baseten_field(self):
+        self._use_baseten_only()
+        with self.assertLogs("aurif.models", level="INFO") as logs:
+            muse_client.log_active_models()
+        text = "\n".join(logs.output)
+        self.assertIn("Aurif text model: provider=baseten", text)
+        self.assertIn("Aurif vision model: provider=baseten", text)
+        self.assertIn("model=meta-models/muse-spark-open-1026", text)
+        self.assertIn("base_url=https://inference.baseten.co/v1", text)
+        self.assertIn("key=set", text)
+        self.assertNotIn("baseten-key", text)
+        providers = muse_client.api_providers()
+        self.assertEqual(providers["text"]["model"], "meta-models/muse-spark-open-1026")
+        self.assertEqual(providers["vision"]["provider"], "baseten")
+        self.assertEqual(
+            providers["baseten"]["base_url"], "https://inference.baseten.co/v1"
+        )
+        self.assertNotIn("modal", providers)
+
     def test_legacy_deepseek_env_is_ignored(self):
         os.environ["MODAL_VISION_MODEL"] = "deepseek-ai/DeepSeek-V4.1-Flash"
         os.environ["MODAL_BASE_URL"] = (
@@ -271,6 +382,7 @@ class MetaModelCallSites(unittest.TestCase):
         os.environ.pop("META_API_KEY", None)
         os.environ.pop("MODEL_API_KEY", None)
         os.environ.pop("META_VISION_API_KEY", None)
+        os.environ.pop("BASETEN_API_KEY", None)
         image = "data:image/png;base64,iVBORw0KGgo="
         with _Recorder('{"match":true}') as rec:
             verdict = muse_client.verify_drawing(image, "A")
@@ -308,6 +420,7 @@ class MetaModelCallSites(unittest.TestCase):
         os.environ.pop("META_API_KEY", None)
         os.environ.pop("MODEL_API_KEY", None)
         os.environ.pop("META_VISION_API_KEY", None)
+        os.environ.pop("BASETEN_API_KEY", None)
         challenge = issue_challenge()
         with tempfile.TemporaryDirectory() as tmp:
             store_path = Path(tmp) / "store.json"

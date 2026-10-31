@@ -1123,10 +1123,7 @@ def api_ai_models():
             "ok": True,
             "models": models,
             "current": current,
-            "providers": {
-                "text": muse_client.public_settings(muse_client.text_settings()),
-                "vision": muse_client.public_settings(muse_client.vision_settings()),
-            },
+            "providers": muse_client.api_providers(),
         }
     )
 
@@ -1384,4 +1381,5 @@ if __name__ == "__main__":
     print("Aurif dashboard  → http://127.0.0.1:5174  (Aurif-UI)")
     print("Demo login       → owner@aurif.dev / demo1234")
     print(f"Site key         → {site['site_key']}")
+    muse_client.log_active_models(echo=True)
     app.run(host="127.0.0.1", port=8787, debug=True)

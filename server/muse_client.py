@@ -1,13 +1,15 @@
 """Meta model client for Aurif product AI features.
 
-Default host is the Meta Model API (Muse Spark 1.3), which accepts text and
-images on the same OpenAI-compatible chat completions endpoint. Provider, base
-URL, model, and API key are env-configured. There is no DeepSeek fallback.
+Preferred host is the Meta Model API (Muse Spark 1.3). If that key is unset
+and BASETEN_API_KEY is present, text and vision stay on Baseten Muse Spark
+Open (meta-models/muse-spark-open-1026), which already accepted CAPTCHA images.
+DeepSeek and Modal are not used.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from collections import Counter
@@ -25,6 +27,13 @@ load_dotenv(ROOT / ".env", override=False)
 # First-party Meta Model API. Muse Spark 1.3 reads text and images.
 META_API_DEFAULT_BASE = "https://api.meta.ai/v1"
 META_DEFAULT_MODEL = "muse-spark-1.3"
+
+# Existing demo setup. Muse Spark Open on Baseten is a Meta model, and the
+# draw-CAPTCHA path already sent images to this id when Modal was down.
+BASETEN_BASE_URL = "https://inference.baseten.co/v1"
+BASETEN_DEFAULT_MODEL = "meta-models/muse-spark-open-1026"
+
+log = logging.getLogger("aurif.models")
 
 # Families we will not call. Llama and Muse ids are Meta models and are allowed
 # even when the name also contains another token (for example a gateway prefix).
@@ -48,13 +57,42 @@ def _first_env(*names: str) -> str:
 
 
 def text_settings() -> dict[str, str]:
-    """Resolved text-model endpoint. Read on each call so env edits apply."""
+    """Resolved text-model endpoint. Read on each call so env edits apply.
+
+    META_API_KEY / MODEL_API_KEY select the Meta Model API. When neither is
+    set, BASETEN_API_KEY keeps the previous Muse Spark Open deployment.
+    """
     _refresh_env()
+    meta_key = _first_env("META_API_KEY", "MODEL_API_KEY")
+    baseten_key = _first_env("BASETEN_API_KEY")
+    using_baseten = not meta_key and bool(baseten_key)
+
+    if _first_env("META_BASE_URL"):
+        base_url = _first_env("META_BASE_URL").rstrip("/")
+    elif using_baseten:
+        base_url = BASETEN_BASE_URL
+    else:
+        base_url = META_API_DEFAULT_BASE
+
+    if _first_env("META_MODEL"):
+        model = _first_env("META_MODEL")
+    elif using_baseten:
+        model = _first_env("BASETEN_MODEL") or BASETEN_DEFAULT_MODEL
+    else:
+        model = META_DEFAULT_MODEL
+
+    if _first_env("META_PROVIDER"):
+        provider = _first_env("META_PROVIDER")
+    elif using_baseten or "inference.baseten.co" in base_url:
+        provider = "baseten"
+    else:
+        provider = "meta"
+
     return {
-        "provider": _first_env("META_PROVIDER") or "meta",
-        "base_url": (_first_env("META_BASE_URL") or META_API_DEFAULT_BASE).rstrip("/"),
-        "model": _first_env("META_MODEL") or META_DEFAULT_MODEL,
-        "api_key": _first_env("META_API_KEY", "MODEL_API_KEY"),
+        "provider": provider,
+        "base_url": base_url,
+        "model": model,
+        "api_key": meta_key or baseten_key,
     }
 
 
@@ -131,10 +169,48 @@ def _meta_extra(base_url: str) -> dict[str, Any]:
 
 
 def _model_label(model_id: str) -> str:
-    if model_id.startswith("muse-spark"):
-        tail = model_id.removeprefix("muse-spark").lstrip("-")
-        return f"Muse Spark {tail}".strip() if tail else "Muse Spark"
-    return model_id.split("/")[-1] or model_id
+    tail = (model_id or "").split("/")[-1]
+    if "muse-spark-open" in model_id:
+        return "Muse Spark Open"
+    if tail.startswith("muse-spark"):
+        rest = tail.removeprefix("muse-spark").lstrip("-")
+        return f"Muse Spark {rest}".strip() if rest else "Muse Spark"
+    return tail or model_id
+
+
+def log_active_models(*, echo: bool = False) -> None:
+    """Log the text and vision provider/model. Never includes the API key."""
+    lines: list[str] = []
+    for kind, loader in (("text", text_settings), ("vision", vision_settings)):
+        cfg = loader()
+        try:
+            _reject_non_meta_target(cfg["model"], cfg["base_url"], kind=kind)
+            line = (
+                f"Aurif {kind} model: provider={cfg['provider']} "
+                f"model={cfg['model']} base_url={cfg['base_url']} "
+                f"key={'set' if cfg.get('api_key') else 'missing'}"
+            )
+            log.info(line)
+        except RuntimeError as exc:
+            line = f"Aurif {kind} model: {exc}"
+            log.error(line)
+        lines.append(line)
+    if echo:
+        for line in lines:
+            print(line)
+
+
+def api_providers() -> dict[str, Any]:
+    """Model-catalog providers. `text` and `vision` are the live endpoints.
+
+    `baseten.base_url` is the previous response field. `modal` is omitted:
+    it was the DeepSeek host, and the dashboard does not read `providers`.
+    """
+    return {
+        "text": public_settings(text_settings()),
+        "vision": public_settings(vision_settings()),
+        "baseten": {"base_url": BASETEN_BASE_URL},
+    }
 
 
 def list_agent_models() -> list[dict[str, Any]]:
@@ -165,8 +241,8 @@ def resolve_model(model_id: str | None) -> dict[str, str]:
 def _client(cfg: dict[str, str], *, kind: str) -> OpenAI:
     if not cfg.get("api_key"):
         raise RuntimeError(
-            f"{kind} provider misconfigured: set META_API_KEY or MODEL_API_KEY "
-            "in the repo root .env"
+            f"{kind} provider misconfigured: set META_API_KEY, MODEL_API_KEY, "
+            "or BASETEN_API_KEY in the repo root .env"
             + (
                 " (or META_VISION_API_KEY for vision)"
                 if kind == "vision"
@@ -546,7 +622,7 @@ def _vision_config_error(cfg: dict[str, str]) -> str | None:
         if not cfg.get("api_key"):
             return (
                 "vision provider misconfigured: set META_VISION_API_KEY, "
-                "META_API_KEY, or MODEL_API_KEY in the repo root .env"
+                "META_API_KEY, MODEL_API_KEY, or BASETEN_API_KEY in the repo root .env"
             )
         if not cfg.get("base_url"):
             return "vision provider misconfigured: META_VISION_BASE_URL / META_BASE_URL is empty"

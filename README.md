@@ -55,11 +55,11 @@ Need **Node 22+** (prefer `pnpm`) and **Python 3.11+**.
 
 ```bash
 # .env (gitignored) — see .env.example and docs/MODELS.md
-MODEL_API_KEY=…           # Meta Model API key (META_API_KEY also works)
-# optional overrides (defaults are Muse Spark 1.3 on https://api.meta.ai/v1):
-# META_MODEL=muse-spark-1.3
-# META_BASE_URL=https://api.meta.ai/v1
-# META_VISION_MODEL=muse-spark-1.3
+# Either a Meta Model API key:
+MODEL_API_KEY=…
+# or the existing Baseten key (Muse Spark Open, text and vision):
+BASETEN_API_KEY=…
+# BASETEN_MODEL=meta-models/muse-spark-open-1026
 ```
 
 ### 2. Three terminals
@@ -138,15 +138,15 @@ Site key is on the dashboard (Settings / site detail).
 
 ## Models (hackathon)
 
-Product AI runs in **server + Aurif-UI** (not Demo-client). Text and CAPTCHA vision both call a Meta model. The default is **Muse Spark 1.3** on the Meta Model API (`https://api.meta.ai/v1`), which accepts text and images. Override the host with `META_BASE_URL` / `META_VISION_BASE_URL` if you serve Muse or Llama elsewhere (Baseten, Llama API, Modal). A misconfigured vision provider returns an error. It does not fall back to another vendor.
+Product AI runs in **server + Aurif-UI** (not Demo-client). Text and CAPTCHA vision both call a Meta model. With `MODEL_API_KEY` or `META_API_KEY`, that is **Muse Spark 1.3** on the Meta Model API (`https://api.meta.ai/v1`). With only `BASETEN_API_KEY`, text and vision stay on **Muse Spark Open** (`BASETEN_MODEL`, default `meta-models/muse-spark-open-1026`) at `https://inference.baseten.co/v1`. Startup prints which provider and model are active. A DeepSeek model id is refused. There is no Modal fallback.
 
 | Feature | Where | Model |
 |---------|--------|--------|
-| Handshake purpose risk | `POST /ai/handshake` | `META_MODEL` (default `muse-spark-1.3`) |
+| Handshake purpose risk | `POST /ai/handshake` | active text model |
 | Policy co-pilot | Endpoints | same |
 | Activity summary | Activity | same |
 | Muse chat phrasing | Agent dashboard | same |
-| CAPTCHA vision | Human gate | `META_VISION_MODEL` (default `muse-spark-1.3`) |
+| CAPTCHA vision | Human gate | active vision model (same as text unless `META_VISION_*` is set) |
 
 See [docs/MODELS.md](docs/MODELS.md).
 
