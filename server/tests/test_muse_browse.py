@@ -252,8 +252,9 @@ class MuseBrowseRepros(unittest.TestCase):
         cls._httpd = make_server("127.0.0.1", 0, app, threaded=True)
         cls._thread = threading.Thread(target=cls._httpd.serve_forever, daemon=True)
         cls._thread.start()
-        cls._api_base = muse_browse.API_BASE
-        muse_browse.API_BASE = f"http://127.0.0.1:{cls._httpd.server_port}"
+        # Muse calls the API through config.api_public_url(); point that at this process.
+        cls._saved_public_url = os.environ.get("AURIF_API_PUBLIC_URL")
+        os.environ["AURIF_API_PUBLIC_URL"] = f"http://127.0.0.1:{cls._httpd.server_port}"
 
         cls.client = app.test_client()
         login = cls.client.post(
@@ -269,7 +270,10 @@ class MuseBrowseRepros(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        muse_browse.API_BASE = cls._api_base
+        if cls._saved_public_url is None:
+            os.environ.pop("AURIF_API_PUBLIC_URL", None)
+        else:
+            os.environ["AURIF_API_PUBLIC_URL"] = cls._saved_public_url
         cls._httpd.shutdown()
         cls._thread.join(timeout=5)
         cls._httpd.server_close()

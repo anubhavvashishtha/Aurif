@@ -510,7 +510,7 @@ def browse_as_agent(
                 actions.append(
                     {
                         "method": "POST",
-                        "url": f"{API_BASE}/ai/actions",
+                        "url": f"{api_base()}/ai/actions",
                         "use_site_key": True,
                         "body": {"action_id": intent["action_id"], "args": {}},
                     }

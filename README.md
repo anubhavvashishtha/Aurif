@@ -82,10 +82,10 @@ If you use npm: **npm 10 fails** with `Cannot read properties of null (reading '
 
 ### Without model keys
 
-The API still starts. Two demo paths do not until you set `MODEL_API_KEY`, `META_API_KEY`, or `BASETEN_API_KEY`:
+The API still starts. With no `MODEL_API_KEY`, `META_API_KEY`, or `BASETEN_API_KEY`, model calls fail closed into a keyword and ink fallback. `GET /api/health` returns 503 while that is true.
 
-- **Drawing CAPTCHA.** `POST /api/public/human-verify` returns a vision-provider error, so a human cannot pass the storefront gate.
-- **`act` scope.** Handshake still returns `view`, then drops `act`, because the risk model errors. `product.add:*` returns 403 `scope 'act' not granted`.
+- **Drawing CAPTCHA.** A typed match of the challenge characters, or a sketch with visible ink, opens the human storefront only. It does not grant agent `act`. A blank pad still fails.
+- **`act` scope.** Handshake risk uses keyword rules. A shopping purpose (`buy`, `cart`, `browse`, and similar) can still receive `act`. A vague purpose, or one that looks like scraping, stays view-only, so `product.add:*` returns 403 `scope 'act' not granted`.
 
 Turn the human gate off for a local walkthrough (owner token from the login response):
 
@@ -100,7 +100,7 @@ curl -s -X PATCH http://127.0.0.1:8787/api/sites/demo-shop \
   -d '{"require_human_captcha":false}'
 ```
 
-Browsing pages with `view` works without keys. Adding to the cart needs a working model key so handshake can grant `act`.
+Browsing pages with `view` works without keys. Adding to the cart still works for a shopping purpose when keyword rules grant `act`. A vague or scraping purpose does not.
 
 Set **one** key in the repo-root `.env`. See [`.env.example`](.env.example) and [docs/MODELS.md](docs/MODELS.md).
 
@@ -169,7 +169,7 @@ curl -s "http://127.0.0.1:8787/ai/page?path=/products" \
   -H "X-Aurif-Session: SESSION_TOKEN"
 ```
 
-`POST /ai/actions` with `product.add:field-tote` also needs that session header, the site key, and a handshake that actually granted `act` (a Meta or Baseten key present). Without the session the API returns 401 `missing or invalid session`.
+`POST /ai/actions` with `product.add:field-tote` also needs that session header, the site key, and a handshake that granted `act`. A shopping purpose still can, including when the model is down and keyword rules score the purpose. A vague or scraping purpose does not. Without the session the API returns 401 `missing or invalid session`.
 
 ---
 
