@@ -32,7 +32,7 @@ Today, agents either:
 | **Owner dashboard** | `Aurif-UI/` | [http://127.0.0.1:5174](http://127.0.0.1:5174) | Login, endpoints, Muse agent chat, activity |
 | **API** | `server/` | [http://127.0.0.1:8787](http://127.0.0.1:8787) | Flask — `/ai/*`, owner APIs, Muse, CAPTCHA, store |
 
-Those URLs are the local defaults. Hosted origins come from env vars. See [DEPLOY.md](DEPLOY.md).
+Those URLs are the local defaults. Override them with the variables in `.env.example` when you need to.
 
 ```
 Aurif/
@@ -40,8 +40,6 @@ Aurif/
 ├── Aurif-UI/      # Aurif dashboard — owners + Muse demo agent
 ├── server/        # Protocol + policy + Muse backend
 ├── docs/          # Extra product / protocol notes
-├── DEPLOY.md      # Vercel + Render steps and env vars
-├── render.yaml    # Render blueprint for the API (gunicorn)
 └── .env.example   # Copy to .env for keys (gitignored once copied)
 ```
 
@@ -66,7 +64,7 @@ pip install -r requirements.txt
 python app.py
 ```
 
-The log prints the API URL, the demo login, and the site key (`Site key → …`). CLI calls need that key. It is also on the dashboard after you log in. A zero-config start listens on `127.0.0.1:8787` with the debugger on. Production is gunicorn with the debugger off — [DEPLOY.md](DEPLOY.md).
+The log prints the API URL, the demo login, and the site key (`Site key → …`). CLI calls need that key. It is also on the dashboard after you log in. With no env set, the API listens on `127.0.0.1:8787` with the debugger on.
 
 ### 2. Customer site and dashboard
 

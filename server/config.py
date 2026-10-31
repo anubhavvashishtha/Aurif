@@ -1,8 +1,8 @@
-"""Process settings for local `python app.py` and a hosted gunicorn process.
+"""Process settings for `python app.py`.
 
 Defaults match a zero-config checkout: bind 127.0.0.1:8787 with the Werkzeug
 debugger on, CORS limited to the two local frontends, public URLs pointing at
-those same ports. Hosted deploys set the variables documented in DEPLOY.md.
+those same ports. Optional env vars override each of those.
 """
 
 from __future__ import annotations
@@ -57,10 +57,10 @@ def port() -> int:
 
 
 def bind_host() -> str:
-    """Host for `python app.py`. Gunicorn uses its own --bind.
+    """Host for `python app.py`.
 
-    Local zero-config stays on the loopback. A platform-injected PORT (Render,
-    Railway) binds all interfaces so the process is reachable in the container.
+    Local zero-config stays on the loopback. If PORT is set and HOST is not,
+    bind all interfaces.
     """
     explicit = _raw("HOST")
     if explicit:
@@ -134,11 +134,11 @@ def _as_origin(value: str) -> str | None:
 
 
 def cors_origins() -> list[str]:
-    """Explicit browser origins. `*` is ignored so production cannot go wildcard.
+    """Explicit browser origins. `*` is ignored.
 
     Local dev origins stay listed so a laptop checkout works with no env.
     AURIF_CORS_ORIGINS / CORS_ORIGINS and the public frontend URLs are added
-    on top. That is how the deployed Vercel apps are allowed.
+    on top.
     """
     configured = _first("AURIF_CORS_ORIGINS", "CORS_ORIGINS")
     if configured and any(part.strip() == "*" for part in configured.split(",")):
