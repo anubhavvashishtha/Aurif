@@ -414,7 +414,7 @@ class MuseBrowseRepros(unittest.TestCase):
         self.assertTrue(pages)
         meta = pages[-1]["json"]["meta"]
         self.assertNotIn("price", meta)
-        self.assertEqual(meta.get("compare_at"), 85)
+        self.assertNotIn("compare_at", meta)
 
         self.assertIn("isn't shared", body["reply"])
         self.assertNotIn("85", body["reply"])
