@@ -428,6 +428,54 @@ class EnforcementApi(unittest.TestCase):
         self.assertEqual(_keys_named(added_body, PRICE_KEYS), [])
         self.assertNotIn("description", added_body["result"]["added"])
 
+    def test_n7_price_hidden_on_the_product_page_is_withheld_from_the_shop_list(self):
+        owner = self._owner()
+        session = self._handshake(scopes=["view", "act"])["session_token"]
+        headers = self._headers(session)
+
+        before = self.client.get("/ai/page", query_string={"path": "/products"}, headers=headers)
+        before_body = before.get_json()
+        self.assertEqual(before.status_code, 200, before_body)
+        self.assertIn("price", json.dumps(before_body))
+        self.assertEqual(before_body["meta"]["products"][0]["price"], 68)
+
+        self._hide(owner, "page.product", "meta.price")
+
+        shop = self.client.get("/ai/page", query_string={"path": "/products"}, headers=headers)
+        shop_body = shop.get_json()
+        self.assertEqual(shop.status_code, 200, shop_body)
+        self.assertEqual(_keys_named(shop_body, PRICE_KEYS), [])
+        self.assertNotIn("68", json.dumps(shop_body))
+        self.assertNotIn("85", json.dumps(shop_body))
+        self.assertIn("Field Tote", json.dumps(shop_body))
+        self.assertIn("rating", json.dumps(shop_body["elements"]))
+
+        product = self.client.get(
+            "/ai/page",
+            query_string={"path": "/products/field-tote"},
+            headers=headers,
+        )
+        product_body = product.get_json()
+        self.assertEqual(product.status_code, 200, product_body)
+        self.assertEqual(_keys_named(product_body, PRICE_KEYS), [])
+        self.assertEqual(product_body["meta"]["sku"], "NL-BG-001")
+        self.assertEqual(product_body["rating"], 4.7)
+
+        added = self.client.post(
+            "/ai/actions",
+            json={"action_id": "product.add:field-tote"},
+            headers=headers,
+        )
+        added_body = added.get_json()
+        self.assertEqual(added.status_code, 200, added_body)
+        self.assertEqual(_keys_named(added_body, PRICE_KEYS), [])
+
+        cart = self.client.get("/ai/page", query_string={"path": "/cart"}, headers=headers)
+        cart_body = cart.get_json()
+        self.assertEqual(cart.status_code, 200, cart_body)
+        self.assertEqual(_keys_named(cart_body, PRICE_KEYS), [])
+        self.assertIn("Field Tote", json.dumps(cart_body))
+
     def test_m3_visible_price_is_still_returned(self):
         session = self._handshake()["session_token"]
         response = self.client.get(

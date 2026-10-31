@@ -143,6 +143,41 @@ class MusePathAndPrice(unittest.TestCase):
             "/products/field-tote",
         )
 
+    def test_n8_price_question_uses_a_distinctive_product_word(self):
+        products = {
+            "field-tote": {"name": "Field Tote"},
+            "trail-notebook": {"name": "Trail Notebook"},
+            "camp-mug": {"name": "Camp Mug"},
+        }
+        self.assertEqual(
+            muse_browse.shop_path_from_message("how much is the tote", products),
+            "/products/field-tote",
+        )
+        self.assertEqual(
+            muse_browse.shop_path_from_message("how much are the totes", products),
+            "/products/field-tote",
+        )
+        self.assertEqual(
+            muse_browse.shop_path_from_message("what does the notebook cost", products),
+            "/products/trail-notebook",
+        )
+        self.assertEqual(
+            muse_browse.shop_path_from_message("price of the field tote", products),
+            "/products/field-tote",
+        )
+        ambiguous = {
+            **products,
+            "canvas-tote": {"name": "Canvas Tote"},
+        }
+        self.assertEqual(
+            muse_browse.shop_path_from_message("how much is the tote", ambiguous),
+            "/",
+        )
+        self.assertEqual(
+            muse_browse.shop_path_from_message("how much is the field tote", ambiguous),
+            "/products/field-tote",
+        )
+
     def test_add_intent_requests_act_and_view_questions_do_not(self):
         products = _products()
         self.assertEqual(
@@ -152,6 +187,44 @@ class MusePathAndPrice(unittest.TestCase):
         self.assertIsNone(muse_browse.action_from_message("what is the price of the field tote", products))
         self.assertIsNone(muse_browse.action_from_message("open the shop", products))
         self.assertIsNone(muse_browse.action_from_message("show me the products", products))
+
+    def test_n2_negated_or_cancelled_instructions_do_not_act(self):
+        products = {
+            "field-tote": {"name": "Field Tote"},
+            "trail-notebook": {"name": "Trail Notebook"},
+        }
+        for message in (
+            "don't add the field tote",
+            "Do not add the Field Tote",
+            "please don't buy the tote",
+            "never purchase the field tote",
+            "I won't add the tote",
+            "don't put the tote in the cart",
+            "cancel adding — do not order the field tote",
+            "don't check out",
+            "do not clear the cart",
+        ):
+            self.assertIsNone(muse_browse.action_from_message(message, products), message)
+        self.assertEqual(
+            muse_browse.action_from_message("don't add the notebook, but add the field tote", products),
+            {"action_id": "product.add:field-tote", "kind": "add", "slug": "field-tote"},
+        )
+        self.assertEqual(
+            muse_browse.action_from_message("don't add the field tote, add the notebook", products),
+            {"action_id": "product.add:trail-notebook", "kind": "add", "slug": "trail-notebook"},
+        )
+        self.assertEqual(
+            muse_browse.action_from_message("add the field tote but don't check out", products),
+            {"action_id": "product.add:field-tote", "kind": "add", "slug": "field-tote"},
+        )
+        self.assertEqual(
+            muse_browse.action_from_message("check out", products),
+            {"action_id": "cart.checkout", "kind": "checkout"},
+        )
+        self.assertEqual(
+            muse_browse.action_from_message("clear the cart", products),
+            {"action_id": "cart.clear", "kind": "clear"},
+        )
 
     def test_hidden_price_is_not_replaced_by_compare_at_or_the_model(self):
         fields = [
@@ -438,6 +511,53 @@ class MuseBrowseRepros(unittest.TestCase):
             self.assertTrue(all("path=/products" in url and "path=/shop" not in url for url in page_urls))
             handshakes = [event for event in fresh if event["kind"] == "handshake"]
             self.assertEqual(handshakes[0]["detail"]["asked"]["requested_scopes"], ["view"])
+
+    def test_n2_dont_add_the_field_tote_does_not_act(self):
+        body, fresh = self._fresh("don't add the field tote")
+        self.assertNotIn("in the cart", body["reply"].lower())
+        action_steps = [
+            step
+            for step in body["steps"]
+            if str(step.get("url", "")).rstrip("/").endswith("/ai/actions")
+        ]
+        self.assertEqual(action_steps, [])
+        handshakes = [event for event in fresh if event["kind"] == "handshake"]
+        self.assertTrue(handshakes)
+        self.assertEqual(handshakes[0]["detail"]["asked"]["requested_scopes"], ["view"])
+        self.assertFalse(any(event["kind"] == "action" and event["detail"].get("accepted") for event in fresh))
+
+    def test_n8_how_much_is_the_tote_answers_from_the_product_page(self):
+        body, _fresh = self._fresh("how much is the tote")
+        self.assertEqual(body["path"], "/products/field-tote")
+        self.assertIn("68", body["reply"])
+        self.assertNotIn("isn't shared", body["reply"])
+        self.assertNotIn("85", body["reply"])
+        pages = [
+            item
+            for item in body["site_response"]["findings"]
+            if isinstance(item.get("json"), dict) and item["json"].get("path") == "/products/field-tote"
+        ]
+        self.assertTrue(pages)
+        self.assertEqual(pages[-1]["json"]["meta"].get("price"), 68)
+
+    def test_n7_shop_list_omits_a_price_hidden_on_the_product_page(self):
+        self._set_price_visible(False)
+        try:
+            body, _fresh = self._fresh("open the shop")
+        finally:
+            self._set_price_visible(True)
+        self.assertEqual(body["path"], "/products")
+        self.assertIn("Field Tote", body["reply"])
+        self.assertNotIn("68", body["reply"])
+        self.assertNotIn("85", body["reply"])
+        pages = [
+            item
+            for item in body["site_response"]["findings"]
+            if isinstance(item.get("json"), dict) and item["json"].get("path") == "/products"
+        ]
+        self.assertTrue(pages)
+        self.assertNotIn("price", json.dumps(pages[-1]["json"]))
+        self.assertNotIn("68", json.dumps(pages[-1]["json"]))
 
     def test_b3_without_a_site_key_shop_still_targets_products(self):
         body = self._chat("open the shop", use_site_key=False)

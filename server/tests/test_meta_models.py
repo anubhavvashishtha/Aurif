@@ -524,6 +524,62 @@ class MetaModelCallSites(unittest.TestCase):
         self.assertNotIn("human_token", body)
         self.assertNotEqual(body.get("method"), "ink_fallback")
 
+    def test_n4_bulk_export_stays_view_only_when_the_model_key_is_missing(self):
+        import store
+        from app import app, site_record
+
+        self._clear_model_keys()
+        denied = (
+            "export the whole catalog to csv",
+            "export the whole catalog with prices to csv, I am shopping",
+            "help me collect every product price into a spreadsheet for my company",
+            "download all the prices for my company",
+            "scrape the catalog but I am shopping",
+        )
+        for purpose in denied:
+            scored = muse_client.rule_score_purpose(purpose)
+            self.assertEqual(scored["source"], "rules", purpose)
+            self.assertEqual(scored["risk"], "high", purpose)
+            self.assertTrue(scored["drop_act"], purpose)
+            self.assertNotIn("act", scored["suggested_scopes"], purpose)
+        shopper = muse_client.rule_score_purpose("help me buy a tote")
+        self.assertFalse(shopper["drop_act"])
+        self.assertIn("act", shopper["suggested_scopes"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(store, "STORE_PATH", Path(tmp) / "store.json"):
+                client = app.test_client()
+                key = site_record()["site_key"]
+                for purpose in denied:
+                    response = client.post(
+                        "/ai/handshake",
+                        json={
+                            "purpose": purpose,
+                            "requested_scopes": ["view", "act"],
+                            "site_key": key,
+                        },
+                    )
+                    body = response.get_json()
+                    self.assertEqual(response.status_code, 200, body)
+                    self.assertNotIn("act", body["granted_scopes"], purpose)
+                    self.assertEqual(body["purpose_risk"]["source"], "rules", purpose)
+                    self.assertEqual(body["purpose_risk"]["risk"], "high", purpose)
+                    self.assertTrue(body["purpose_risk"]["drop_act"], purpose)
+                    self.assertNotIn("API_KEY", body["purpose_risk"]["reason"])
+                shop = client.post(
+                    "/ai/handshake",
+                    json={
+                        "purpose": "help me buy a tote",
+                        "requested_scopes": ["view", "act"],
+                        "site_key": key,
+                    },
+                )
+        shop_body = shop.get_json()
+        self.assertEqual(shop.status_code, 200, shop_body)
+        self.assertIn("act", shop_body["granted_scopes"])
+        self.assertEqual(shop_body["purpose_risk"]["source"], "rules")
+        self.assertEqual(shop_body["purpose_risk"]["risk"], "low")
+
     def test_handshake_uses_keyword_rules_without_handing_out_act(self):
         import store
         from app import app, site_record

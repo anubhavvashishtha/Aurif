@@ -168,16 +168,71 @@ def _normalize_ai_path(path: str) -> str:
     return _PATH_ALIASES.get(path, path)
 
 
+_TOKEN = re.compile(r"[a-z0-9]+")
+# Words that name the question, not the product. "how much is the tote" should
+# match Tote, not fail because the full name "field tote" is absent.
+_NAME_STOPWORDS = frozenset({
+    "a", "an", "the", "of", "and", "or", "for", "to", "my", "me", "please",
+    "this", "that", "these", "those", "it", "is", "are", "was", "be",
+    "how", "much", "what", "whats", "price", "prices", "cost", "costs",
+    "product", "products", "item", "items", "one", "some", "with",
+    "from", "in", "on", "at", "do", "does", "did", "you", "your", "i", "we",
+    "can", "could", "would", "should", "just", "now", "then",
+})
+
+
+def _tokens(text: str) -> list[str]:
+    return _TOKEN.findall((text or "").lower())
+
+
+def _same_word(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    if len(left) < 3 or len(right) < 3:
+        return False
+    return left.rstrip("s") == right.rstrip("s")
+
+
 def _product_slug_from_message(message: str, products: dict[str, dict[str, Any]]) -> str:
-    lowered = message.lower()
+    """Product the message names.
+
+    The full name or slug wins. A single distinctive word is enough ("tote"
+    for Field Tote, "notebook" for Trail Notebook). If two products share that
+    word and nothing breaks the tie, return nothing rather than guess.
+    """
+    lowered = (message or "").lower()
+    if not lowered.strip():
+        return ""
+    message_tokens = _tokens(lowered)
     best_slug = ""
-    best_len = 0
+    best_score = 0
+    tied = False
     for slug, product in products.items():
-        candidates = {slug.replace("-", " "), str(product.get("name") or "").lower()}
-        for name in candidates:
-            if name and name in lowered and len(name) > best_len:
-                best_slug = slug
-                best_len = len(name)
+        name = str((product or {}).get("name") or "").lower().strip()
+        phrase = slug.replace("-", " ")
+        score = 0
+        for candidate in {c for c in (name, phrase, slug) if c}:
+            if re.search(rf"(?<![a-z0-9]){re.escape(candidate)}(?![a-z0-9])", lowered):
+                score = max(score, 1000 + len(candidate))
+        if score < 1000:
+            seen: set[str] = set()
+            words: list[str] = []
+            for tok in _tokens(f"{name} {phrase}"):
+                if len(tok) < 3 or tok in _NAME_STOPWORDS or tok in seen:
+                    continue
+                seen.add(tok)
+                words.append(tok)
+            matched = [tok for tok in words if any(_same_word(tok, msg) for msg in message_tokens)]
+            if matched:
+                score = sum(len(tok) for tok in matched) + 10 * len(matched)
+        if score > best_score:
+            best_slug = slug
+            best_score = score
+            tied = False
+        elif score == best_score and score > 0 and slug != best_slug:
+            tied = True
+    if tied or best_score <= 0:
+        return ""
     return best_slug
 
 
@@ -206,21 +261,88 @@ def shop_path_from_message(message: str, products: dict[str, dict[str, Any]]) ->
     return "/"
 
 
+# A cue before the verb, in the same clause, cancels that verb. "but" / "." start
+# a new clause so "don't add the notebook, but add the tote" still adds the tote.
+_NEGATION_CUE = re.compile(
+    r"\b(?:"
+    r"don'?t|do\s+not|doesn'?t|does\s+not|didn'?t|did\s+not|"
+    r"won'?t|will\s+not|can'?t|cannot|can\s+not|"
+    r"never|without|avoid|refrain(?:\s+from)?|skip|"
+    r"cancel(?:led|ed|ing)?|stop|"
+    r"no\s+longer|not"
+    r")\b",
+    re.I,
+)
+_SCOPE_RESET = re.compile(
+    r"[.!?;]|\b(?:but|however|although|though|instead|except)\b",
+    re.I,
+)
+_FRESH_IMPERATIVE = re.compile(r"(?:please|just|now|then|actually|do)?\s*", re.I)
+_CHECKOUT_VERB = re.compile(r"\bcheck\s*out\b|\bcheckout\b", re.I)
+_CLEAR_VERB = re.compile(r"\b(?:clear|empty)\b", re.I)
+_ADD_VERB = re.compile(r"\b(?:add|buy|purchase|order)\b", re.I)
+_PUT_VERB = re.compile(r"\b(?:put|place)\b", re.I)
+
+
+def _scope_start(text: str, index: int) -> int:
+    start = 0
+    for match in _SCOPE_RESET.finditer(text):
+        if match.end() <= index:
+            start = match.end()
+        else:
+            break
+    prefix = text[start:index]
+    for match in re.finditer(r",\s*", prefix):
+        between = prefix[match.end():]
+        if _FRESH_IMPERATIVE.fullmatch(between):
+            start = start + match.end()
+    return start
+
+
+def _clause_end(text: str, index: int) -> int:
+    for match in _SCOPE_RESET.finditer(text):
+        if match.start() > index:
+            return match.start()
+    return len(text)
+
+
+def _verb_is_negated(text: str, verb_start: int) -> bool:
+    window = text[_scope_start(text, verb_start):verb_start]
+    return _NEGATION_CUE.search(window) is not None
+
+
+def _affirmed_matches(text: str, pattern: re.Pattern[str]) -> list[re.Match[str]]:
+    return [match for match in pattern.finditer(text) if not _verb_is_negated(text, match.start())]
+
+
 def _wants_cart_add(message: str) -> bool:
-    lowered = message.lower()
-    if re.search(r"\b(add|buy|purchase|order)\b", lowered):
+    if _affirmed_matches(message, _ADD_VERB):
         return True
-    return bool("cart" in lowered and re.search(r"\b(put|place)\b", lowered))
+    return bool("cart" in message.lower() and _affirmed_matches(message, _PUT_VERB))
+
+
+def _slug_for_add(message: str, products: dict[str, dict[str, Any]]) -> str:
+    """Product named next to an affirmed add, ignoring a cancelled one."""
+    for pattern in (_ADD_VERB, _PUT_VERB):
+        for match in _affirmed_matches(message, pattern):
+            if pattern is _PUT_VERB and "cart" not in message.lower():
+                continue
+            clause = message[_scope_start(message, match.start()):_clause_end(message, match.start())]
+            slug = _product_slug_from_message(clause, products)
+            if slug:
+                return slug
+    if _wants_cart_add(message):
+        return _product_slug_from_message(message, products)
+    return ""
 
 
 def action_from_message(message: str, products: dict[str, dict[str, Any]]) -> dict[str, str] | None:
-    """Mutation the user asked for. Read questions return None so they stay view-only."""
-    lowered = message.lower()
-    if re.search(r"\bcheck\s*out\b|\bcheckout\b", lowered):
+    """Mutation the user asked for. A negated or cancelled instruction does not act."""
+    if _affirmed_matches(message, _CHECKOUT_VERB):
         return {"action_id": "cart.checkout", "kind": "checkout"}
-    if re.search(r"\b(clear|empty)\b", lowered) and "cart" in lowered:
+    if "cart" in message.lower() and _affirmed_matches(message, _CLEAR_VERB):
         return {"action_id": "cart.clear", "kind": "clear"}
-    slug = _product_slug_from_message(message, products)
+    slug = _slug_for_add(message, products)
     if slug and _wants_cart_add(message):
         return {"action_id": f"product.add:{slug}", "kind": "add", "slug": slug}
     return None
