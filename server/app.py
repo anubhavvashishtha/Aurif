@@ -59,7 +59,116 @@ CORS(
 
 sessions: dict[str, dict[str, Any]] = {}
 cart_by_session: dict[str, list[str]] = {}
+# Storefront cart. It mirrors the Muse conversation's session cart.
+# External agent sessions keep their own cart_by_session lists and do not touch it.
+shop_cart: list[dict[str, Any]] = []
+# Owner id -> the one handshake for that chat. Reused until the purpose
+# changes or the session expires.
+muse_conversations: dict[str, dict[str, str]] = {}
 PRODUCTS = products_by_slug()
+
+
+def _default_variant(slug: str) -> dict[str, str]:
+    product = PRODUCTS.get(slug) or {}
+    variant: dict[str, str] = {}
+    for option in product.get("variants") or []:
+        if not isinstance(option, dict):
+            continue
+        name = str(option.get("name") or "").strip()
+        choices = option.get("options") or []
+        if name:
+            variant[name] = str(choices[0]) if choices else ""
+    return variant
+
+
+def _line_id(slug: str, variant: dict[str, str]) -> str:
+    parts = ",".join(f"{key}:{value}" for key, value in variant.items())
+    return f"{slug}|{parts}"
+
+
+def _clean_variant(slug: str, raw: Any) -> dict[str, str]:
+    if isinstance(raw, dict) and raw:
+        variant = {
+            str(key): str(value)
+            for key, value in raw.items()
+            if str(key).strip() and value is not None
+        }
+        if variant:
+            return variant
+    return _default_variant(slug)
+
+
+def shop_cart_slugs() -> list[str]:
+    """Agent carts are a slug per unit. Quantity on a line becomes repeats."""
+    slugs: list[str] = []
+    for line in shop_cart:
+        slug = str(line.get("slug") or "")
+        if slug not in PRODUCTS:
+            continue
+        try:
+            qty = int(line.get("qty") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        slugs.extend([slug] * max(0, min(10, qty)))
+    return slugs
+
+
+def normalize_shop_lines(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    lines: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        slug = str(item.get("slug") or "").strip()
+        if slug not in PRODUCTS:
+            continue
+        variant = _clean_variant(slug, item.get("variant"))
+        try:
+            qty = int(item.get("qty") or 1)
+        except (TypeError, ValueError):
+            qty = 1
+        qty = max(1, min(10, qty))
+        lines.append(
+            {"id": _line_id(slug, variant), "slug": slug, "variant": variant, "qty": qty}
+        )
+    return lines
+
+
+def replace_shop_cart(lines: list[dict[str, Any]]) -> None:
+    shop_cart.clear()
+    shop_cart.extend(lines)
+
+
+def sync_shop_cart_from_slugs(slugs: list[str]) -> None:
+    """Write an agent slug list back onto the storefront cart.
+
+    Existing lines keep their variant. A slug the storefront has not seen
+    yet uses the catalog's first option.
+    """
+    counts: dict[str, int] = {}
+    for slug in slugs:
+        if slug in PRODUCTS:
+            counts[slug] = min(10, counts.get(slug, 0) + 1)
+    kept: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for line in shop_cart:
+        slug = str(line.get("slug") or "")
+        if slug not in counts or slug in seen:
+            continue
+        variant = _clean_variant(slug, line.get("variant"))
+        kept.append(
+            {"id": _line_id(slug, variant), "slug": slug, "variant": variant, "qty": counts[slug]}
+        )
+        seen.add(slug)
+    for slug, qty in counts.items():
+        if slug in seen:
+            continue
+        variant = _default_variant(slug)
+        kept.append(
+            {"id": _line_id(slug, variant), "slug": slug, "variant": variant, "qty": qty}
+        )
+    replace_shop_cart(kept)
 
 
 def site_record() -> dict[str, Any]:
@@ -1278,13 +1387,39 @@ def api_ai_models():
     )
 
 
+def _reusable_muse_session(
+    record: dict[str, str] | None,
+    *,
+    purpose: str,
+    site_key: str,
+    needed: list[str],
+) -> str | None:
+    """The conversation's handshake, or nothing if this turn needs a new one.
+
+    A new handshake happens when the purpose changed, the session expired,
+    or this turn needs a scope the session was not granted (a later add
+    after a view-only hello). Otherwise the same cart stays on the same token.
+    """
+    if not record or not site_key:
+        return None
+    if record.get("purpose") != purpose or record.get("site_key") != site_key:
+        return None
+    token = str(record.get("token") or "")
+    session = sessions.get(token)
+    if not session or float(session.get("expires_at") or 0) < time.time():
+        return None
+    granted = session.get("scopes") or []
+    if any(scope not in granted for scope in needed):
+        return None
+    return token
+
+
 @app.post("/api/ai/agent-chat")
 def api_agent_chat():
     """Owner chat: Muse browses the real storefront like a normal agent (no /ai/* protocol)."""
     owner, err = owner_auth()
     if err:
         return err
-    _ = owner
     data = request.get_json(silent=True) or {}
     message = str(data.get("message") or "").strip()
     if not message:
@@ -1299,6 +1434,33 @@ def api_agent_chat():
         model_info = muse_client.resolve_model(str(data.get("model") or "").strip() or None)
     except RuntimeError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
+
+    owner_id = str((owner.get("user") or {}).get("id") or owner.get("token") or "")
+    record = muse_conversations.get(owner_id)
+    requested_purpose = str(data.get("purpose") or "").strip()
+    if requested_purpose:
+        purpose = requested_purpose[:240]
+    elif record and record.get("purpose"):
+        purpose = record["purpose"]
+    else:
+        purpose = message[:240]
+    intent = muse_browse.action_from_message(message, PRODUCTS)
+    needed = ["view", "act"] if intent else ["view"]
+    resume = _reusable_muse_session(record, purpose=purpose, site_key=site_key, needed=needed)
+    if resume:
+        # The storefront is the same cart. Pick up a human edit before this turn.
+        mirrored = shop_cart_slugs()
+        if mirrored != list(cart_by_session.get(resume) or []):
+            cart_by_session[resume] = list(mirrored)
+
+    def seed_new_session(token: str) -> None:
+        # A brand-new handshake starts empty. Load the storefront lines first
+        # so a re-handshake (new purpose, or the old session expired) still
+        # shows the cart the shopper already has.
+        if token not in sessions:
+            return
+        cart_by_session[token] = shop_cart_slugs()
+
     result = muse_browse.browse_as_agent(
         site=site,
         path=path,
@@ -1307,7 +1469,19 @@ def api_agent_chat():
         site_key=site_key or None,
         model=model_info["id"],
         provider=model_info["provider"],
+        on_session=seed_new_session,
+        resume_session=resume,
+        purpose=purpose,
     )
+    token = str(result.get("session_token") or "")
+    if token and token in cart_by_session:
+        sync_shop_cart_from_slugs(list(cart_by_session[token]))
+        if owner_id and site_key:
+            muse_conversations[owner_id] = {
+                "token": token,
+                "purpose": purpose,
+                "site_key": site_key,
+            }
 
     kind = "page_blocked" if result.get("denied") else "page"
     store.log_activity(
@@ -1361,6 +1535,19 @@ def _reject_anonymous_agent_if_needed():
         detail={"reason": "anonymous_agent_blocked"},
     )
     return jsonify(blocked_response_body(site["name"])), 403
+
+
+@app.get("/api/public/shop-cart")
+def api_public_shop_cart_get():
+    """Shared demo cart for the storefront. No human token and no site key."""
+    return jsonify({"ok": True, "lines": [dict(line) for line in shop_cart]})
+
+
+@app.put("/api/public/shop-cart")
+def api_public_shop_cart_put():
+    data = request.get_json(silent=True) or {}
+    replace_shop_cart(normalize_shop_lines(data.get("lines")))
+    return jsonify({"ok": True, "lines": [dict(line) for line in shop_cart]})
 
 
 @app.get("/api/public/gate")

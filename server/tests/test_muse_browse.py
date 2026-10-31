@@ -21,7 +21,7 @@ if str(SERVER) not in sys.path:
 
 import muse_browse  # noqa: E402
 import store  # noqa: E402
-from app import app, cart_by_session, sessions  # noqa: E402
+from app import app, cart_by_session, muse_conversations, sessions, shop_cart  # noqa: E402
 
 ENV_KEYS = (
     "META_API_KEY",
@@ -381,6 +381,8 @@ class MuseBrowseRepros(unittest.TestCase):
         cls._store.start()
         sessions.clear()
         cart_by_session.clear()
+        shop_cart.clear()
+        muse_conversations.clear()
 
         cls._openai = patch("muse_client.OpenAI", cls.script.client)
         cls._openai.start()
@@ -429,20 +431,25 @@ class MuseBrowseRepros(unittest.TestCase):
         self.script.reset()
         sessions.clear()
         cart_by_session.clear()
+        shop_cart.clear()
+        muse_conversations.clear()
 
     def _events(self) -> list[dict]:
         response = self.client.get("/api/sites/demo-shop/activity", headers=self.owner)
         self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
         return response.get_json()["events"]
 
-    def _chat(self, message: str, *, use_site_key: bool = True) -> dict:
+    def _chat(self, message: str, *, use_site_key: bool = True, purpose: str | None = None) -> dict:
+        payload: dict = {
+            "message": message,
+            "use_site_key": use_site_key,
+            "site_key": self.site_key if use_site_key else "",
+        }
+        if purpose is not None:
+            payload["purpose"] = purpose
         response = self.client.post(
             "/api/ai/agent-chat",
-            json={
-                "message": message,
-                "use_site_key": use_site_key,
-                "site_key": self.site_key if use_site_key else "",
-            },
+            json=payload,
             headers=self.owner,
         )
         self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
@@ -575,7 +582,11 @@ class MuseBrowseRepros(unittest.TestCase):
             self.assertTrue(page_urls, message)
             self.assertTrue(all("path=/products" in url and "path=/shop" not in url for url in page_urls))
             handshakes = [event for event in fresh if event["kind"] == "handshake"]
-            self.assertEqual(handshakes[0]["detail"]["asked"]["requested_scopes"], ["view"])
+            if message == "open the shop":
+                self.assertEqual(handshakes[0]["detail"]["asked"]["requested_scopes"], ["view"])
+            else:
+                # Same conversation and purpose: the second turn reuses the handshake.
+                self.assertEqual(handshakes, [])
 
     def test_n2_dont_add_the_field_tote_does_not_act(self):
         body, fresh = self._fresh("don't add the field tote")
@@ -643,6 +654,104 @@ class MuseBrowseRepros(unittest.TestCase):
         self.assertEqual(body["path"], "/products")
         self.assertTrue(body["url"].endswith("/products"))
         self.assertNotIn("/shop", body["url"])
+
+    def _handshake(self, purpose: str) -> str:
+        response = self.client.post(
+            "/ai/handshake",
+            json={
+                "agent_id": "external-agent",
+                "purpose": purpose,
+                "requested_scopes": ["view", "act"],
+                "site_key": self.site_key,
+            },
+            headers={"X-Aurif-Site-Key": self.site_key},
+        )
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        return response.get_json()["session_token"]
+
+    def test_g3_storefront_cart_is_what_muse_reads(self):
+        put = self.client.put(
+            "/api/public/shop-cart",
+            json={
+                "lines": [
+                    {"slug": "field-tote", "variant": {"Color": "Sand"}, "qty": 1},
+                    {"slug": "not-a-product", "qty": 4},
+                ]
+            },
+        )
+        self.assertEqual(put.status_code, 200, put.get_data(as_text=True))
+        self.assertEqual([line["slug"] for line in put.get_json()["lines"]], ["field-tote"])
+        body = self._chat("show my cart")
+        self.assertIn("Field Tote", body["reply"])
+        self.assertNotIn("empty", body["reply"].lower())
+        again = self.client.get("/api/public/shop-cart")
+        self.assertEqual(again.status_code, 200)
+        line = again.get_json()["lines"][0]
+        self.assertEqual(line["variant"], {"Color": "Sand"})
+        self.assertEqual(line["qty"], 1)
+
+    def test_g3_muse_add_updates_the_storefront_cart(self):
+        added = self._chat("add the Field Tote to my cart")
+        self.assertIn("Field Tote", added["reply"])
+        lines = self.client.get("/api/public/shop-cart").get_json()["lines"]
+        self.assertEqual([line["slug"] for line in lines], ["field-tote"])
+        self.assertEqual(lines[0]["qty"], 1)
+        shown = self._chat("show my cart")
+        self.assertIn("Field Tote", shown["reply"])
+        self.assertIn("Your cart has", shown["reply"])
+
+    def test_g3_add_then_open_the_cart_reuses_one_session(self):
+        before = {event["id"] for event in self._events()}
+        added = self._chat("add the Field Tote to my cart")
+        self.assertIn("in the cart", added["reply"].lower())
+        opened = self._chat("open the cart")
+        self.assertIn("Field Tote", opened["reply"])
+        self.assertNotIn("0 item", opened["reply"])
+        self.assertFalse(
+            any("/ai/handshake" in str(step.get("url") or "") for step in opened["steps"])
+        )
+        fresh = [event for event in self._events() if event["id"] not in before]
+        handshakes = [event for event in fresh if event["kind"] == "handshake"]
+        self.assertEqual(len(handshakes), 1)
+        held = [items for items in cart_by_session.values() if items]
+        self.assertEqual(held, [["field-tote"]])
+        shop = self.client.get("/api/public/shop-cart").get_json()["lines"]
+        self.assertEqual([line["slug"] for line in shop], ["field-tote"])
+
+    def test_g3_new_handshake_when_purpose_changes_or_session_expires(self):
+        self._chat("add the Field Tote to my cart", purpose="buy a tote")
+        changed, fresh = self._fresh("open the cart", purpose="compare shipping")
+        self.assertIn("Field Tote", changed["reply"])
+        self.assertEqual(len([event for event in fresh if event["kind"] == "handshake"]), 1)
+        for session in sessions.values():
+            session["expires_at"] = 0
+        expired, again = self._fresh("open the cart", purpose="compare shipping")
+        self.assertIn("Field Tote", expired["reply"])
+        self.assertEqual(len([event for event in again if event["kind"] == "handshake"]), 1)
+
+    def test_g3_external_agent_sessions_stay_isolated(self):
+        self.client.put(
+            "/api/public/shop-cart",
+            json={"lines": [{"slug": "field-tote", "variant": {"Color": "Olive"}, "qty": 1}]},
+        )
+        session_a = self._handshake("browse the catalog for a tote")
+        session_b = self._handshake("browse the catalog for a notebook")
+        added = self.client.post(
+            "/ai/actions",
+            json={"action_id": "product.add:field-tote", "args": {}},
+            headers={"X-Aurif-Session": session_a, "X-Aurif-Site-Key": self.site_key},
+        )
+        self.assertEqual(added.status_code, 200, added.get_data(as_text=True))
+        page_b = self.client.get(
+            "/ai/page?path=/cart",
+            headers={"X-Aurif-Session": session_b, "X-Aurif-Site-Key": self.site_key},
+        )
+        self.assertEqual(page_b.status_code, 200, page_b.get_data(as_text=True))
+        self.assertEqual(page_b.get_json()["meta"]["items"], [])
+        shop = self.client.get("/api/public/shop-cart").get_json()["lines"]
+        self.assertEqual(len(shop), 1)
+        self.assertEqual(shop[0]["qty"], 1)
+        self.assertEqual(shop[0]["variant"], {"Color": "Olive"})
 
 
 if __name__ == "__main__":

@@ -528,6 +528,9 @@ def browse_as_agent(
     site_key: str | None = None,
     model: str | None = None,
     provider: str | None = None,
+    on_session: Any = None,
+    resume_session: str | None = None,
+    purpose: str | None = None,
 ) -> dict[str, Any]:
     """Browse/scrape like a normal agent and return structured steps for the dashboard."""
     base = (site.get("url") or config.customer_site_url()).rstrip("/")
@@ -621,7 +624,7 @@ def browse_as_agent(
             detail = "No site key enabled — I can't act on the cart without permissioned API access"
         add("stop", result="stopped", detail=detail)
 
-    session_token: str | None = None
+    session_token = (resume_session or "").strip() or None
     if can_continue:
         if site_key:
             add(
@@ -635,22 +638,30 @@ def browse_as_agent(
             )
             actions = [
                 {"method": "GET", "url": f"{api_base()}/ai/help", "use_site_key": False},
-                {
-                    "method": "POST",
-                    "url": f"{api_base()}/ai/handshake",
-                    "use_site_key": True,
-                    "body": {
-                        "purpose": message[:240],
-                        "requested_scopes": scopes,
-                        "site_key": site_key,
-                    },
-                },
+            ]
+            # One handshake per conversation. A later turn reuses that session
+            # so the cart is still there. A new handshake is only for a new
+            # conversation (no token yet).
+            if not session_token:
+                actions.append(
+                    {
+                        "method": "POST",
+                        "url": f"{api_base()}/ai/handshake",
+                        "use_site_key": True,
+                        "body": {
+                            "purpose": (purpose or message)[:240],
+                            "requested_scopes": scopes,
+                            "site_key": site_key,
+                        },
+                    }
+                )
+            actions.append(
                 {
                     "method": "GET",
                     "url": f"{api_base()}/ai/page?path={urllib.parse.quote(path)}",
                     "use_site_key": True,
                 },
-            ]
+            )
             if intent:
                 # Same gate as any external agent: ask for act, then invoke the action.
                 actions.append(
@@ -693,7 +704,11 @@ def browse_as_agent(
             parsed = summ.get("json")
 
             if isinstance(parsed, dict) and parsed.get("session_token"):
-                session_token = str(parsed.get("session_token"))
+                new_token = str(parsed.get("session_token"))
+                if new_token != session_token:
+                    session_token = new_token
+                    if on_session is not None:
+                        on_session(session_token)
 
             is_action_call = urllib.parse.urlparse(url).path.rstrip("/") == "/ai/actions"
             action_id = str((body_obj or {}).get("action_id") or "")
@@ -844,6 +859,7 @@ def browse_as_agent(
         "captcha": {"attempted": True, "passed": captcha_passed},
         "fields": fields,
         "model": model_info,
+        "session_token": session_token,
         "site_response": {
             "url": target_url,
             "site_key_used": bool(site_key),
@@ -982,6 +998,38 @@ def _missing_field_reply(message: str) -> str | None:
     return f"I reached the page, but {label} was not available to agents."
 
 
+_CART_READ = re.compile(
+    r"\b(?:my cart|the cart|show\b.{0,40}\bcart\b|what(?:'s| is) in (?:my |the )?cart|cart contents)\b",
+    re.I,
+)
+
+
+def _is_cart_read(message: str) -> bool:
+    """A question about the cart, not an add, clear, or checkout."""
+    if _wants_cart_add(message):
+        return False
+    if _CHECKOUT_VERB.search(message) or _CLEAR_VERB.search(message):
+        return False
+    return bool(_CART_READ.search(message))
+
+
+def _cart_reply(fields: list[dict[str, str]]) -> str | None:
+    mapped = _field_map(fields)
+    products = mapped.get("products") or ""
+    if products:
+        names: list[str] = []
+        for part in products.split(", "):
+            name = re.sub(r"\s*\([^)]*\)\s*$", "", part).strip()
+            if name:
+                names.append(name)
+        if names:
+            return "Your cart has " + ", ".join(names) + "."
+    summary = mapped.get("summary") or ""
+    if re.search(r"\b0 item\(s\) in cart\b", summary):
+        return "Your cart is empty."
+    return None
+
+
 def _declined_add_reply(message: str) -> str | None:
     """A cancelled add should read as a sentence, not a dump of the page fields."""
     mentions_add = bool(_ADD_VERB.search(message) or ("cart" in message.lower() and _PUT_VERB.search(message)))
@@ -1044,6 +1092,11 @@ def _compose_reply(
     declined = _declined_add_reply(message)
     if declined:
         return declined
+
+    if _is_cart_read(message):
+        cart_line = _cart_reply(fields)
+        if cart_line:
+            return cart_line
 
     deterministic = _answer_from_fields(message, fields) if fields else None
     if deterministic:
