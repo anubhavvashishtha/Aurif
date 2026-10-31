@@ -53,10 +53,24 @@ ENV_KEYS = (
 )
 
 
+class _LimitRejected(Exception):
+    status_code = 400
+
+
 class _Recorder:
-    def __init__(self, content: str, error: BaseException | None = None):
+    def __init__(
+        self,
+        content: str,
+        error: BaseException | None = None,
+        *,
+        reasoning: str | None = None,
+        reject_reasoning_limit: bool = False,
+    ):
         self.content = content
         self.error = error
+        self.reasoning = reasoning
+        self.reject_reasoning_limit = reject_reasoning_limit
+        self._rejected_limit = False
         self.clients: list[dict] = []
         self.calls: list[dict] = []
 
@@ -66,11 +80,23 @@ class _Recorder:
         class _Completions:
             def create(_self, **kwargs):
                 recorder.calls.append(kwargs)
+                extra = kwargs.get("extra_body") or {}
+                if (
+                    recorder.reject_reasoning_limit
+                    and not recorder._rejected_limit
+                    and (
+                        "chat_template_kwargs" in extra
+                        or extra.get("reasoning_effort") == "low"
+                    )
+                ):
+                    recorder._rejected_limit = True
+                    raise _LimitRejected("reasoning limit rejected")
                 if recorder.error:
                     raise recorder.error
                 msg = MagicMock()
                 msg.content = recorder.content
-                msg.reasoning_content = None
+                msg.reasoning = None
+                msg.reasoning_content = recorder.reasoning
                 choice = MagicMock()
                 choice.message = msg
                 resp = MagicMock()
@@ -431,8 +457,8 @@ class ActivitySummaryGrounding(unittest.TestCase):
             else:
                 os.environ[key] = value
 
-    def _summarize(self, content: str):
-        with _Recorder(content) as rec:
+    def _summarize(self, content: str, **recorder_kwargs):
+        with _Recorder(content, **recorder_kwargs) as rec:
             result = muse_client.summarize_activity(_SHOP_EVENTS)
         return result, rec
 
@@ -541,6 +567,63 @@ class ActivitySummaryGrounding(unittest.TestCase):
         self.assertEqual(result["fallback"], "activity_counts")
         self.assertIn("2 events", result["summary"])
         self.assertNotIn("Twelve", result["summary"])
+
+    def test_reasoning_without_content_falls_back(self):
+        reasoning = "Restating the prompt: use only the counted facts and return JSON."
+        with self.assertLogs("aurif.models", level="WARNING") as logs:
+            result, rec = self._summarize("", reasoning=reasoning)
+        self.assertEqual(result["source"], "rules")
+        self.assertTrue(result["degraded"])
+        self.assertEqual(result["fallback"], "activity_counts")
+        self.assertIn("2 events", result["summary"])
+        self.assertNotIn("Restating the prompt", result["summary"])
+        self.assertIn("model returned only reasoning", "\n".join(logs.output))
+        self.assertEqual(rec.calls[0]["max_tokens"], 2048)
+        self.assertEqual(rec.clients[0]["timeout"], 8.0)
+        self.assertNotIn("chat_template_kwargs", rec.calls[0].get("extra_body") or {})
+
+    def test_content_summary_is_kept_when_reasoning_is_also_present(self):
+        text = "Two events from one agent included one handshake and one page read."
+        payload = json.dumps(
+            {"summary": text, "risks": [], "suggested_blocked_agents": []}
+        )
+        result, rec = self._summarize(
+            payload,
+            reasoning="I will spend the whole budget restating the prompt before I answer.",
+        )
+        self.assertEqual(result["source"], "model")
+        self.assertFalse(result["degraded"])
+        self.assertIsNone(result["fallback"])
+        self.assertEqual(result["summary"], text)
+        self.assertNotIn("restating the prompt", result["summary"].lower())
+        self.assertEqual(rec.calls[0]["max_tokens"], 2048)
+        self.assertEqual(rec.clients[0]["timeout"], 8.0)
+        self.assertEqual(len(rec.calls), 1)
+
+    def test_baseten_retries_summary_without_a_rejected_reasoning_limit(self):
+        os.environ.pop("META_API_KEY", None)
+        os.environ.pop("META_BASE_URL", None)
+        os.environ.pop("META_MODEL", None)
+        os.environ.pop("META_PROVIDER", None)
+        os.environ["BASETEN_API_KEY"] = "test-baseten-key"
+        text = "Two events from one agent included one handshake and one page read."
+        payload = json.dumps(
+            {"summary": text, "risks": [], "suggested_blocked_agents": []}
+        )
+        result, rec = self._summarize(payload, reject_reasoning_limit=True)
+        self.assertEqual(result["source"], "model")
+        self.assertEqual(result["summary"], text)
+        self.assertEqual(len(rec.calls), 2)
+        self.assertEqual(rec.calls[0]["max_tokens"], 2048)
+        self.assertEqual(rec.calls[0]["extra_body"]["reasoning_effort"], "low")
+        self.assertEqual(
+            rec.calls[0]["extra_body"]["chat_template_kwargs"],
+            {"reasoning_effort": "low"},
+        )
+        self.assertNotIn("extra_body", rec.calls[1])
+        self.assertEqual(rec.calls[1]["max_tokens"], 2048)
+        self.assertEqual(rec.clients[0]["timeout"], 8.0)
+        self.assertEqual(rec.clients[0]["base_url"], "https://inference.baseten.co/v1")
 
 
 if __name__ == "__main__":

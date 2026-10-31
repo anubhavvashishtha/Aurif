@@ -774,11 +774,42 @@ def health_snapshot() -> dict[str, Any]:
 
 
 def _message_text(msg: Any) -> str:
-    content = getattr(msg, "content", None) or ""
-    if content:
-        return str(content).strip()
-    reasoning = getattr(msg, "reasoning_content", None) or ""
-    return str(reasoning).strip()
+    """Visible answer only. Reasoning is never the reply."""
+    content = getattr(msg, "content", None)
+    text = content.strip() if isinstance(content, str) else (str(content).strip() if content else "")
+    if text:
+        return text
+    for name in ("reasoning", "reasoning_content"):
+        value = getattr(msg, name, None)
+        if isinstance(value, str) and value.strip():
+            log.warning("model returned only reasoning")
+            break
+    return ""
+
+
+def _http_status(exc: BaseException) -> int | None:
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    return status if isinstance(status, int) else None
+
+
+def _reasoning_limit_extra(base_url: str) -> dict[str, Any]:
+    """Ask Muse Spark Open to keep reasoning short.
+
+    The open weights default to xhigh and can spend the whole output budget
+    before `message.content`. `api.meta.ai` already sends `reasoning_effort`.
+    Other hosts get the same limit, plus the chat-template field the open
+    server reads. A host that rejects either field is retried without them.
+    """
+    if _is_meta_model_api(base_url):
+        return {}
+    return {
+        "reasoning_effort": "low",
+        "chat_template_kwargs": {"reasoning_effort": "low"},
+    }
 
 
 def complete(
@@ -788,6 +819,7 @@ def complete(
     temperature: float = 0.2,
     model: str | None = None,
     provider: str | None = None,
+    limit_reasoning: bool = False,
 ) -> str:
     cfg = text_settings()
     resolved = resolve_model(model)
@@ -803,10 +835,23 @@ def complete(
     # Send temperature only. Meta Model API rejects temperature together with top_p.
     if temperature is not None:
         kwargs["temperature"] = temperature
-    extra = _meta_extra(cfg["base_url"])
+    extra = dict(_meta_extra(cfg["base_url"]))
+    limited = _reasoning_limit_extra(cfg["base_url"]) if limit_reasoning else {}
+    if limited:
+        extra.update(limited)
     if extra:
         kwargs["extra_body"] = extra
-    response = _chat(cfg, kind="text", **kwargs)
+    try:
+        response = _chat(cfg, kind="text", **kwargs)
+    except Exception as exc:
+        if not limited or _http_status(exc) != 400:
+            raise
+        log.warning("reasoning limit rejected; retrying without it")
+        kwargs.pop("extra_body", None)
+        base_extra = _meta_extra(cfg["base_url"])
+        if base_extra:
+            kwargs["extra_body"] = base_extra
+        response = _chat(cfg, kind="text", **kwargs)
     return _message_text(response.choices[0].message)
 
 
@@ -1475,23 +1520,29 @@ Return ONLY JSON: {{"summary":"...","risks":["..."],"suggested_blocked_agents":[
                 },
                 {"role": "user", "content": polish_prompt},
             ],
-            max_tokens=600,
+            max_tokens=2048,
             temperature=0.1,
+            limit_reasoning=True,
         )
     except Exception as exc:
         model_error = _public_model_error(exc)
         log.warning("activity summary model unavailable (%s); using counted brief", model_error)
     else:
-        try:
-            polished = extract_json(raw_reply)
-        except Exception:
-            # A sentence with the right counts is still a summary. JSON is preferred.
-            log.debug("activity summary model reply was not JSON")
-            polished = {
-                "summary": (raw_reply or "").strip(),
-                "risks": [],
-                "suggested_blocked_agents": [],
-            }
+        if not (raw_reply or "").strip():
+            # Reasoning-only replies are already logged. Do not run them through
+            # the count check; there is no summary to accept.
+            model_error = "model returned only reasoning"
+        else:
+            try:
+                polished = extract_json(raw_reply)
+            except Exception:
+                # A sentence with the right counts is still a summary. JSON is preferred.
+                log.debug("activity summary model reply was not JSON")
+                polished = {
+                    "summary": (raw_reply or "").strip(),
+                    "risks": [],
+                    "suggested_blocked_agents": [],
+                }
 
     data = brief
     used_model = False
