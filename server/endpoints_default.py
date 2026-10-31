@@ -30,9 +30,7 @@ def _page(
         "ref": path,
         "agent_access": access,
         "direction": "read",
-        "response_fields": [
-            _rf(k, t, visible=(k not in hide)) for k, t in field_keys
-        ],
+        "response_fields": [_rf(k, t, visible=(k not in hide)) for k, t in field_keys],
         "request_fields": [],
         "sample_response": sample,
         "sample_request": {},
@@ -73,38 +71,66 @@ def _action(
     }
 
 
-PAGE_KEYS = [
+# Distinct schemas per real page type (not one shared PAGE_KEYS blob).
+HOME_KEYS: list[tuple[str, str]] = [
     ("title", "string"),
     ("summary", "string"),
     ("elements", "array"),
     ("meta", "object"),
-    ("meta.price", "number"),
-    ("meta.compare_at", "number"),
     ("meta.name", "string"),
     ("meta.summary", "string"),
+]
+
+SHOP_KEYS: list[tuple[str, str]] = [
+    ("title", "string"),
+    ("summary", "string"),
+    ("elements", "array"),
+    ("meta", "object"),
+    ("meta.products", "array"),
+    ("meta.products[].name", "string"),
+    ("meta.products[].price", "number"),
+    ("meta.products[].rating", "number"),
+    ("meta.products[].href", "string"),
+    ("meta.products[].slug", "string"),
+]
+
+PRODUCT_KEYS: list[tuple[str, str]] = [
+    ("title", "string"),
+    ("summary", "string"),
+    ("elements", "array"),
+    ("meta", "object"),
+    ("meta.name", "string"),
+    ("meta.summary", "string"),
+    ("meta.price", "number"),
+    ("meta.compare_at", "number"),
     ("meta.rating", "number"),
+    ("meta.sku", "string"),
+    ("meta.highlights", "array"),
     ("rating", "number"),
     ("discount", "number"),
     ("reviews", "array"),
 ]
 
-CART_KEYS = [
+CART_KEYS: list[tuple[str, str]] = [
     ("title", "string"),
     ("summary", "string"),
     ("elements", "array"),
     ("meta", "object"),
     ("meta.items", "array"),
     ("meta.products", "array"),
-    ("meta.products[].price", "number"),
     ("meta.products[].name", "string"),
-    ("rating", "number"),
-    ("discount", "number"),
-    ("reviews", "array"),
+    ("meta.products[].price", "number"),
 ]
+
+# Legacy IDs collapsed into shared Product / product.* action templates.
+LEGACY_PRODUCT_PAGE_IDS = (
+    "page.product.field-tote",
+    "page.product.trail-notebook",
+)
 
 
 def build_default_endpoints() -> list[dict[str, Any]]:
-    tote = {
+    product_sample = {
         "title": "Field Tote",
         "summary": "A heavy canvas carryall for markets, beaches and the long way home.",
         "elements": [
@@ -117,32 +143,12 @@ def build_default_endpoints() -> list[dict[str, Any]]:
             "price": 68,
             "compare_at": 85,
             "rating": 4.7,
+            "sku": "NL-TOTE",
+            "highlights": ["waxed canvas", "brass hardware"],
         },
         "rating": 4.7,
         "discount": 20,
         "reviews": [{"author": "Alex", "text": "Beautifully made.", "rating": 5}],
-    }
-    notebook = {
-        "title": "Trail Notebook",
-        "summary": "Pocket-size ruled notebook with a waterproof cover.",
-        "elements": [
-            {"action_id": "nav.products", "label": "Shop", "type": "link"},
-            {
-                "action_id": "product.add:trail-notebook",
-                "label": "Add Trail Notebook",
-                "type": "button",
-            },
-        ],
-        "meta": {
-            "name": "Trail Notebook",
-            "summary": "Takes pencil, ink and a little rain.",
-            "price": 18,
-            "compare_at": 22,
-            "rating": 4.6,
-        },
-        "rating": 4.6,
-        "discount": 18,
-        "reviews": [{"author": "Sam", "text": "Perfect pocket size.", "rating": 5}],
     }
     return [
         _page(
@@ -156,12 +162,9 @@ def build_default_endpoints() -> list[dict[str, Any]]:
                     {"action_id": "nav.products", "label": "Shop", "type": "link"},
                     {"action_id": "nav.cart", "label": "Cart", "type": "link"},
                 ],
-                "meta": {"name": "Northline Goods", "summary": "Editorial outdoor gear.", "price": None},
-                "rating": 4.8,
-                "discount": 0,
-                "reviews": [],
+                "meta": {"name": "Northline Goods", "summary": "Editorial outdoor gear."},
             },
-            PAGE_KEYS,
+            HOME_KEYS,
         ),
         _page(
             "page.products",
@@ -174,27 +177,33 @@ def build_default_endpoints() -> list[dict[str, Any]]:
                     {"action_id": "product.view:field-tote", "label": "View Field Tote", "type": "link"},
                     {"action_id": "product.add:field-tote", "label": "Add Field Tote", "type": "button"},
                 ],
-                "meta": {"name": "Shop", "summary": "Full catalog", "price": None},
-                "rating": 4.7,
-                "discount": 0,
-                "reviews": [],
+                "meta": {
+                    "products": [
+                        {
+                            "name": "Field Tote",
+                            "slug": "field-tote",
+                            "price": 68,
+                            "rating": 4.7,
+                            "href": "/products/field-tote",
+                        },
+                        {
+                            "name": "Trail Notebook",
+                            "slug": "trail-notebook",
+                            "price": 18,
+                            "rating": 4.6,
+                            "href": "/products/trail-notebook",
+                        },
+                    ]
+                },
             },
-            PAGE_KEYS,
+            SHOP_KEYS,
         ),
         _page(
-            "page.product.field-tote",
-            "Product: Field Tote",
-            "/products/field-tote",
-            tote,
-            PAGE_KEYS,
-            hide={"meta.price", "discount"},
-        ),
-        _page(
-            "page.product.trail-notebook",
-            "Product: Trail Notebook",
-            "/products/trail-notebook",
-            notebook,
-            PAGE_KEYS,
+            "page.product",
+            "Product page",
+            "/products/*",
+            product_sample,
+            PRODUCT_KEYS,
         ),
         _page(
             "page.cart",
@@ -214,36 +223,14 @@ def build_default_endpoints() -> list[dict[str, Any]]:
                         {"name": "Trail Notebook", "price": 18},
                     ],
                 },
-                "rating": 0,
-                "discount": 0,
-                "reviews": [],
             },
             CART_KEYS,
-            access=True,
         ),
         _action("action.nav.products", "Action: Shop", "nav.products"),
         _action("action.nav.cart", "Action: Cart", "nav.cart"),
         _action("action.nav.home", "Action: Home", "nav.home"),
-        _action(
-            "action.product.add.field-tote",
-            "Action: Add Field Tote",
-            "product.add:field-tote",
-        ),
-        _action(
-            "action.product.add.trail-notebook",
-            "Action: Add Trail Notebook",
-            "product.add:trail-notebook",
-        ),
-        _action(
-            "action.product.view.field-tote",
-            "Action: View Field Tote",
-            "product.view:field-tote",
-        ),
-        _action(
-            "action.product.view.trail-notebook",
-            "Action: View Trail Notebook",
-            "product.view:trail-notebook",
-        ),
+        _action("action.product.add", "Action: Add product", "product.add:*"),
+        _action("action.product.view", "Action: View product", "product.view:*"),
         _action("action.cart.clear", "Action: Clear cart", "cart.clear"),
         _action("action.cart.checkout", "Action: Checkout", "cart.checkout"),
     ]
@@ -252,36 +239,124 @@ def build_default_endpoints() -> list[dict[str, Any]]:
 DEFAULT_ENDPOINTS = build_default_endpoints()
 
 
+def _collect_visibility(rows: list[dict[str, Any]]) -> dict[str, bool]:
+    vis: dict[str, bool] = {}
+    for row in rows:
+        for f in row.get("response_fields") or []:
+            if isinstance(f, dict) and f.get("key"):
+                # Prefer False if any legacy row hid the field.
+                key = str(f["key"])
+                visible = bool(f.get("agent_visible", True))
+                if key not in vis:
+                    vis[key] = visible
+                else:
+                    vis[key] = vis[key] and visible
+    return vis
+
+
+def _collect_request_allowed(rows: list[dict[str, Any]]) -> dict[str, bool]:
+    allowed: dict[str, bool] = {}
+    for row in rows:
+        for f in row.get("request_fields") or []:
+            if isinstance(f, dict) and f.get("key"):
+                key = str(f["key"])
+                ok = bool(f.get("agent_allowed", True))
+                if key not in allowed:
+                    allowed[key] = ok
+                else:
+                    allowed[key] = allowed[key] and ok
+    return allowed
+
+
 def ensure_endpoint_shape(endpoints: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Upgrade legacy endpoint rows to include field schemas."""
-    by_id = {e["id"]: e for e in endpoints}
+    """Upgrade legacy endpoint rows to the real page-type schemas."""
+    by_id = {e["id"]: e for e in endpoints if isinstance(e, dict) and e.get("id")}
     defaults = {e["id"]: deepcopy(e) for e in DEFAULT_ENDPOINTS}
+
+    legacy_product_pages = [by_id[i] for i in LEGACY_PRODUCT_PAGE_IDS if i in by_id]
+    # Also catch any other page.product.* rows that may have been added.
+    for eid, row in by_id.items():
+        if eid.startswith("page.product.") and eid != "page.product":
+            if row not in legacy_product_pages:
+                legacy_product_pages.append(row)
+
+    legacy_add = [
+        row
+        for eid, row in by_id.items()
+        if any(eid.startswith(p) for p in ("action.product.add.",))
+        or row.get("action_id", "").startswith("product.add:")
+    ]
+    legacy_view = [
+        row
+        for eid, row in by_id.items()
+        if any(eid.startswith(p) for p in ("action.product.view.",))
+        or row.get("action_id", "").startswith("product.view:")
+    ]
+
+    product_vis = _collect_visibility(legacy_product_pages)
+    if "page.product" in by_id:
+        product_vis = {**product_vis, **_collect_visibility([by_id["page.product"]])}
+
+    product_access = True
+    for row in legacy_product_pages:
+        if row.get("agent_access") is False:
+            product_access = False
+            break
+    if "page.product" in by_id and by_id["page.product"].get("agent_access") is False:
+        product_access = False
+
+    add_access = all(bool(r.get("agent_access", True)) for r in legacy_add) if legacy_add else True
+    if "action.product.add" in by_id:
+        add_access = bool(by_id["action.product.add"].get("agent_access", add_access)) and add_access
+    view_access = all(bool(r.get("agent_access", True)) for r in legacy_view) if legacy_view else True
+    if "action.product.view" in by_id:
+        view_access = bool(by_id["action.product.view"].get("agent_access", view_access)) and view_access
+
+    add_req = _collect_request_allowed(legacy_add + ([by_id["action.product.add"]] if "action.product.add" in by_id else []))
+    view_req = _collect_request_allowed(
+        legacy_view + ([by_id["action.product.view"]] if "action.product.view" in by_id else [])
+    )
+
     out: list[dict[str, Any]] = []
     for eid, default in defaults.items():
-        cur = by_id.get(eid)
-        if not cur:
-            out.append(default)
-            continue
         merged = deepcopy(default)
-        merged["agent_access"] = bool(cur.get("agent_access", True))
-        # preserve visibility toggles when keys match
-        if cur.get("response_fields"):
-            vis = {
-                f["key"]: f.get("agent_visible", True)
-                for f in cur["response_fields"]
-                if isinstance(f, dict) and f.get("key")
-            }
+        cur = by_id.get(eid)
+
+        if eid == "page.product":
+            merged["agent_access"] = product_access
             for f in merged["response_fields"]:
-                if f["key"] in vis:
-                    f["agent_visible"] = bool(vis[f["key"]])
-        if cur.get("request_fields"):
-            allowed = {
-                f["key"]: f.get("agent_allowed", True)
-                for f in cur["request_fields"]
-                if isinstance(f, dict) and f.get("key")
-            }
+                if f["key"] in product_vis:
+                    f["agent_visible"] = bool(product_vis[f["key"]])
+        elif eid == "action.product.add":
+            merged["agent_access"] = add_access
             for f in merged["request_fields"]:
-                if f["key"] in allowed:
-                    f["agent_allowed"] = bool(allowed[f["key"]])
+                if f["key"] in add_req:
+                    f["agent_allowed"] = bool(add_req[f["key"]])
+        elif eid == "action.product.view":
+            merged["agent_access"] = view_access
+            for f in merged["request_fields"]:
+                if f["key"] in view_req:
+                    f["agent_allowed"] = bool(view_req[f["key"]])
+        elif cur:
+            merged["agent_access"] = bool(cur.get("agent_access", True))
+            if cur.get("response_fields"):
+                vis = {
+                    f["key"]: f.get("agent_visible", True)
+                    for f in cur["response_fields"]
+                    if isinstance(f, dict) and f.get("key")
+                }
+                for f in merged["response_fields"]:
+                    if f["key"] in vis:
+                        f["agent_visible"] = bool(vis[f["key"]])
+            if cur.get("request_fields"):
+                allowed = {
+                    f["key"]: f.get("agent_allowed", True)
+                    for f in cur["request_fields"]
+                    if isinstance(f, dict) and f.get("key")
+                }
+                for f in merged["request_fields"]:
+                    if f["key"] in allowed:
+                        f["agent_allowed"] = bool(allowed[f["key"]])
+
         out.append(merged)
     return out

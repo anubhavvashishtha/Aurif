@@ -83,12 +83,27 @@ def _migrate(data: dict[str, Any]) -> bool:
             changed = True
         eps = site.get("endpoints") or []
         needs = not eps or not eps[0].get("response_fields")
-        # also migrate old widget/badge product paths
+        ids = {str(e.get("id", "")) for e in eps}
+        home = next((e for e in eps if e.get("id") == "page.home"), None)
+        shop = next((e for e in eps if e.get("id") == "page.products"), None)
+        home_keys = {f.get("key") for f in (home or {}).get("response_fields") or [] if isinstance(f, dict)}
+        shop_keys = {f.get("key") for f in (shop or {}).get("response_fields") or [] if isinstance(f, dict)}
+        # Migrate widget leftovers, per-product rows, and pre–page-type schemas.
         legacy = any(
             (e.get("path") or "").endswith("/widget")
             or (e.get("action_id") or "").endswith(":widget")
-            or e.get("id", "").endswith(".widget")
+            or str(e.get("id", "")).endswith(".widget")
+            or str(e.get("id", "")).startswith("page.product.")
+            or str(e.get("id", "")).startswith("action.product.add.")
+            or str(e.get("id", "")).startswith("action.product.view.")
             for e in eps
+        ) or (
+            bool(eps)
+            and (
+                "page.product" not in ids
+                or "meta.products" not in shop_keys
+                or bool(home_keys & {"meta.price", "rating", "discount", "reviews"})
+            )
         )
         if needs or legacy:
             site["endpoints"] = ensure_endpoint_shape(eps)
@@ -337,13 +352,50 @@ def set_endpoint_fields(
     return update_site(site_id, owner_id, {"endpoints": [patch]})
 
 
+def _path_matches(pattern: str, path: str) -> bool:
+    """Exact or single-segment wildcard: `/products/*` → `/products/field-tote`."""
+    if not pattern or not path:
+        return False
+    if pattern == path:
+        return True
+    if pattern.endswith("/*"):
+        prefix = pattern[:-1]  # keep trailing slash, e.g. /products/
+        if not path.startswith(prefix):
+            return False
+        rest = path[len(prefix) :]
+        return bool(rest) and "/" not in rest
+    return False
+
+
+def _action_matches(pattern: str, action_id: str) -> bool:
+    """Exact or suffix wildcard: `product.add:*` → `product.add:field-tote`."""
+    if not pattern or not action_id:
+        return False
+    if pattern == action_id:
+        return True
+    if pattern.endswith(":*"):
+        prefix = pattern[:-1]  # product.add:
+        return action_id.startswith(prefix) and len(action_id) > len(prefix)
+    return False
+
+
 def find_endpoint(site: dict[str, Any], *, path: str | None = None, action_id: str | None = None) -> dict[str, Any] | None:
+    """Resolve page/action endpoint. Exact match wins, then wildcard patterns."""
+    pattern_hit: dict[str, Any] | None = None
     for ep in site.get("endpoints") or []:
-        if path is not None and ep.get("kind") == "page" and ep.get("path") == path:
-            return ep
-        if action_id is not None and ep.get("kind") == "action" and ep.get("action_id") == action_id:
-            return ep
-    return None
+        if path is not None and ep.get("kind") == "page":
+            ep_path = ep.get("path") or ""
+            if ep_path == path:
+                return ep
+            if pattern_hit is None and _path_matches(ep_path, path):
+                pattern_hit = ep
+        if action_id is not None and ep.get("kind") == "action":
+            ep_aid = ep.get("action_id") or ""
+            if ep_aid == action_id:
+                return ep
+            if pattern_hit is None and _action_matches(ep_aid, action_id):
+                pattern_hit = ep
+    return pattern_hit
 
 
 def endpoint_allowed(site: dict[str, Any], *, path: str | None = None, action_id: str | None = None) -> bool:

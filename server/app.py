@@ -216,17 +216,24 @@ def page_snapshot(path: str, session: dict[str, Any]) -> dict[str, Any]:
                 ]
             ),
             "meta": {"name": site["name"], "summary": welcome},
-            "rating": 4.8,
-            "discount": 0,
-            "reviews": [],
         }
 
     if path == "/products":
         elements: list[dict[str, Any]] = [
             {"action_id": "nav.home", "type": "link", "label": "Home", "href": "/", "scopes": ["view"]}
         ]
+        catalog: list[dict[str, Any]] = []
         for product in PRODUCTS.values():
             pub = public_product(product)
+            catalog.append(
+                {
+                    "name": pub["name"],
+                    "slug": pub["slug"],
+                    "price": pub["price"],
+                    "rating": pub["rating"],
+                    "href": f"/products/{pub['slug']}",
+                }
+            )
             elements.append(
                 {
                     "action_id": f"product.view:{pub['slug']}",
@@ -250,10 +257,7 @@ def page_snapshot(path: str, session: dict[str, Any]) -> dict[str, Any]:
             "title": "Shop — " + site["name"],
             "summary": f"{welcome} {len(PRODUCTS)} products available.".strip(),
             "elements": filter_elements(elements),
-            "meta": {"name": "Shop", "summary": f"{len(PRODUCTS)} products"},
-            "rating": 4.7,
-            "discount": 0,
-            "reviews": [],
+            "meta": {"products": catalog},
         }
 
     if path.startswith("/products/"):
@@ -312,11 +316,13 @@ def page_snapshot(path: str, session: dict[str, Any]) -> dict[str, Any]:
             ),
             "meta": {
                 "items": cart,
-                "products": [public_product(PRODUCTS[i]) for i in cart if i in PRODUCTS],
+                "products": [
+                    {"name": p["name"], "price": p["price"]}
+                    for i in cart
+                    if i in PRODUCTS
+                    for p in [public_product(PRODUCTS[i])]
+                ],
             },
-            "rating": 0,
-            "discount": 0,
-            "reviews": [],
         }
 
     return {
