@@ -406,11 +406,24 @@ def _chat(cfg: dict[str, str], *, kind: str, **kwargs: Any) -> Any:
     raise last
 
 
+# Bulk export and catalog extraction. Shopping words in the same sentence
+# ("I am shopping") must not promote these to act when the model is down.
+_BULK_EXTRACTION = re.compile(
+    r"\b(?:export(?:ing|ed|s)?|csv|tsv|xlsx|spreadsheets?|excel)\b"
+    r"|\b(?:every|all)\s+(?:the\s+)?(?:product\s+)?prices?\b"
+    r"|\b(?:collect|gather|pull|extract|copy|download|harvest|scrape)(?:ing|ed|s)?\s+(?:every|all|the\s+(?:whole|entire))\b"
+    r"|\b(?:download|export|copy|extract|scrape|harvest|dump)(?:ing|ed|s)?\s+(?:the\s+|a\s+)?(?:whole\s+|entire\s+|full\s+)?(?:catalog(?:ue)?|inventory|price\s+list)s?\b",
+    re.I,
+)
+
+
 def rule_score_purpose(purpose: str) -> dict[str, Any]:
     """Conservative keyword score used only when the Meta model cannot answer.
 
-    Shopping language may keep act. Anything else, including an empty purpose,
-    is view-only. This does not grant act just because the model is down.
+    A clear shopping request may keep act. Bulk export, scraping, or bypass
+    language stays view-only even when the same purpose also says it is shopping.
+    Anything else, including an empty purpose, is view-only. This does not
+    grant act just because the model is down.
     """
     text = (purpose or "").strip()
     if not text or text == "(empty)":
@@ -420,10 +433,10 @@ def rule_score_purpose(purpose: str) -> dict[str, Any]:
             "suggested_scopes": ["view"],
             "drop_act": True,
         }
-    elif _HIGH_RISK.search(text):
+    elif _HIGH_RISK.search(text) or _BULK_EXTRACTION.search(text):
         scored = {
             "risk": "high",
-            "reason": "keyword rule: purpose looks like scraping or bypass",
+            "reason": "keyword rule: purpose looks like scraping, export, or bypass",
             "suggested_scopes": ["view"],
             "drop_act": True,
         }

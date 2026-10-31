@@ -190,8 +190,12 @@ def apply_page_redaction(site: dict[str, Any], path: str, snap: dict[str, Any], 
     if not ep:
         return snap
     fields = ep.get("response_fields") or []
+    # Price hidden on any page is withheld on every page the agent reads.
+    # The shop list stores it as meta.products[].price and elements[].meta.price,
+    # which are different paths from the detail page's meta.price.
+    linked = price_link_fields(site.get("endpoints") or [])
     hidden = hidden_field_keys(fields)
-    out = redact_response(snap, fields)
+    out = redact_response(snap, fields, linked)
     if hidden:
         store.log_activity(
             site["id"],
