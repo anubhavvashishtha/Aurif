@@ -148,17 +148,27 @@ def make_captcha_drawing(target: str) -> str:
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def shop_path_from_message(message: str, products: dict[str, dict[str, Any]]) -> str:
-    url_match = re.search(r"https?://\S+", message)
-    if url_match:
-        raw = url_match.group(0).rstrip(".,)")
-        path = re.sub(r"^https?://[^/]+", "", raw) or "/"
-        if not path.startswith("/"):
-            path = "/" + path
-        return path.split("?")[0] or "/"
-    path_match = re.search(r"(?:^|\s)(/[A-Za-z0-9_./-]*)", message)
-    if path_match:
-        return path_match.group(1).rstrip("/") or "/"
+# Storefront words that have no AI surface. The protocol only serves these routes.
+_PATH_ALIASES = {
+    "/shop": "/products",
+    "/store": "/products",
+    "/catalog": "/products",
+    "/catalogue": "/products",
+    "/product": "/products",
+}
+
+
+def _normalize_ai_path(path: str) -> str:
+    """Collapse a URL path onto a route the site actually exposes to agents."""
+    path = (path or "/").split("?")[0].split("#")[0]
+    if not path.startswith("/"):
+        path = "/" + path
+    if len(path) > 1:
+        path = path.rstrip("/") or "/"
+    return _PATH_ALIASES.get(path, path)
+
+
+def _product_slug_from_message(message: str, products: dict[str, dict[str, Any]]) -> str:
     lowered = message.lower()
     best_slug = ""
     best_len = 0
@@ -168,12 +178,52 @@ def shop_path_from_message(message: str, products: dict[str, dict[str, Any]]) ->
             if name and name in lowered and len(name) > best_len:
                 best_slug = slug
                 best_len = len(name)
-    if best_slug:
-        return f"/products/{best_slug}"
-    for guess, token in (("/shop", "shop"), ("/shop", "product"), ("/cart", "cart"), ("/", "home")):
-        if token in lowered:
-            return guess
+    return best_slug
+
+
+def shop_path_from_message(message: str, products: dict[str, dict[str, Any]]) -> str:
+    url_match = re.search(r"https?://\S+", message)
+    if url_match:
+        raw = url_match.group(0).rstrip(".,)")
+        path = re.sub(r"^https?://[^/]+", "", raw) or "/"
+        if not path.startswith("/"):
+            path = "/" + path
+        return _normalize_ai_path(path)
+    path_match = re.search(r"(?:^|\s)(/[A-Za-z0-9_./-]*)", message)
+    if path_match:
+        return _normalize_ai_path(path_match.group(1))
+    slug = _product_slug_from_message(message, products)
+    if slug:
+        return f"/products/{slug}"
+    lowered = message.lower()
+    # "shop" / "product(s)" / "catalog" are the catalog, which lives at /products.
+    if re.search(r"\b(shop(?:ping)?|stores?|catalog(?:ue)?|products?)\b", lowered):
+        return "/products"
+    if re.search(r"\bcarts?\b", lowered):
+        return "/cart"
+    if re.search(r"\bhome\b", lowered):
+        return "/"
     return "/"
+
+
+def _wants_cart_add(message: str) -> bool:
+    lowered = message.lower()
+    if re.search(r"\b(add|buy|purchase|order)\b", lowered):
+        return True
+    return bool("cart" in lowered and re.search(r"\b(put|place)\b", lowered))
+
+
+def action_from_message(message: str, products: dict[str, dict[str, Any]]) -> dict[str, str] | None:
+    """Mutation the user asked for. Read questions return None so they stay view-only."""
+    lowered = message.lower()
+    if re.search(r"\bcheck\s*out\b|\bcheckout\b", lowered):
+        return {"action_id": "cart.checkout", "kind": "checkout"}
+    if re.search(r"\b(clear|empty)\b", lowered) and "cart" in lowered:
+        return {"action_id": "cart.clear", "kind": "clear"}
+    slug = _product_slug_from_message(message, products)
+    if slug and _wants_cart_add(message):
+        return {"action_id": f"product.add:{slug}", "kind": "add", "slug": slug}
+    return None
 
 
 def _absolute(url: str, base: str) -> str:
@@ -202,6 +252,16 @@ def _step(n: int, action: str, *, result: str, detail: str = "", **extra: Any) -
         if v is not None and v != "":
             row[k] = v
     return row
+
+
+def _catalog_line(item: dict[str, Any]) -> str:
+    """One catalog row. Price is included only when the site actually sent it."""
+    name = str(item.get("name") or "").strip()
+    if not name:
+        return ""
+    if "price" in item and item.get("price") not in (None, ""):
+        return f"{name} ({item.get('price')})"
+    return name
 
 
 def _fields_from_product(product: dict[str, Any]) -> list[dict[str, str]]:
@@ -334,10 +394,13 @@ def browse_as_agent(
     if provider:
         model_info["provider"] = provider
 
+    intent = action_from_message(message, products)
+    scopes = ["view", "act"] if intent else ["view"]
     steps: list[dict[str, Any]] = []
     findings: list[dict[str, Any]] = []
     fields: list[dict[str, str]] = []
     denied = False
+    action_outcome: dict[str, Any] | None = None
     n = 0
 
     def add(action: str, *, result: str, detail: str = "", **extra: Any) -> None:
@@ -407,15 +470,22 @@ def browse_as_agent(
     can_continue = bool(site_key) or (page_ok and captcha_passed)
     if not captcha_passed and not site_key:
         can_continue = False
-        add("stop", result="stopped", detail="No site key enabled — stopped after CAPTCHA / storefront block")
+        detail = "No site key enabled — stopped after CAPTCHA / storefront block"
+        if intent:
+            detail = "No site key enabled — I can't act on the cart without permissioned API access"
+        add("stop", result="stopped", detail=detail)
 
     session_token: str | None = None
     if can_continue:
-        if site_key and not captcha_passed:
+        if site_key:
             add(
                 "switch_to_api",
                 result="started",
-                detail="Site key is on — trying credentialed API after failed human check",
+                detail=(
+                    "Site key is on — trying credentialed API after failed human check"
+                    if not captcha_passed
+                    else "Site key is on — using the permissioned API"
+                ),
             )
             actions = [
                 {"method": "GET", "url": f"{api_base()}/ai/help", "use_site_key": False},
@@ -425,7 +495,7 @@ def browse_as_agent(
                     "use_site_key": True,
                     "body": {
                         "purpose": message[:240],
-                        "requested_scopes": ["view"],
+                        "requested_scopes": scopes,
                         "site_key": site_key,
                     },
                 },
@@ -435,6 +505,16 @@ def browse_as_agent(
                     "use_site_key": True,
                 },
             ]
+            if intent:
+                # Same gate as any external agent: ask for act, then invoke the action.
+                actions.append(
+                    {
+                        "method": "POST",
+                        "url": f"{API_BASE}/ai/actions",
+                        "use_site_key": True,
+                        "body": {"action_id": intent["action_id"], "args": {}},
+                    }
+                )
         else:
             add("follow_up", result="started", detail="Trying follow-up fetches for product data")
             actions = [
@@ -469,11 +549,21 @@ def browse_as_agent(
             if isinstance(parsed, dict) and parsed.get("session_token"):
                 session_token = str(parsed.get("session_token"))
 
+            is_action_call = urllib.parse.urlparse(url).path.rstrip("/") == "/ai/actions"
+            action_id = str((body_obj or {}).get("action_id") or "")
+
             if st >= 400:
                 denied = True
                 err = ""
                 if isinstance(parsed, dict):
                     err = str(parsed.get("error") or parsed.get("message") or parsed.get("summary") or "")
+                if is_action_call:
+                    action_outcome = {
+                        "ok": False,
+                        "action_id": action_id,
+                        "error": err or f"HTTP {st}",
+                        "status": st,
+                    }
                 add(
                     "request",
                     result="failed",
@@ -482,6 +572,39 @@ def browse_as_agent(
                     url=url,
                     status=st,
                     site_key_sent=use_key,
+                    action_id=action_id or None,
+                )
+                continue
+
+            if is_action_call and isinstance(parsed, dict):
+                result_body = parsed.get("result") if isinstance(parsed.get("result"), dict) else {}
+                added = result_body.get("added") if isinstance(result_body.get("added"), dict) else {}
+                added_name = str(added.get("name") or "").strip()
+                action_outcome = {
+                    "ok": bool(parsed.get("ok", True)),
+                    "action_id": action_id,
+                    "added_name": added_name or None,
+                    "cart": result_body.get("cart") if isinstance(result_body.get("cart"), list) else None,
+                }
+                if action_outcome["ok"]:
+                    denied = False
+                else:
+                    denied = True
+                    action_outcome["error"] = str(parsed.get("error") or "action failed")
+                add(
+                    "request",
+                    result="ok" if action_outcome["ok"] else "failed",
+                    detail="Action completed" if action_outcome["ok"] else str(action_outcome.get("error") or "action failed"),
+                    method=method,
+                    url=url,
+                    status=st,
+                    site_key_sent=use_key,
+                    action_id=action_id or None,
+                    saw={
+                        "action_id": action_id,
+                        "ok": action_outcome["ok"],
+                        "added": added_name or None,
+                    },
                 )
                 continue
 
@@ -528,6 +651,12 @@ def browse_as_agent(
                                     "value": str(meta.get(key)),
                                 }
                             )
+                    catalog = meta.get("products")
+                    if isinstance(catalog, list):
+                        lines = [_catalog_line(item) for item in catalog if isinstance(item, dict)]
+                        lines = [line for line in lines if line]
+                        if lines:
+                            page_fields.append({"label": "Products", "value": ", ".join(lines)})
                     if page_fields:
                         fields = page_fields
                         saw = {f["label"]: f["value"] for f in page_fields}
@@ -555,6 +684,7 @@ def browse_as_agent(
         denied=denied,
         model=model_info.get("id"),
         provider=model_info.get("provider"),
+        action_outcome=action_outcome,
     )
 
     return {
@@ -589,8 +719,10 @@ def _field_map(fields: list[dict[str, str]]) -> dict[str, str]:
 
 def _asked_keys(message: str) -> list[str]:
     lowered = message.lower()
+    # Price is only `price`. compare_at and discount are different facts and
+    # must not stand in when the site hid the price.
     if any(w in lowered for w in ("price", "cost", "how much")):
-        return ["price", "compare at", "compare_at"]
+        return ["price"]
     if any(w in lowered for w in ("rating", "review", "stars")):
         return ["rating"]
     if any(w in lowered for w in ("name", "title", "called", "what product")):
@@ -619,7 +751,7 @@ def _answer_from_fields(message: str, fields: list[dict[str, str]]) -> str | Non
             return None
         name = pick("name", "title")
         key = asked[0]
-        if key in ("price", "compare at", "compare_at"):
+        if key == "price":
             return f"The price of {name} is {value}." if name else f"The price is {value}."
         if key == "rating":
             return f"The rating for {name} is {value}." if name else f"The rating is {value}."
@@ -629,12 +761,96 @@ def _answer_from_fields(message: str, fields: list[dict[str, str]]) -> str | Non
             return f"The SKU is {value}."
         return f"{key.capitalize()}: {value}."
 
-    # Broad ask ("what can you see") — short field dump, no story.
-    preferred = ["name", "title", "price", "rating", "sku"]
+    # Broad ask ("what can you see" / "open the shop") — short field dump, no story.
+    preferred = ["products", "name", "title", "price", "rating", "sku"]
     bits = [f"{k.capitalize()}: {m[k]}" for k in preferred if k in m]
     if not bits:
         return None
     return "; ".join(bits) + "."
+
+
+def _numbers_in(text: str) -> set[float]:
+    found: set[float] = set()
+    for raw in re.findall(r"\d+(?:\.\d+)?", text or ""):
+        try:
+            found.add(float(raw))
+        except ValueError:
+            continue
+    return found
+
+
+def _mentions_value(text: str, value: str) -> bool:
+    value = (value or "").strip()
+    if not value:
+        return False
+    if value in (text or ""):
+        return True
+    wanted = _numbers_in(value)
+    return bool(wanted) and wanted <= _numbers_in(text)
+
+
+def _facts_for_answer(message: str, fields: list[dict[str, str]]) -> dict[str, str]:
+    """Facts the model is allowed to see. A price question never receives stand-ins."""
+    asked = _asked_keys(message)
+    if "price" in asked:
+        keep = {"name", "title", "price"}
+        return {
+            str(f.get("label")): str(f.get("value"))
+            for f in fields
+            if str(f.get("label") or "").strip().lower() in keep and f.get("value") not in (None, "")
+        }
+    return {
+        str(f.get("label")): str(f.get("value"))
+        for f in fields
+        if f.get("label") and f.get("value") not in (None, "")
+    }
+
+
+def _polish_ok(polished: str, message: str, facts: dict[str, str], fields: list[dict[str, str]]) -> bool:
+    words = polished.split()
+    bad = any(w in polished.lower() for w in ("rewrite", "steps", "json", "as an ai", "prompt"))
+    if not polished or not (3 <= len(words) <= 40) or bad:
+        return False
+    allowed = set()
+    for value in facts.values():
+        allowed |= _numbers_in(value)
+    if _numbers_in(polished) - allowed:
+        return False
+    asked = _asked_keys(message)
+    if not asked:
+        return True
+    present = _field_map(fields)
+    key = asked[0]
+    if key not in present:
+        return False
+    return _mentions_value(polished, present[key])
+
+
+def _missing_field_reply(message: str) -> str | None:
+    asked = _asked_keys(message)
+    if not asked:
+        return None
+    if asked[0] == "price":
+        return "I reached the page, but the price isn't shared by this site."
+    label = asked[0].replace("_", " ")
+    return f"I reached the page, but {label} was not available to agents."
+
+
+def _reply_for_action(outcome: dict[str, Any]) -> str:
+    if outcome.get("ok"):
+        action_id = str(outcome.get("action_id") or "")
+        if action_id.startswith("product.add:"):
+            name = str(outcome.get("added_name") or "").strip()
+            if not name:
+                name = action_id.split(":", 1)[-1].replace("-", " ").strip() or "The item"
+            return f"{name} is in the cart."
+        if action_id == "cart.clear":
+            return "The cart is cleared."
+        if action_id == "cart.checkout":
+            return "Checkout is complete."
+        return "Done."
+    err = str(outcome.get("error") or "the site denied that action")
+    return f"I couldn't do that — {err}."
 
 
 def _failure_reason(steps: list[dict[str, Any]]) -> str:
@@ -658,19 +874,32 @@ def _compose_reply(
     denied: bool,
     model: str | None = None,
     provider: str | None = None,
+    action_outcome: dict[str, Any] | None = None,
 ) -> str:
-    """If we can answer, answer only. Otherwise one short failure line."""
+    """If we can answer, answer only. Otherwise one short failure line.
+
+    Action allow/deny is reported as the gate returned it. The model is not
+    asked to rephrase those, and it is not given stand-in fields for a value
+    the site withheld.
+    """
+    if action_outcome:
+        return _reply_for_action(action_outcome)
+
     deterministic = _answer_from_fields(message, fields) if fields else None
     if deterministic:
-        # Optional model phrasing — fall back instantly if the model is weird/slow/fails.
+        # Optional model phrasing — fall back instantly if the model is weird/slow/fails
+        # or tries to cite a number that was not in the facts it was given.
         try:
-            facts = {f["label"]: f["value"] for f in fields}
+            facts = _facts_for_answer(message, fields)
             polished = muse_client.complete(
                 [
                     {
                         "role": "user",
                         "content": (
                             "Answer the user in ONE short sentence using only these facts. "
+                            "If a fact they asked for is missing, say it isn't shared by this site. "
+                            "Never substitute another field for a missing one "
+                            "(compare-at, discount, and similar are not the price). "
                             "No steps, no story, no JSON.\n"
                             f"Question: {message}\nFacts: {json.dumps(facts)}"
                         ),
@@ -681,21 +910,15 @@ def _compose_reply(
                 max_tokens=60,
                 temperature=0.1,
             ).strip()
-            words = polished.split()
-            bad = any(
-                w in polished.lower()
-                for w in ("rewrite", "steps", "json", "as an ai", "prompt")
-            )
-            if polished and 3 <= len(words) <= 40 and not bad:
+            if _polish_ok(polished, message, facts, fields):
                 return polished
         except Exception:
             pass
         return deterministic
 
-    asked = _asked_keys(message)
-    if asked and fields:
-        label = asked[0].replace("_", " ")
-        return f"I reached the page, but {label} was not available to agents."
+    missing = _missing_field_reply(message) if fields else None
+    if missing:
+        return missing
 
     if denied or not fields:
         return _failure_reason(steps)
