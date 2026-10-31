@@ -29,6 +29,11 @@ export const Route = createFileRoute("/dashboard/endpoints")({
 
 const DIRECTION = { read: "Returns JSON", write: "Accepts JSON", both: "Both" };
 
+function isPriceFieldKey(key: string): boolean {
+  const leaf = (key.split(".").pop() || "").replace(/\[\]$/, "");
+  return leaf === "price";
+}
+
 type PolicyProposal = {
   summary: string;
   patches: Array<Record<string, unknown>>;
@@ -222,7 +227,12 @@ function FieldDrawer({ siteId, endpoint: e }: { siteId: string; endpoint: Endpoi
     <div className="space-y-5">
       <SheetHeader className="pr-8">
         <div className="flex items-center justify-between gap-4"><SheetTitle className="font-mono text-xl uppercase tracking-tight text-ink">{e.label}</SheetTitle><Switch checked={e.agentAccess} onCheckedChange={(v) => toggleEndpoint(siteId, e.id, v)} aria-label="Agent access" /></div>
-        <SheetDescription>If access is on but price is hidden, agents still get JSON — without the price field.</SheetDescription>
+        <SheetDescription>
+          If access is on but price is hidden, agents still get JSON — without the price field.
+          {e.responseFields.some((f) => isPriceFieldKey(f.key))
+            ? " Price is site-wide: hiding or showing it here updates every page an agent can read."
+            : ""}
+        </SheetDescription>
       </SheetHeader>
       <Tabs defaultValue={e.direction === "write" ? "request" : "response"}>
         <TabsList>{e.direction !== "write" && <TabsTrigger value="response">Response JSON</TabsTrigger>}{e.direction !== "read" && <TabsTrigger value="request">Request JSON</TabsTrigger>}</TabsList>

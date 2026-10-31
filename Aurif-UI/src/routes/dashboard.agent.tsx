@@ -11,6 +11,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { PageHeader, Panel } from "@/components/aurif/ui";
+import { degradedModelWarning } from "@/lib/degraded-banner";
 import {
   chatWithMuse,
   fetchAgentModels,
@@ -72,11 +73,7 @@ function AgentDashboard() {
         }
         if (health?.degraded) {
           const detail = [health.text?.last_error, health.vision?.last_error].filter(Boolean).join("; ");
-          setModelWarning(
-            detail
-              ? `Model degraded (${detail}). Handshake uses keyword rules. The human gate can fall back without vision. Act is not granted automatically.`
-              : "Model key missing or the last call failed. Handshake uses keyword rules. The human gate can fall back without vision. Act is not granted automatically.",
-          );
+          setModelWarning(degradedModelWarning(detail));
         } else {
           setModelWarning(null);
         }

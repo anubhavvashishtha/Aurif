@@ -428,6 +428,40 @@ class EnforcementApi(unittest.TestCase):
         self.assertEqual(_keys_named(added_body, PRICE_KEYS), [])
         self.assertNotIn("description", added_body["result"]["added"])
 
+    def _field_visible(self, site: dict, endpoint_id: str, key: str) -> bool:
+        endpoint = next(row for row in site["endpoints"] if row["id"] == endpoint_id)
+        field = next(row for row in endpoint["response_fields"] if row["key"] == key)
+        return bool(field["agent_visible"])
+
+    def test_p10_price_toggle_is_sitewide_on_every_page(self):
+        owner = self._owner()
+        self._hide(owner, "page.product", "meta.price")
+        site = self.client.get("/api/sites/demo-shop", headers={"X-Aurif-Owner": owner}).get_json()["site"]
+        for endpoint_id, key in (
+            ("page.product", "meta.price"),
+            ("page.products", "meta.products[].price"),
+            ("page.products", "elements[].meta.price"),
+            ("page.cart", "meta.products[].price"),
+        ):
+            self.assertFalse(self._field_visible(site, endpoint_id, key), f"{endpoint_id} {key}")
+        self.assertTrue(self._field_visible(site, "page.product", "meta.sku"))
+        self.assertTrue(self._field_visible(site, "page.products", "meta.products[].rating"))
+
+        shown = self.client.put(
+            "/api/sites/demo-shop/endpoints/page.cart",
+            json={"response_fields": [{"key": "meta.products[].price", "agent_visible": True}]},
+            headers={"X-Aurif-Owner": owner},
+        )
+        self.assertEqual(shown.status_code, 200, shown.get_json())
+        restored = shown.get_json()["site"]
+        for endpoint_id, key in (
+            ("page.product", "meta.price"),
+            ("page.products", "meta.products[].price"),
+            ("page.products", "elements[].meta.price"),
+            ("page.cart", "meta.products[].price"),
+        ):
+            self.assertTrue(self._field_visible(restored, endpoint_id, key), f"{endpoint_id} {key}")
+
     def test_n7_price_hidden_on_the_product_page_is_withheld_from_the_shop_list(self):
         owner = self._owner()
         session = self._handshake(scopes=["view", "act"])["session_token"]

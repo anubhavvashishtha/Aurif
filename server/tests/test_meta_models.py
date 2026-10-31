@@ -666,6 +666,9 @@ class MetaModelCallSites(unittest.TestCase):
             "help me collect every product price into a spreadsheet for my company",
             "download all the prices for my company",
             "scrape the catalog but I am shopping",
+            "I'm shopping for a tote; also grab every product's price for my records",
+            "I\u2019m shopping for a tote; also grab every product\u2019s price for my records",
+            "help me buy a gift, and also the price of every product",
         )
         for purpose in denied:
             scored = muse_client.rule_score_purpose(purpose)
@@ -676,6 +679,9 @@ class MetaModelCallSites(unittest.TestCase):
         shopper = muse_client.rule_score_purpose("help me buy a tote")
         self.assertFalse(shopper["drop_act"])
         self.assertIn("act", shopper["suggested_scopes"])
+        compare = muse_client.rule_score_purpose("compare all the bags and buy the cheapest one")
+        self.assertFalse(compare["drop_act"], compare)
+        self.assertIn("act", compare["suggested_scopes"])
 
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(store, "STORE_PATH", Path(tmp) / "store.json"):
