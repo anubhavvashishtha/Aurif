@@ -231,6 +231,62 @@ class MusePathAndPrice(unittest.TestCase):
             {"action_id": "cart.clear", "kind": "clear"},
         )
 
+    def test_p10_retraction_after_the_verb_does_not_act(self):
+        products = {
+            "field-tote": {"name": "Field Tote"},
+            "trail-notebook": {"name": "Trail Notebook"},
+            "camp-mug": {"name": "Camp Mug"},
+        }
+        for message in (
+            "add the tote, actually no",
+            "add the field tote, never mind",
+            "add the tote, wait, don't",
+            "buy the tote, scratch that",
+            "put the tote in the cart, actually no",
+            "Add the tote. Actually no.",
+        ):
+            self.assertIsNone(muse_browse.action_from_message(message, products), message)
+        self.assertEqual(
+            muse_browse.action_from_message("add the notebook but not the tote", products),
+            {"action_id": "product.add:trail-notebook", "kind": "add", "slug": "trail-notebook"},
+        )
+        self.assertEqual(
+            muse_browse.action_from_message("I don't want the notebook. Add the tote.", products),
+            {"action_id": "product.add:field-tote", "kind": "add", "slug": "field-tote"},
+        )
+        self.assertEqual(
+            muse_browse.action_from_message("add the tote, actually no, add the mug", products),
+            {"action_id": "product.add:camp-mug", "kind": "add", "slug": "camp-mug"},
+        )
+
+    def test_p10_declined_add_is_a_sentence_not_a_field_list(self):
+        fields = [
+            {"label": "Name", "value": "Field Tote"},
+            {"label": "Title", "value": "Field Tote"},
+            {"label": "Price", "value": "68"},
+            {"label": "Rating", "value": "4.7"},
+            {"label": "Sku", "value": "NL-BG-001"},
+        ]
+        with patch("muse_browse.muse_client.complete", return_value="Name: Field Tote; Price: 68.") as complete:
+            reply = muse_browse._compose_reply(
+                message="add the tote, actually no",
+                steps=[],
+                fields=fields,
+                denied=False,
+            )
+            negated = muse_browse._compose_reply(
+                message="don't add the field tote",
+                steps=[],
+                fields=fields,
+                denied=False,
+            )
+        self.assertEqual(complete.call_count, 0)
+        for text in (reply, negated):
+            self.assertIn("won't add", text)
+            self.assertNotIn("Sku", text)
+            self.assertNotIn("68", text)
+            self.assertNotIn(";", text)
+
     def test_hidden_price_is_not_replaced_by_compare_at_or_the_model(self):
         fields = [
             {"label": "Name", "value": "Field Tote"},
@@ -530,6 +586,20 @@ class MuseBrowseRepros(unittest.TestCase):
         handshakes = [event for event in fresh if event["kind"] == "handshake"]
         self.assertTrue(handshakes)
         self.assertEqual(handshakes[0]["detail"]["asked"]["requested_scopes"], ["view"])
+        self.assertFalse(any(event["kind"] == "action" and event["detail"].get("accepted") for event in fresh))
+
+    def test_p10_add_then_actually_no_does_not_add(self):
+        body, fresh = self._fresh("add the tote, actually no")
+        self.assertIn("won't add", body["reply"])
+        self.assertNotIn("in the cart", body["reply"].lower())
+        self.assertNotIn("Sku", body["reply"])
+        self.assertNotIn("NL-BG-001", body["reply"])
+        action_steps = [
+            step
+            for step in body["steps"]
+            if str(step.get("url", "")).rstrip("/").endswith("/ai/actions")
+        ]
+        self.assertEqual(action_steps, [])
         self.assertFalse(any(event["kind"] == "action" and event["detail"].get("accepted") for event in fresh))
 
     def test_n8_how_much_is_the_tote_answers_from_the_product_page(self):

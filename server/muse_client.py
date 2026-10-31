@@ -520,26 +520,35 @@ def _chat(cfg: dict[str, str], *, kind: str, **kwargs: Any) -> Any:
     raise last
 
 
-# Bulk export and catalog extraction. Shopping words in the same sentence
-# ("I am shopping") must not promote these to act when the model is down.
+# Bulk export and catalog extraction. Any such clause in the purpose, even
+# after a shopping clause, must not promote the handshake to act.
 _BULK_EXTRACTION = re.compile(
     r"\b(?:export(?:ing|ed|s)?|csv|tsv|xlsx|spreadsheets?|excel)\b"
-    r"|\b(?:every|all)\s+(?:the\s+)?(?:product\s+)?prices?\b"
-    r"|\b(?:collect|gather|pull|extract|copy|download|harvest|scrape)(?:ing|ed|s)?\s+(?:every|all|the\s+(?:whole|entire))\b"
-    r"|\b(?:download|export|copy|extract|scrape|harvest|dump)(?:ing|ed|s)?\s+(?:the\s+|a\s+)?(?:whole\s+|entire\s+|full\s+)?(?:catalog(?:ue)?|inventory|price\s+list)s?\b",
+    r"|\b(?:every|each|all)\s+(?:the\s+)?(?:products?\s+)?prices?\b"
+    r"|\bprices?\s+(?:of|for|on)\s+(?:every|each|all)\b"
+    r"|\b(?:collect|gather|pull|extract|copy|download|harvest|scrape|grab)(?:ing|ed|s)?\s+(?:every|each|all|the\s+(?:whole|entire))\b"
+    r"|\b(?:download|export|copy|extract|scrape|harvest|dump|grab)(?:ing|ed|s)?\s+(?:the\s+|a\s+)?(?:whole\s+|entire\s+|full\s+)?(?:catalog(?:ue)?|inventory|price\s+list)s?\b",
     re.I,
 )
+
+
+def _normalize_rule_text(text: str) -> str:
+    """Drop possessives so "every product's price" is the same clause as "every product price"."""
+    cleaned = (text or "").replace("\u2019", "'").replace("\u2018", "'")
+    cleaned = re.sub(r"(\w)'s\b", r"\1", cleaned, flags=re.I)
+    cleaned = re.sub(r"(\w)s'\b", r"\1s", cleaned, flags=re.I)
+    return cleaned
 
 
 def rule_score_purpose(purpose: str) -> dict[str, Any]:
     """Conservative keyword score used only when the Meta model cannot answer.
 
-    A clear shopping request may keep act. Bulk export, scraping, or bypass
-    language stays view-only even when the same purpose also says it is shopping.
-    Anything else, including an empty purpose, is view-only. This does not
-    grant act just because the model is down.
+    A clear shopping request may keep act. Any bulk-export, scraping, or bypass
+    clause stays view-only, including when another clause in the same purpose
+    is shopping. Anything else, including an empty purpose, is view-only.
+    This does not grant act just because the model is down.
     """
-    text = (purpose or "").strip()
+    text = _normalize_rule_text((purpose or "").strip())
     if not text or text == "(empty)":
         scored = {
             "risk": "medium",

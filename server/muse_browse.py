@@ -282,6 +282,21 @@ _CHECKOUT_VERB = re.compile(r"\bcheck\s*out\b|\bcheckout\b", re.I)
 _CLEAR_VERB = re.compile(r"\b(?:clear|empty)\b", re.I)
 _ADD_VERB = re.compile(r"\b(?:add|buy|purchase|order)\b", re.I)
 _PUT_VERB = re.compile(r"\b(?:put|place)\b", re.I)
+# A take-back after the verb ("add the tote, actually no"). "but not the tote"
+# is a different product, not one of these, so that add still stands.
+_RETRACTION = re.compile(
+    r"(?:"
+    r"\bactually\s*,?\s*no\b|"
+    r"\bnever\s*mind\b|"
+    r"\bnevermind\b|"
+    r"\bscratch\s+that\b|"
+    r"\bforget\s+(?:it|that)\b|"
+    r"\bon\s+second\s+thought\b|"
+    r"\bwait\s*,?\s*(?:don't|dont|do\s+not)\b|"
+    r",\s*no\b"
+    r")",
+    re.I,
+)
 
 
 def _scope_start(text: str, index: int) -> int:
@@ -311,8 +326,17 @@ def _verb_is_negated(text: str, verb_start: int) -> bool:
     return _NEGATION_CUE.search(window) is not None
 
 
+def _verb_is_retracted(text: str, verb_end: int) -> bool:
+    """A retraction after this verb cancels it. A later verb is judged on its own."""
+    return _RETRACTION.search(text[verb_end:]) is not None
+
+
 def _affirmed_matches(text: str, pattern: re.Pattern[str]) -> list[re.Match[str]]:
-    return [match for match in pattern.finditer(text) if not _verb_is_negated(text, match.start())]
+    return [
+        match
+        for match in pattern.finditer(text)
+        if not _verb_is_negated(text, match.start()) and not _verb_is_retracted(text, match.end())
+    ]
 
 
 def _wants_cart_add(message: str) -> bool:
@@ -958,6 +982,16 @@ def _missing_field_reply(message: str) -> str | None:
     return f"I reached the page, but {label} was not available to agents."
 
 
+def _declined_add_reply(message: str) -> str | None:
+    """A cancelled add should read as a sentence, not a dump of the page fields."""
+    mentions_add = bool(_ADD_VERB.search(message) or ("cart" in message.lower() and _PUT_VERB.search(message)))
+    if not mentions_add or _wants_cart_add(message):
+        return None
+    if not (_NEGATION_CUE.search(message) or _RETRACTION.search(message)):
+        return None
+    return "OK, I won't add it."
+
+
 def _reply_for_action(outcome: dict[str, Any]) -> str:
     if outcome.get("ok"):
         action_id = str(outcome.get("action_id") or "")
@@ -1006,6 +1040,10 @@ def _compose_reply(
     """
     if action_outcome:
         return _reply_for_action(action_outcome)
+
+    declined = _declined_add_reply(message)
+    if declined:
+        return declined
 
     deterministic = _answer_from_fields(message, fields) if fields else None
     if deterministic:

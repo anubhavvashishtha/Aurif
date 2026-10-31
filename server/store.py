@@ -15,6 +15,7 @@ from urllib.parse import unquote
 
 import config
 from endpoints_default import DEFAULT_ENDPOINTS, ensure_endpoint_shape
+from redact import is_price_field
 
 STORE_PATH = config.store_path()
 DATA_DIR = STORE_PATH.parent
@@ -281,6 +282,41 @@ def create_site(owner_id: str, name: str, url: str) -> dict[str, Any]:
     return public_site(get_site(site_id))  # type: ignore
 
 
+def _price_visibility_choice(items: list[Any]) -> bool | None:
+    """Price visibility in this write. Hidden wins if the same write mixes both."""
+    seen_true = False
+    seen_false = False
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        fields = item.get("response_fields")
+        if not isinstance(fields, list):
+            continue
+        for field in fields:
+            if not isinstance(field, dict):
+                continue
+            if not is_price_field(str(field.get("key") or "")):
+                continue
+            if bool(field.get("agent_visible", True)):
+                seen_true = True
+            else:
+                seen_false = True
+    if seen_false:
+        return False
+    if seen_true:
+        return True
+    return None
+
+
+def _apply_sitewide_price_visibility(endpoints: list[Any], visible: bool) -> None:
+    for endpoint in endpoints:
+        if not isinstance(endpoint, dict) or endpoint.get("kind") != "page":
+            continue
+        for field in endpoint.get("response_fields") or []:
+            if isinstance(field, dict) and is_price_field(str(field.get("key") or "")):
+                field["agent_visible"] = visible
+
+
 def update_site(site_id: str, owner_id: str, patch: dict[str, Any]) -> dict[str, Any]:
     site = get_site(site_id)
     if not site or site["owner_id"] != owner_id:
@@ -330,6 +366,11 @@ def update_site(site_id: str, owner_id: str, patch: dict[str, Any]) -> dict[str,
                     for f in by_id[eid].get("request_fields", []):
                         if f.get("key") in allowed:
                             f["agent_allowed"] = bool(allowed[f["key"]])
+            # A hidden price is already withheld on every page. The toggles
+            # follow that: one price write sets every page's price fields.
+            choice = _price_visibility_choice(patch["endpoints"])
+            if choice is not None:
+                _apply_sitewide_price_visibility(list(by_id.values()), choice)
             s["endpoints"] = list(by_id.values())
 
     save(mut)
