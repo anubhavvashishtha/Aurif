@@ -504,6 +504,8 @@ def browse_as_agent(
     site_key: str | None = None,
     model: str | None = None,
     provider: str | None = None,
+    on_session: Any = None,
+    on_step: Any = None,
 ) -> dict[str, Any]:
     """Browse/scrape like a normal agent and return structured steps for the dashboard."""
     base = (site.get("url") or config.customer_site_url()).rstrip("/")
@@ -528,7 +530,10 @@ def browse_as_agent(
     def add(action: str, *, result: str, detail: str = "", **extra: Any) -> None:
         nonlocal n
         n += 1
-        steps.append(_step(n, action, result=result, detail=detail, **extra))
+        row = _step(n, action, result=result, detail=detail, **extra)
+        steps.append(row)
+        if on_step is not None:
+            on_step(row)
 
     add(
         "open_url",
@@ -582,7 +587,10 @@ def browse_as_agent(
     captcha = _try_captcha()
     for raw_step in captcha.get("steps") or []:
         n += 1
-        steps.append({"step": n, **raw_step})
+        row = {"step": n, **raw_step}
+        steps.append(row)
+        if on_step is not None:
+            on_step(row)
     captcha_passed = bool(captcha.get("passed"))
     human_token = captcha.get("human_token")
     if not captcha_passed:
@@ -670,6 +678,10 @@ def browse_as_agent(
 
             if isinstance(parsed, dict) and parsed.get("session_token"):
                 session_token = str(parsed.get("session_token"))
+                # Handshake starts a new empty cart. Carry the chat's items
+                # across before the page read or the action on this turn.
+                if on_session is not None:
+                    on_session(session_token)
 
             is_action_call = urllib.parse.urlparse(url).path.rstrip("/") == "/ai/actions"
             action_id = str((body_obj or {}).get("action_id") or "")
@@ -820,6 +832,7 @@ def browse_as_agent(
         "captcha": {"attempted": True, "passed": captcha_passed},
         "fields": fields,
         "model": model_info,
+        "session_token": session_token,
         "site_response": {
             "url": target_url,
             "site_key_used": bool(site_key),
@@ -975,17 +988,77 @@ def _reply_for_action(outcome: dict[str, Any]) -> str:
     return f"I couldn't do that — {err}."
 
 
+def _step_status(step: dict[str, Any]) -> int:
+    try:
+        return int(step.get("status") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _failure_reason(steps: list[dict[str, Any]]) -> str:
+    """Separate a dead site from a human-check refusal.
+
+    A closed port used to fall through to the CAPTCHA rejection and Muse said
+    human verification blocked it. Connection failures are reported as
+    unreachable. An HTTP refusal from a site we did reach keeps that error.
+    """
     fail_reqs = [s for s in steps if s.get("action") == "request" and s.get("result") == "failed"]
-    if fail_reqs:
-        detail = str(fail_reqs[-1].get("detail") or "access denied")
+    http_fails = [s for s in fail_reqs if _step_status(s) >= 400]
+    if http_fails:
+        detail = str(http_fails[-1].get("detail") or "access denied")
         return f"I couldn't get that — {detail}."
+    page_down = any(
+        s.get("action") == "open_url" and s.get("result") == "failed" and _step_status(s) == 0
+        for s in steps
+    )
+    api_down = any(s.get("result") == "failed" and _step_status(s) == 0 for s in fail_reqs)
+    if page_down or api_down:
+        return "I couldn't get that — the site is unreachable."
     if any(s.get("action") == "solve_captcha" and s.get("result") == "rejected" for s in steps):
         if not any(s.get("action") == "switch_to_api" for s in steps):
             return "I couldn't get that — human verification blocked me."
     if any(s.get("action") == "open_url" and s.get("result") == "blocked" for s in steps):
         return "I couldn't get that — the storefront blocked automated access."
     return "I couldn't get the data you asked for."
+
+
+def _is_cart_read(message: str) -> bool:
+    """A question about the cart, not an add, clear, or checkout."""
+    if _wants_cart_add(message):
+        return False
+    if _affirmed_matches(message, _CHECKOUT_VERB):
+        return False
+    if "cart" in message.lower() and _affirmed_matches(message, _CLEAR_VERB):
+        return False
+    text = message.lower()
+    if re.search(r"\b(?:show|see|view|open|list|read|display)\b.{0,40}\b(?:cart|basket)\b", text):
+        return True
+    if re.search(r"\bwhat(?:'s| is|s)?\b.{0,30}\b(?:in|inside)\b.{0,20}\b(?:cart|basket)\b", text):
+        return True
+    if re.search(r"\b(?:cart|basket)\b.{0,20}\b(?:contents|items)\b", text):
+        return True
+    return False
+
+
+def _cart_reply(
+    message: str,
+    fields: list[dict[str, str]],
+    denied: bool,
+    steps: list[dict[str, Any]],
+) -> str | None:
+    if not _is_cart_read(message):
+        return None
+    labels = _field_map(fields)
+    products = labels.get("products", "").strip()
+    if products:
+        return f"Your cart has {products}."
+    # The agent cart page always says "N item(s) in cart." A storefront title
+    # that merely contains the word cart is not that page.
+    if "item(s) in cart" in labels.get("summary", "").lower():
+        return "Your cart is empty."
+    if denied or not fields:
+        return _failure_reason(steps)
+    return None
 
 
 def _compose_reply(
@@ -1006,6 +1079,10 @@ def _compose_reply(
     """
     if action_outcome:
         return _reply_for_action(action_outcome)
+
+    cart_reply = _cart_reply(message, fields, denied, steps)
+    if cart_reply:
+        return cart_reply
 
     deterministic = _answer_from_fields(message, fields) if fields else None
     if deterministic:

@@ -1,5 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
+import { Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
@@ -17,6 +18,7 @@ import {
   refreshActivity,
   useActiveSite,
   type AgentModel,
+  type MuseStep,
 } from "@/lib/aurif-store";
 import { aurifHead } from "@/lib/aurif-meta";
 
@@ -32,7 +34,57 @@ type ChatMessage = {
   text: string;
   denied?: boolean;
   modelLabel?: string;
+  steps?: string[];
+  pending?: boolean;
 };
+
+function stepCaption(step: MuseStep): string | null {
+  const action = String(step.action || "");
+  const result = String(step.result || "");
+  const actionId = step.action_id ? String(step.action_id) : "";
+  const url = String(step.url || "");
+  if (action === "open_url" && result === "started") return "Tried the page";
+  if (action === "open_url" && result === "failed") return "Could not reach the page";
+  if (action === "open_url" && result === "blocked") return "Page blocked automated access";
+  if (action === "open_url" && result === "ok") return "Page loaded";
+  if (action === "check_captcha_required" || (action === "fetch_captcha" && result === "skipped")) {
+    return "Human verification is off";
+  }
+  if (action === "fetch_captcha" && result === "failed") return "Could not run human verification";
+  if (action === "fetch_captcha") return "Human verification requested";
+  if (action === "solve_captcha") return "Blocked by human verification";
+  if (action === "switch_to_api") return "Used the site key";
+  if (action === "stop") return "Stopped";
+  if (action === "follow_up") return "Read the page";
+  if (action === "request" && url.includes("/ai/help")) return null;
+  if (action === "request" && result === "failed") {
+    return actionId ? `API refused ${actionId}` : "API refused the request";
+  }
+  if (action === "request" && result === "ok") {
+    if (actionId.startsWith("product.add:")) return "Called the API to add the item";
+    if (actionId === "cart.checkout") return "Called the API to check out";
+    if (actionId === "cart.clear") return "Called the API to clear the cart";
+    if (actionId) return `Called the API (${actionId})`;
+    if (url.includes("/ai/handshake")) return "Called the Aurif API";
+    if (url.includes("/ai/page")) return "Read the page from the API";
+    return "Called the Aurif API";
+  }
+  return null;
+}
+
+function captionsFor(steps: MuseStep[] | undefined): string[] {
+  const out: string[] = [];
+  for (const step of steps || []) {
+    const caption = stepCaption(step);
+    if (caption && caption !== out[out.length - 1]) out.push(caption);
+  }
+  return out;
+}
+
+function pushCaption(steps: string[] | undefined, caption: string | null): string[] | undefined {
+  if (!caption || caption === steps?.[steps.length - 1]) return steps;
+  return [...(steps || []), caption];
+}
 
 function AgentDashboard() {
   const site = useActiveSite();
@@ -91,42 +143,62 @@ function AgentDashboard() {
     const text = draft.trim();
     if (!text || busy) return;
     setDraft("");
-    setMessages((prev) => [...prev, { id: crypto.randomUUID(), role: "user", text }]);
+    const liveId = crypto.randomUUID();
+    setMessages((prev) => [
+      ...prev,
+      { id: crypto.randomUUID(), role: "user", text },
+      { id: liveId, role: "muse", text: "", pending: true, steps: [] },
+    ]);
     setBusy(true);
     try {
-      const res = await chatWithMuse({
-        message: text,
-        use_site_key: useSiteKey,
-        site_key: useSiteKey ? site.siteKey : undefined,
-        model: modelId || undefined,
-      });
+      const res = await chatWithMuse(
+        {
+          message: text,
+          use_site_key: useSiteKey,
+          site_key: useSiteKey ? site.siteKey : undefined,
+          model: modelId || undefined,
+        },
+        (step) => {
+          const caption = stepCaption(step);
+          setMessages((prev) =>
+            prev.map((m) => (m.id === liveId ? { ...m, steps: pushCaption(m.steps, caption) } : m)),
+          );
+        },
+      );
       const used =
         res.model?.label ||
         selected?.label ||
         res.model?.id ||
         modelId ||
         undefined;
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: crypto.randomUUID(),
-          role: "muse",
-          text: res.reply,
-          denied: res.denied,
-          modelLabel: used,
-        },
-      ]);
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === liveId
+            ? {
+                ...m,
+                text: res.reply,
+                denied: res.denied,
+                modelLabel: used,
+                pending: false,
+                steps: captionsFor(res.steps),
+              }
+            : m,
+        ),
+      );
       await refreshActivity(site.id);
     } catch (err) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: crypto.randomUUID(),
-          role: "muse",
-          denied: true,
-          text: err instanceof Error ? err.message : "Muse could not reach the site.",
-        },
-      ]);
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === liveId
+            ? {
+                ...m,
+                pending: false,
+                denied: true,
+                text: err instanceof Error ? err.message : "Muse could not reach the site.",
+              }
+            : m,
+        ),
+      );
     } finally {
       setBusy(false);
     }
@@ -196,11 +268,32 @@ function AgentDashboard() {
                     Muse{m.modelLabel ? ` · ${m.modelLabel}` : ""}
                   </p>
                 )}
-                <p className="whitespace-pre-wrap">{m.text}</p>
+                {m.pending && (
+                  <p className="mb-2 flex items-center gap-2 text-sm text-ink">
+                    <Loader2 className="size-4 animate-spin" aria-hidden />
+                    Working through the steps
+                  </p>
+                )}
+                {m.text && <p className="whitespace-pre-wrap">{m.text}</p>}
+                {m.steps && m.steps.length > 0 && (
+                  <ol
+                    className={
+                      m.text
+                        ? "mt-2 space-y-1 border-t border-ink/10 pt-2 text-sm text-ink"
+                        : "space-y-1 text-sm text-ink"
+                    }
+                    aria-live={m.pending ? "polite" : undefined}
+                  >
+                    {m.steps.map((step, index) => (
+                      <li key={`${m.id}-${index}`}>
+                        {index + 1}. {step}
+                      </li>
+                    ))}
+                  </ol>
+                )}
               </div>
             </div>
           ))}
-          {busy && <p className="font-mono text-xs uppercase tracking-wider text-muted-foreground">Muse is browsing…</p>}
           <div ref={endRef} />
         </div>
         <form

@@ -21,7 +21,7 @@ if str(SERVER) not in sys.path:
 
 import muse_browse  # noqa: E402
 import store  # noqa: E402
-from app import app, cart_by_session, sessions  # noqa: E402
+from app import app, cart_by_session, muse_chat_sessions, sessions  # noqa: E402
 
 ENV_KEYS = (
     "META_API_KEY",
@@ -364,6 +364,7 @@ class MuseBrowseRepros(unittest.TestCase):
         self.script.reset()
         sessions.clear()
         cart_by_session.clear()
+        muse_chat_sessions.clear()
 
     def _events(self) -> list[dict]:
         response = self.client.get("/api/sites/demo-shop/activity", headers=self.owner)
@@ -564,6 +565,192 @@ class MuseBrowseRepros(unittest.TestCase):
         self.assertEqual(body["path"], "/products")
         self.assertTrue(body["url"].endswith("/products"))
         self.assertNotIn("/shop", body["url"])
+
+    def _handshake(self, scopes: list[str] | None = None) -> str:
+        response = self.client.post(
+            "/ai/handshake",
+            json={
+                "purpose": "help me shop",
+                "requested_scopes": scopes or ["view", "act"],
+            },
+            headers={"X-Aurif-Site-Key": self.site_key},
+        )
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        return response.get_json()["session_token"]
+
+    def _agent_headers(self, session: str) -> dict[str, str]:
+        return {"X-Aurif-Site-Key": self.site_key, "X-Aurif-Session": session}
+
+    def test_g3_cart_persists_across_muse_turns(self):
+        added = self._chat("add the Field Tote to my cart")
+        self.assertIn("Field Tote", added["reply"])
+        self.assertIn("cart", added["reply"].lower())
+
+        shown = self._chat("show my cart")
+        self.assertIn("Field Tote", shown["reply"])
+        self.assertNotIn("empty", shown["reply"].lower())
+        pages = [
+            item
+            for item in shown["site_response"]["findings"]
+            if isinstance(item.get("json"), dict) and item["json"].get("path") == "/cart"
+        ]
+        self.assertTrue(pages, shown["reply"])
+        self.assertIn("field-tote", pages[-1]["json"]["meta"].get("items") or [])
+
+    def test_g3_separate_agent_sessions_do_not_share_a_cart(self):
+        first = self._handshake()
+        added = self.client.post(
+            "/ai/actions",
+            json={"action_id": "product.add:field-tote"},
+            headers=self._agent_headers(first),
+        )
+        self.assertEqual(added.status_code, 200, added.get_data(as_text=True))
+        second = self._handshake()
+        page = self.client.get("/ai/page", query_string={"path": "/cart"}, headers=self._agent_headers(second))
+        self.assertEqual(page.status_code, 200, page.get_data(as_text=True))
+        self.assertEqual(page.get_json()["meta"].get("items"), [])
+
+    def test_g4_empty_checkout_is_refused(self):
+        session = self._handshake()
+        response = self.client.post(
+            "/ai/actions",
+            json={"action_id": "cart.checkout"},
+            headers=self._agent_headers(session),
+        )
+        self.assertEqual(response.status_code, 409, response.get_data(as_text=True))
+        self.assertIn("empty", response.get_json()["error"].lower())
+        self.assertEqual(cart_by_session.get(session), [])
+
+        body = self._chat("checkout")
+        self.assertTrue(body["denied"])
+        self.assertIn("empty", body["reply"].lower())
+        self.assertNotIn("complete", body["reply"].lower())
+
+    def test_g4_checkout_with_an_item_still_completes(self):
+        added = self._chat("add the Field Tote to my cart")
+        self.assertIn("Field Tote", added["reply"])
+        body = self._chat("checkout")
+        self.assertFalse(body["denied"], body["reply"])
+        self.assertIn("complete", body["reply"].lower())
+        self.assertNotIn("empty", body["reply"].lower())
+
+    def test_stream_emits_real_steps_before_the_reply(self):
+        response = self.client.post(
+            "/api/ai/agent-chat",
+            json={
+                "message": "open the shop",
+                "use_site_key": True,
+                "site_key": self.site_key,
+                "stream": True,
+            },
+            headers=self.owner,
+        )
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        self.assertIn("ndjson", response.content_type)
+        events = [json.loads(line) for line in response.get_data(as_text=True).splitlines() if line.strip()]
+        steps = [event["step"] for event in events if event.get("type") == "step"]
+        done = [event for event in events if event.get("type") == "done"]
+        self.assertTrue(steps)
+        self.assertEqual(steps[0].get("action"), "open_url")
+        self.assertEqual(len(done), 1)
+        self.assertTrue(done[0].get("reply"))
+        self.assertEqual([event["type"] for event in events if event.get("type") == "done"], ["done"])
+        self.assertLess(
+            next(i for i, event in enumerate(events) if event.get("type") == "step"),
+            next(i for i, event in enumerate(events) if event.get("type") == "done"),
+        )
+
+    def test_g7_unreachable_storefront_is_not_blamed_on_human_verification(self):
+        result = muse_browse.browse_as_agent(
+            site={"id": "demo-shop", "url": "http://127.0.0.1:1", "name": "Northline"},
+            path="/products",
+            products={},
+            message="open the shop",
+            site_key=None,
+        )
+        self.assertIn("unreachable", result["reply"].lower())
+        self.assertNotIn("human verification", result["reply"].lower())
+        self.assertTrue(
+            any(step.get("action") == "open_url" and step.get("result") == "failed" for step in result["steps"])
+        )
+        self.assertTrue(
+            any(step.get("action") == "solve_captcha" and step.get("result") == "rejected" for step in result["steps"])
+        )
+
+
+class MuseFailureWording(unittest.TestCase):
+    def test_g3_cart_read_lists_items_and_names_an_empty_cart(self):
+        filled = muse_browse._compose_reply(
+            message="show my cart",
+            steps=[],
+            fields=[
+                {"label": "Title", "value": "Cart — Northline Goods"},
+                {"label": "Summary", "value": "1 item(s) in cart."},
+                {"label": "Products", "value": "Field Tote (68)"},
+            ],
+            denied=False,
+        )
+        self.assertIn("Field Tote", filled)
+        empty = muse_browse._compose_reply(
+            message="show my cart",
+            steps=[],
+            fields=[
+                {"label": "Title", "value": "Cart — Northline Goods"},
+                {"label": "Summary", "value": "0 item(s) in cart."},
+            ],
+            denied=False,
+        )
+        self.assertIn("empty", empty.lower())
+        self.assertNotIn("Field Tote", empty)
+
+    def test_g4_empty_checkout_reply_does_not_say_complete(self):
+        reply = muse_browse._reply_for_action(
+            {"ok": False, "action_id": "cart.checkout", "error": "cart is empty"}
+        )
+        self.assertIn("empty", reply.lower())
+        self.assertNotIn("complete", reply.lower())
+
+    def test_g7_unreachable_is_distinct_from_human_verification_and_http_denial(self):
+        unreachable = muse_browse._failure_reason(
+            [
+                {"action": "open_url", "result": "failed", "status": 0, "detail": "Could not reach the page"},
+                {"action": "solve_captcha", "result": "rejected", "detail": "drawing rejected"},
+            ]
+        )
+        self.assertIn("unreachable", unreachable.lower())
+        self.assertNotIn("human verification", unreachable.lower())
+
+        captcha = muse_browse._failure_reason(
+            [
+                {"action": "open_url", "result": "blocked", "status": 403, "detail": "Storefront blocked automated access"},
+                {"action": "solve_captcha", "result": "rejected", "detail": "drawing rejected"},
+            ]
+        )
+        self.assertIn("human verification", captcha.lower())
+        self.assertNotIn("unreachable", captcha.lower())
+
+        api_down = muse_browse._failure_reason(
+            [
+                {"action": "open_url", "result": "ok", "status": 200},
+                {"action": "request", "result": "failed", "status": 0, "detail": "Connection refused"},
+            ]
+        )
+        self.assertIn("unreachable", api_down.lower())
+
+        http_denial = muse_browse._failure_reason(
+            [
+                {"action": "open_url", "result": "failed", "status": 0, "detail": "Could not reach the page"},
+                {
+                    "action": "request",
+                    "result": "failed",
+                    "status": 403,
+                    "detail": "site_key required and must match this site",
+                },
+            ]
+        )
+        self.assertIn("site_key required", http_denial)
+        self.assertNotIn("unreachable", http_denial.lower())
+        self.assertNotIn("human verification", http_denial.lower())
 
 
 if __name__ == "__main__":

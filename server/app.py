@@ -6,13 +6,15 @@ Customer storefront UI: Demo-client (Vite). Dashboard UI: Aurif-UI (Vite).
 from __future__ import annotations
 
 import json
+import queue
 import re
 import secrets
+import threading
 import time
 import uuid
 from typing import Any
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 
 import config
@@ -59,6 +61,13 @@ CORS(
 
 sessions: dict[str, dict[str, Any]] = {}
 cart_by_session: dict[str, list[str]] = {}
+# One agent session per owner chat. Each Muse turn still handshakes, and the
+# cart is copied onto that new session so "show my cart" sees what was added.
+muse_chat_sessions: dict[str, str] = {}
+
+
+class EmptyCartError(Exception):
+    """Checkout was asked to run with nothing in the cart."""
 PRODUCTS = products_by_slug()
 
 
@@ -182,6 +191,20 @@ def log_denial(
 def _session_denial_reason(err: tuple[Any, int]) -> str:
     status = err[1] if len(err) > 1 else 401
     return "no_session" if status == 401 else "scope_not_granted"
+
+
+def adopt_muse_cart(new_token: str, previous_token: str | None) -> None:
+    """Keep Muse's cart when a turn has to handshake a new agent session.
+
+    Handshake always starts from an empty cart. Copy the previous chat's items
+    onto the new token before the page read or the next action, and only when
+    the new cart is still empty so a mutation in this turn is not overwritten.
+    """
+    if not previous_token or previous_token == new_token or new_token not in sessions:
+        return
+    previous = list(cart_by_session.get(previous_token) or [])
+    if previous and not (cart_by_session.get(new_token) or []):
+        cart_by_session[new_token] = previous
 
 
 def apply_page_redaction(site: dict[str, Any], path: str, snap: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
@@ -421,6 +444,8 @@ def run_action(session: dict[str, Any], action_id: str, args: dict[str, Any]) ->
         if "act" not in session["scopes"]:
             raise PermissionError("act")
         items = list(cart)
+        if not items:
+            raise EmptyCartError()
         cart_by_session[token] = []
         return {
             "checked_out": items,
@@ -737,6 +762,16 @@ def ai_actions():
             session=session,
         )
         return jsonify({"ok": False, "error": "scope 'act' not granted"}), 403
+    except EmptyCartError:
+        log_denial(
+            site,
+            kind="action_blocked",
+            reason="cart_empty",
+            action_id=action_id,
+            asked=asked,
+            session=session,
+        )
+        return jsonify({"ok": False, "error": "cart is empty"}), 409
 
     page = result.get("page") if isinstance(result, dict) else None
     if isinstance(page, dict) and page.get("blocked"):
@@ -1283,7 +1318,6 @@ def api_agent_chat():
     owner, err = owner_auth()
     if err:
         return err
-    _ = owner
     data = request.get_json(silent=True) or {}
     message = str(data.get("message") or "").strip()
     if not message:
@@ -1298,36 +1332,46 @@ def api_agent_chat():
         model_info = muse_client.resolve_model(str(data.get("model") or "").strip() or None)
     except RuntimeError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
-    result = muse_browse.browse_as_agent(
-        site=site,
-        path=path,
-        products=PRODUCTS,
-        message=message,
-        site_key=site_key or None,
-        model=model_info["id"],
-        provider=model_info["provider"],
-    )
+    owner_id = str((owner.get("user") or {}).get("id") or "")
+    previous_token = muse_chat_sessions.get(owner_id) if owner_id else None
 
-    kind = "page_blocked" if result.get("denied") else "page"
-    store.log_activity(
-        site["id"],
-        kind=kind,
-        agent_id="muse-dashboard/1.0",
-        path=path,
-        detail={
-            "accepted": not bool(result.get("denied")),
-            "reason": "muse_storefront_browse",
-            "asked": {"method": "GET", "url": result.get("url"), "purpose": message[:240]},
-            "navigated": [path],
-            "captcha": result.get("captcha"),
-            "storefront_status": result.get("status"),
-            "site_key_used": bool(site_key),
-            "model": model_info,
-        },
-    )
+    def _keep_cart(token: str) -> None:
+        adopt_muse_cart(token, previous_token)
 
-    return jsonify(
-        {
+    def _run(on_step: Any = None) -> dict[str, Any]:
+        result = muse_browse.browse_as_agent(
+            site=site,
+            path=path,
+            products=PRODUCTS,
+            message=message,
+            site_key=site_key or None,
+            model=model_info["id"],
+            provider=model_info["provider"],
+            on_session=_keep_cart if owner_id else None,
+            on_step=on_step,
+        )
+        remembered = result.get("session_token")
+        if owner_id and isinstance(remembered, str) and remembered in sessions:
+            muse_chat_sessions[owner_id] = remembered
+
+        kind = "page_blocked" if result.get("denied") else "page"
+        store.log_activity(
+            site["id"],
+            kind=kind,
+            agent_id="muse-dashboard/1.0",
+            path=path,
+            detail={
+                "accepted": not bool(result.get("denied")),
+                "reason": "muse_storefront_browse",
+                "asked": {"method": "GET", "url": result.get("url"), "purpose": message[:240]},
+                "navigated": [path],
+                "captcha": result.get("captcha"),
+                "storefront_status": result.get("status"),
+                "site_key_used": bool(site_key),
+                "model": model_info,
+            },
+        )
+        return {
             "ok": True,
             "denied": bool(result.get("denied")),
             "reply": result.get("reply"),
@@ -1340,6 +1384,38 @@ def api_agent_chat():
             "url": result.get("url"),
             "model": model_info,
         }
+
+    # The dashboard asks for a stream so each real step can show up as it
+    # happens. The default body stays one JSON object for existing clients.
+    if not data.get("stream"):
+        return jsonify(_run())
+
+    events: queue.Queue = queue.Queue()
+
+    def _on_step(step: dict[str, Any]) -> None:
+        events.put({"type": "step", "step": step})
+
+    def _work() -> None:
+        try:
+            events.put({"type": "done", **_run(_on_step)})
+        except Exception:
+            events.put({"type": "error", "error": "Muse could not finish that."})
+        finally:
+            events.put(None)
+
+    threading.Thread(target=_work, daemon=True).start()
+
+    def _generate():
+        while True:
+            item = events.get()
+            if item is None:
+                break
+            yield json.dumps(item) + "\n"
+
+    return Response(
+        _generate(),
+        mimetype="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

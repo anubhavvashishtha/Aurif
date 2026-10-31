@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import { api, clearToken, getToken, setToken } from "./api";
+import { API_BASE, api, clearToken, getToken, setToken } from "./api";
 import type { JsonValue, RequestField, ResponseField } from "./aurif-fields";
 
 /**
@@ -521,23 +521,68 @@ export async function fetchAgentModels() {
   }>("/api/ai/models");
 }
 
-export async function chatWithMuse(body: {
-  message: string;
-  site_key?: string;
-  use_site_key?: boolean;
-  model?: string;
-}) {
-  return api<{
-    ok: boolean;
-    denied: boolean;
-    reply: string;
-    steps?: MuseStep[];
-    path?: string;
-    status?: number;
-    fields?: { label: string; value: string }[];
-    url?: string;
-    model?: { id: string; provider: string; label: string };
-  }>("/api/ai/agent-chat", { method: "POST", body: JSON.stringify(body) });
+export type MuseChatResult = {
+  ok: boolean;
+  denied: boolean;
+  reply: string;
+  steps?: MuseStep[];
+  path?: string;
+  status?: number;
+  fields?: { label: string; value: string }[];
+  url?: string;
+  model?: { id: string; provider: string; label: string };
+};
+
+export async function chatWithMuse(
+  body: {
+    message: string;
+    site_key?: string;
+    use_site_key?: boolean;
+    model?: string;
+  },
+  onStep?: (step: MuseStep) => void,
+) {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const token = getToken();
+  if (token) headers["X-Aurif-Owner"] = token;
+  const res = await fetch(API_BASE + "/api/ai/agent-chat", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ...body, stream: true }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error((data as { error?: string }).error || res.statusText || "Request failed");
+  }
+  if (!res.body) {
+    const data = (await res.json()) as MuseChatResult;
+    for (const step of data.steps || []) onStep?.(step);
+    return data;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let final: MuseChatResult | null = null;
+  const take = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    const event = JSON.parse(trimmed) as { type?: string; step?: MuseStep; error?: string } & MuseChatResult;
+    if (event.type === "step" && event.step) onStep?.(event.step);
+    else if (event.type === "done") final = event;
+    else if (event.type === "error") throw new Error(event.error || "Muse could not finish that.");
+  };
+  while (true) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    buf += decoder.decode(chunk.value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop() || "";
+    for (const line of lines) take(line);
+  }
+  if (buf.trim()) take(buf);
+  if (!final) throw new Error("Muse did not finish that reply.");
+  return final;
 }
 
 export const useActiveSite = () =>
