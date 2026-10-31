@@ -54,13 +54,12 @@ Need **Node 22+** (prefer `pnpm`) and **Python 3.11+**.
 ### 1. Env (repo root)
 
 ```bash
-# .env (gitignored)
+# .env (gitignored) — see .env.example and docs/MODELS.md
+# Either a Meta Model API key:
+MODEL_API_KEY=…
+# or the existing Baseten key (Muse Spark Open, text and vision):
 BASETEN_API_KEY=…
-MODAL_TOKEN_ID=…          # CAPTCHA vision (DeepSeek on Modal)
-MODAL_TOKEN_SECRET=…
-# optional:
 # BASETEN_MODEL=meta-models/muse-spark-open-1026
-# MODAL_VISION_MODEL=deepseek-ai/DeepSeek-V4.1-Flash
 ```
 
 ### 2. Three terminals
@@ -139,14 +138,17 @@ Site key is on the dashboard (Settings / site detail).
 
 ## Models (hackathon)
 
-Product AI runs in **server + Aurif-UI** (not Demo-client). Inference via Baseten (OpenAI-compatible) and Modal for vision CAPTCHA.
+Product AI runs in **server + Aurif-UI** (not Demo-client). Text and CAPTCHA vision both call a Meta model. With `MODEL_API_KEY` or `META_API_KEY`, that is **Muse Spark 1.3** on the Meta Model API (`https://api.meta.ai/v1`). With only `BASETEN_API_KEY`, text and vision stay on **Muse Spark Open** (`BASETEN_MODEL`, default `meta-models/muse-spark-open-1026`) at `https://inference.baseten.co/v1`. Startup prints which provider and model are active. A DeepSeek model id is refused. There is no Modal fallback.
 
 | Feature | Where | Model |
 |---------|--------|--------|
-| Handshake purpose risk | `POST /ai/handshake` | `meta-models/muse-spark-open-1026` |
+| Handshake purpose risk | `POST /ai/handshake` | active text model |
 | Policy co-pilot | Endpoints | same |
 | Activity summary | Activity | same |
-| Muse chat | Agent dashboard | Muse (Baseten) or DeepSeek vision path as configured |
+| Muse chat phrasing | Agent dashboard | same |
+| CAPTCHA vision | Human gate | active vision model (same as text unless `META_VISION_*` is set) |
+
+See [docs/MODELS.md](docs/MODELS.md).
 
 ---
 

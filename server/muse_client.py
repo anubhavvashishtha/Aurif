@@ -1,8 +1,15 @@
-"""Baseten Muse Spark Open client for Aurif product AI features."""
+"""Meta model client for Aurif product AI features.
+
+Preferred host is the Meta Model API (Muse Spark 1.3). If that key is unset
+and BASETEN_API_KEY is present, text and vision stay on Baseten Muse Spark
+Open (meta-models/muse-spark-open-1026), which already accepted CAPTCHA images.
+DeepSeek and Modal are not used.
+"""
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from collections import Counter
@@ -13,106 +20,241 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 ROOT = Path(__file__).resolve().parents[1]
-# override=True so restarted Flask picks up tokens added to .env after process start
-load_dotenv(ROOT / ".env", override=True)
+# Fill missing vars from repo-root .env. Do not override existing process env
+# (tests and exported keys win). A restarted Flask process picks up .env edits.
+load_dotenv(ROOT / ".env", override=False)
 
+# First-party Meta Model API. Muse Spark 1.3 reads text and images.
+META_API_DEFAULT_BASE = "https://api.meta.ai/v1"
+META_DEFAULT_MODEL = "muse-spark-1.3"
+
+# Existing demo setup. Muse Spark Open on Baseten is a Meta model, and the
+# draw-CAPTCHA path already sent images to this id when Modal was down.
 BASETEN_BASE_URL = "https://inference.baseten.co/v1"
-# Hackathon model id — plain muse-spark-open returns 403 with participant keys
-DEFAULT_MODEL = os.environ.get("BASETEN_MODEL", "meta-models/muse-spark-open-1026")
+BASETEN_DEFAULT_MODEL = "meta-models/muse-spark-open-1026"
 
-# Modal DeepSeek vision endpoint (draw CAPTCHA) + optional text inference
-MODAL_BASE_URL = os.environ.get(
-    "MODAL_BASE_URL",
-    "https://anubhavvashishtha-iitd--ep-deepseek-v4-1-flash-server.us-west.modal.direct/v1",
-).rstrip("/")
-VISION_MODEL = os.environ.get("MODAL_VISION_MODEL", "deepseek-ai/DeepSeek-V4.1-Flash")
+log = logging.getLogger("aurif.models")
 
-# Models the Agent dashboard can switch between (Baseten Meta + Modal).
-AGENT_MODELS: list[dict[str, str]] = [
-    {
-        "id": "meta-models/muse-spark-open-1026",
-        "label": "Muse Spark Open",
-        "provider": "baseten",
-    },
-    {
-        "id": VISION_MODEL,
-        "label": "DeepSeek V4.1 Flash",
-        "provider": "modal",
-    },
-]
+# Families we will not call. Llama and Muse ids are Meta models and are allowed
+# even when the name also contains another token (for example a gateway prefix).
+_NON_META_MODEL = re.compile(
+    r"(deepseek|gpt-|o1-|o3-|o4-|claude|gemini|qwen|kimi|moonshot|\bglm-|mixtral|\bgrok\b)",
+    re.I,
+)
+_META_MODEL_OK = re.compile(r"(muse|llama|meta-models|meta-llama)", re.I)
+
+
+def _refresh_env() -> None:
+    load_dotenv(ROOT / ".env", override=False)
+
+
+def _first_env(*names: str) -> str:
+    for name in names:
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def text_settings() -> dict[str, str]:
+    """Resolved text-model endpoint. Read on each call so env edits apply.
+
+    META_API_KEY / MODEL_API_KEY select the Meta Model API. When neither is
+    set, BASETEN_API_KEY keeps the previous Muse Spark Open deployment.
+    """
+    _refresh_env()
+    meta_key = _first_env("META_API_KEY", "MODEL_API_KEY")
+    baseten_key = _first_env("BASETEN_API_KEY")
+    using_baseten = not meta_key and bool(baseten_key)
+
+    if _first_env("META_BASE_URL"):
+        base_url = _first_env("META_BASE_URL").rstrip("/")
+    elif using_baseten:
+        base_url = BASETEN_BASE_URL
+    else:
+        base_url = META_API_DEFAULT_BASE
+
+    if _first_env("META_MODEL"):
+        model = _first_env("META_MODEL")
+    elif using_baseten:
+        model = _first_env("BASETEN_MODEL") or BASETEN_DEFAULT_MODEL
+    else:
+        model = META_DEFAULT_MODEL
+
+    if _first_env("META_PROVIDER"):
+        provider = _first_env("META_PROVIDER")
+    elif using_baseten or "inference.baseten.co" in base_url:
+        provider = "baseten"
+    else:
+        provider = "meta"
+
+    return {
+        "provider": provider,
+        "base_url": base_url,
+        "model": model,
+        "api_key": meta_key or baseten_key,
+    }
+
+
+def vision_settings() -> dict[str, str]:
+    """Vision endpoint. Unset vision vars inherit the text Meta endpoint."""
+    text = text_settings()
+    return {
+        "provider": _first_env("META_VISION_PROVIDER") or text["provider"],
+        "base_url": (_first_env("META_VISION_BASE_URL") or text["base_url"]).rstrip("/"),
+        "model": _first_env("META_VISION_MODEL") or text["model"],
+        "api_key": _first_env("META_VISION_API_KEY") or text["api_key"],
+    }
+
+
+def public_settings(cfg: dict[str, str]) -> dict[str, str]:
+    """Settings safe to return from an API (no key)."""
+    return {
+        "provider": cfg.get("provider") or "",
+        "base_url": cfg.get("base_url") or "",
+        "model": cfg.get("model") or "",
+    }
+
+
+def text_model_id() -> str:
+    return text_settings()["model"]
+
+
+def _looks_non_meta(model: str) -> bool:
+    if _META_MODEL_OK.search(model or ""):
+        return False
+    return bool(_NON_META_MODEL.search(model or ""))
+
+
+def _reject_non_meta_target(model: str, base_url: str, *, kind: str) -> None:
+    """Raise if this call would hit DeepSeek or another non-Meta model."""
+    blob = f"{model} {base_url}"
+    if "deepseek" in blob.lower():
+        raise RuntimeError(
+            f"{kind} provider misconfigured: refusing DeepSeek target "
+            f"({model} @ {base_url}). Set META_MODEL / META_VISION_MODEL and "
+            "META_BASE_URL / META_VISION_BASE_URL to a Meta model "
+            f"(default {META_DEFAULT_MODEL} at {META_API_DEFAULT_BASE})."
+        )
+    if _looks_non_meta(model):
+        raise RuntimeError(
+            f"{kind} provider misconfigured: {model!r} is not a Meta model. "
+            "Use a Muse Spark or Llama model "
+            f"(default {META_DEFAULT_MODEL})."
+        )
+
+
+def _is_meta_model_api(base_url: str) -> bool:
+    return "api.meta.ai" in (base_url or "").lower()
+
+
+def _output_tokens(requested: int, base_url: str) -> int:
+    # Muse Spark spends output tokens on reasoning before the visible answer.
+    # Tiny budgets (the browse phrasing call asks for ~60) come back empty.
+    if _is_meta_model_api(base_url):
+        return max(int(requested), 768)
+    return int(requested)
+
+
+def _meta_extra(base_url: str) -> dict[str, Any]:
+    if not _is_meta_model_api(base_url):
+        return {}
+    effort = (_first_env("META_REASONING_EFFORT") or "low").lower()
+    if effort in ("", "default", "unset"):
+        return {}
+    # Muse Spark rejects reasoning_effort=none with HTTP 400.
+    if effort == "none":
+        effort = "low"
+    return {"reasoning_effort": effort}
+
+
+def _model_label(model_id: str) -> str:
+    tail = (model_id or "").split("/")[-1]
+    if "muse-spark-open" in model_id:
+        return "Muse Spark Open"
+    if tail.startswith("muse-spark"):
+        rest = tail.removeprefix("muse-spark").lstrip("-")
+        return f"Muse Spark {rest}".strip() if rest else "Muse Spark"
+    return tail or model_id
+
+
+def log_active_models(*, echo: bool = False) -> None:
+    """Log the text and vision provider/model. Never includes the API key."""
+    lines: list[str] = []
+    for kind, loader in (("text", text_settings), ("vision", vision_settings)):
+        cfg = loader()
+        try:
+            _reject_non_meta_target(cfg["model"], cfg["base_url"], kind=kind)
+            line = (
+                f"Aurif {kind} model: provider={cfg['provider']} "
+                f"model={cfg['model']} base_url={cfg['base_url']} "
+                f"key={'set' if cfg.get('api_key') else 'missing'}"
+            )
+            log.info(line)
+        except RuntimeError as exc:
+            line = f"Aurif {kind} model: {exc}"
+            log.error(line)
+        lines.append(line)
+    if echo:
+        for line in lines:
+            print(line)
+
+
+def api_providers() -> dict[str, Any]:
+    """Model-catalog providers. `text` and `vision` are the live endpoints.
+
+    `baseten.base_url` is the previous response field. `modal` is omitted:
+    it was the DeepSeek host, and the dashboard does not read `providers`.
+    """
+    return {
+        "text": public_settings(text_settings()),
+        "vision": public_settings(vision_settings()),
+        "baseten": {"base_url": BASETEN_BASE_URL},
+    }
 
 
 def list_agent_models() -> list[dict[str, Any]]:
     """Catalog for the Agent dashboard model dropdown."""
-    out: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    if DEFAULT_MODEL:
-        out.append(
-            {
-                "id": DEFAULT_MODEL,
-                "label": "Muse Spark Open" if "muse-spark" in DEFAULT_MODEL else DEFAULT_MODEL.split("/")[-1],
-                "provider": "baseten",
-                "default": True,
-            }
-        )
-        seen.add(DEFAULT_MODEL)
-    for row in AGENT_MODELS:
-        if row["id"] in seen:
-            continue
-        out.append(
-            {
-                "id": row["id"],
-                "label": row["label"],
-                "provider": row["provider"],
-                "default": False,
-            }
-        )
-        seen.add(row["id"])
-    if not out:
-        out.append(
-            {
-                "id": "meta-models/muse-spark-open-1026",
-                "label": "Muse Spark Open",
-                "provider": "baseten",
-                "default": True,
-            }
-        )
-    return out
+    cfg = text_settings()
+    _reject_non_meta_target(cfg["model"], cfg["base_url"], kind="text")
+    return [
+        {
+            "id": cfg["model"],
+            "label": _model_label(cfg["model"]),
+            "provider": cfg["provider"],
+            "base_url": cfg["base_url"],
+            "default": True,
+        }
+    ]
 
 
 def resolve_model(model_id: str | None) -> dict[str, str]:
-    mid = (model_id or "").strip() or DEFAULT_MODEL
+    cfg = text_settings()
+    mid = (model_id or "").strip() or cfg["model"]
+    _reject_non_meta_target(mid, cfg["base_url"], kind="text")
     for row in list_agent_models():
         if row["id"] == mid:
             return {"id": row["id"], "provider": row["provider"], "label": row["label"]}
-    if mid == VISION_MODEL or mid.startswith("deepseek"):
-        return {"id": mid, "provider": "modal", "label": mid}
-    return {"id": mid, "provider": "baseten", "label": mid}
+    return {"id": mid, "provider": cfg["provider"], "label": _model_label(mid)}
 
 
-def _api_key() -> str:
-    key = (os.environ.get("BASETEN_API_KEY") or "").strip()
-    if not key:
-        raise RuntimeError("BASETEN_API_KEY missing — set it in the repo root .env")
-    return key
-
-
-def _modal_api_key() -> str:
-    tid = (os.environ.get("MODAL_TOKEN_ID") or "").strip()
-    secret = (os.environ.get("MODAL_TOKEN_SECRET") or "").strip()
-    if not tid or not secret:
+def _client(cfg: dict[str, str], *, kind: str) -> OpenAI:
+    if not cfg.get("api_key"):
         raise RuntimeError(
-            "MODAL_TOKEN_ID and MODAL_TOKEN_SECRET required in repo root .env for vision CAPTCHA"
+            f"{kind} provider misconfigured: set META_API_KEY, MODEL_API_KEY, "
+            "or BASETEN_API_KEY in the repo root .env"
+            + (
+                " (or META_VISION_API_KEY for vision)"
+                if kind == "vision"
+                else ""
+            )
         )
-    return f"{tid}.{secret}"
-
-
-def get_client() -> OpenAI:
-    return OpenAI(api_key=_api_key(), base_url=BASETEN_BASE_URL)
-
-
-def get_modal_client() -> OpenAI:
-    return OpenAI(api_key=_modal_api_key(), base_url=MODAL_BASE_URL)
+    if not cfg.get("base_url"):
+        raise RuntimeError(f"{kind} provider misconfigured: base URL is empty")
+    if not cfg.get("model"):
+        raise RuntimeError(f"{kind} provider misconfigured: model name is empty")
+    _reject_non_meta_target(cfg["model"], cfg["base_url"], kind=kind)
+    return OpenAI(api_key=cfg["api_key"], base_url=cfg["base_url"])
 
 
 def _message_text(msg: Any) -> str:
@@ -124,27 +266,31 @@ def _message_text(msg: Any) -> str:
 
 
 def complete(
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     *,
     max_tokens: int = 1200,
     temperature: float = 0.2,
     model: str | None = None,
     provider: str | None = None,
 ) -> str:
+    cfg = text_settings()
     resolved = resolve_model(model)
-    mid = resolved["id"]
-    prov = (provider or resolved["provider"] or "baseten").lower()
-    client = get_modal_client() if prov == "modal" else get_client()
+    # Provider is a label (meta, baseten, llama-api, …). The host is the base URL.
+    # A mismatched label must not switch the request onto another vendor.
+    _ = provider or resolved["provider"]
+    client = _client(cfg, kind="text")
     kwargs: dict[str, Any] = {
-        "model": mid,
+        "model": resolved["id"],
         "messages": messages,
         "stream": False,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
+        "max_tokens": _output_tokens(max_tokens, cfg["base_url"]),
     }
-    if prov == "modal":
-        # Modal DeepSeek endpoint accepts OpenAI-compatible chat; keep extras light.
-        pass
+    # Send temperature only. Meta Model API rejects temperature together with top_p.
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    extra = _meta_extra(cfg["base_url"])
+    if extra:
+        kwargs["extra_body"] = extra
     response = client.chat.completions.create(**kwargs)
     return _message_text(response.choices[0].message)
 
@@ -471,16 +617,42 @@ Draft:
     }
 
 
+def _vision_config_error(cfg: dict[str, str]) -> str | None:
+    try:
+        if not cfg.get("api_key"):
+            return (
+                "vision provider misconfigured: set META_VISION_API_KEY, "
+                "META_API_KEY, MODEL_API_KEY, or BASETEN_API_KEY in the repo root .env"
+            )
+        if not cfg.get("base_url"):
+            return "vision provider misconfigured: META_VISION_BASE_URL / META_BASE_URL is empty"
+        if not cfg.get("model"):
+            return "vision provider misconfigured: META_VISION_MODEL / META_MODEL is empty"
+        _reject_non_meta_target(cfg["model"], cfg["base_url"], kind="vision")
+    except RuntimeError as e:
+        return str(e)
+    return None
+
+
 def verify_drawing(image_data_url: str, target: str) -> dict[str, Any]:
-    """Vision check via Modal DeepSeek: does the sketch show the target?"""
-    # Refresh secrets from .env on each verify (dev-friendly)
-    load_dotenv(ROOT / ".env", override=True)
+    """Vision check: does the sketch show the target?
+
+    Uses only the configured Meta vision model. A missing key, a DeepSeek model
+    id, or an upstream error is returned to the caller. There is no fallback.
+    """
+    cfg = vision_settings()
+    model = cfg["model"]
+    provider = cfg["provider"]
     target = (target or "").strip().upper()
     raw = (image_data_url or "").strip()
     if not raw.startswith("data:image/"):
-        return {"ok": False, "reason": "expected a drawing image", "model": VISION_MODEL}
+        return {"ok": False, "reason": "expected a drawing image", "model": model, "provider": provider}
     if len(raw) > 1_800_000:
-        return {"ok": False, "reason": "drawing too large", "model": VISION_MODEL}
+        return {"ok": False, "reason": "drawing too large", "model": model, "provider": provider}
+
+    problem = _vision_config_error(cfg)
+    if problem:
+        return {"ok": False, "reason": problem, "model": model, "provider": provider}
 
     prompt = f"""CAPTCHA check. Target to draw: "{target}"
 
@@ -500,6 +672,7 @@ or
 or
 {{"match":true,"human_like":false,"read_as":"{target}","reason":"typed_or_machine"}}
 """
+    # Images are only honored on user messages (Meta Model API returns 400 otherwise).
     messages = [
         {
             "role": "system",
@@ -514,38 +687,27 @@ or
         },
     ]
 
-    used_model = VISION_MODEL
-    text = ""
     try:
-        client = get_modal_client()
-        response = client.chat.completions.create(
-            model=VISION_MODEL,
-            messages=messages,
-            stream=False,
-            max_tokens=2048,
-            temperature=0.1,
-            top_p=0.9,
-            extra_body={"reasoning_effort": "high"},
-        )
+        client = _client(cfg, kind="vision")
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "max_tokens": _output_tokens(2048, cfg["base_url"]),
+            "temperature": 0.1,
+        }
+        extra = _meta_extra(cfg["base_url"])
+        if extra:
+            kwargs["extra_body"] = extra
+        response = client.chat.completions.create(**kwargs)
         text = _message_text(response.choices[0].message)
-    except Exception as modal_err:
-        # Fallback: Baseten Muse Spark Open (multimodal) if Modal is down/unconfigured
-        try:
-            used_model = DEFAULT_MODEL
-            response = get_client().chat.completions.create(
-                model=DEFAULT_MODEL,
-                messages=messages,
-                stream=False,
-                max_tokens=2200,
-                temperature=0.1,
-            )
-            text = _message_text(response.choices[0].message)
-        except Exception as baseten_err:
-            return {
-                "ok": False,
-                "reason": f"vision unavailable (modal: {modal_err}; baseten: {baseten_err})",
-                "model": VISION_MODEL,
-            }
+    except Exception as err:
+        return {
+            "ok": False,
+            "reason": f"vision provider error ({provider} {model}): {err}",
+            "model": model,
+            "provider": provider,
+        }
 
     try:
         data = extract_json(text)
@@ -562,10 +724,16 @@ or
                 "ok": False,
                 "reason": "vision model returned unreadable result",
                 "raw": text[:200],
-                "model": used_model,
+                "model": model,
+                "provider": provider,
             }
     if not isinstance(data, dict):
-        return {"ok": False, "reason": "invalid vision response", "model": used_model}
+        return {
+            "ok": False,
+            "reason": "invalid vision response",
+            "model": model,
+            "provider": provider,
+        }
 
     match = bool(data.get("match"))
     # Default False: missing human_like must not accidentally pass bots.
@@ -584,5 +752,6 @@ or
         "human_like": human_like,
         "read_as": read_as,
         "reason": reason,
-        "model": used_model,
+        "model": model,
+        "provider": provider,
     }
