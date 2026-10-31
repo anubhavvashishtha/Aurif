@@ -12,10 +12,11 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+import config
 from endpoints_default import DEFAULT_ENDPOINTS, ensure_endpoint_shape
 
-DATA_DIR = Path(__file__).resolve().parent / "data"
-STORE_PATH = DATA_DIR / "store.json"
+STORE_PATH = config.store_path()
+DATA_DIR = STORE_PATH.parent
 _lock = threading.RLock()
 
 
@@ -60,8 +61,8 @@ def _seed(data: dict[str, Any]) -> dict[str, Any]:
         "id": site_id,
         "owner_id": owner_id,
         "name": "Northline Goods",
-        "url": "http://127.0.0.1:5173",
-        "site_key": secrets.token_urlsafe(18),
+        "url": config.customer_site_url(),
+        "site_key": config.pinned_site_key() or secrets.token_urlsafe(18),
         "agent_welcome": "You are browsing Northline Goods via permissioned AI access.",
         "blocked_agents": ["blocked"],
         "block_anonymous_agents": True,
@@ -109,7 +110,7 @@ def _migrate(data: dict[str, Any]) -> bool:
             site["endpoints"] = ensure_endpoint_shape(eps)
             site["name"] = site.get("name") or "Northline Goods"
             if "127.0.0.1:8787" in (site.get("url") or ""):
-                site["url"] = "http://127.0.0.1:5173"
+                site["url"] = config.customer_site_url()
             changed = True
     return changed
 

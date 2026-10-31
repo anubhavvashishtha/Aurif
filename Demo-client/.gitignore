@@ -12,6 +12,7 @@ dist
 dist-ssr
 build
 .output
+.vercel
 .vinxi
 .tanstack/**
 .nitro
