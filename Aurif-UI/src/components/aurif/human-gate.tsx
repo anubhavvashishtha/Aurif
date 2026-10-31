@@ -9,6 +9,7 @@ import {
   verifyHumanDrawing,
   type AgentAccessHint,
   type Challenge,
+  type VisionModelCard,
 } from "@/lib/human-gate";
 
 const API_BASE = import.meta.env.VITE_AURIF_API ?? "http://127.0.0.1:8787";
@@ -36,6 +37,7 @@ export function HumanGate({ embed = false }: { embed?: boolean }) {
   const [hasInk, setHasInk] = useState(false);
   const [required, setRequired] = useState(true);
   const [agentModal, setAgentModal] = useState<AgentAccessHint | null>(null);
+  const [visionModel, setVisionModel] = useState<VisionModelCard | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const drawing = useRef(false);
@@ -54,6 +56,7 @@ export function HumanGate({ embed = false }: { embed?: boolean }) {
         const gate = await fetchGate();
         if (cancelled) return;
         setSiteName(gate.site_name || "this site");
+        setVisionModel(gate.models?.vision || null);
         if (!gate.require_human_captcha) {
           setRequired(false);
           setReady(true);
@@ -232,6 +235,11 @@ export function HumanGate({ embed = false }: { embed?: boolean }) {
           The shop stays closed until a person draws the code. Aurif sends the sketch to a vision model.
           Agents do not solve this screen — they use the Aurif protocol.
         </p>
+        {visionModel?.powered_by && (
+          <p className="mt-2 font-mono text-[10px] uppercase tracking-[0.18em] text-white/45">
+            Powered by {visionModel.powered_by}
+          </p>
+        )}
 
         {challenge?.prompt && (
           <div className="mt-5 space-y-3">

@@ -34,6 +34,11 @@ ENV_KEYS = (
     "META_VISION_MODEL",
     "META_VISION_PROVIDER",
     "META_REASONING_EFFORT",
+    "VISION_MODEL",
+    "VISION_BASE_URL",
+    "VISION_API_KEY",
+    "VISION_PROVIDER",
+    "VISION_TIMEOUT_SECONDS",
     "BASETEN_API_KEY",
     "BASETEN_MODEL",
     "MODAL_VISION_MODEL",
@@ -310,6 +315,7 @@ class MuseBrowseRepros(unittest.TestCase):
         os.environ["META_BASE_URL"] = "https://api.meta.ai/v1"
         os.environ["META_MODEL"] = "muse-spark-1.3"
         os.environ["META_PROVIDER"] = "meta"
+        os.environ["BASETEN_API_KEY"] = "test-baseten-key"
 
         cls._tmp = tempfile.TemporaryDirectory()
         cls._store = patch.object(store, "STORE_PATH", Path(cls._tmp.name) / "store.json")

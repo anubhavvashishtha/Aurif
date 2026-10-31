@@ -40,6 +40,7 @@ function AgentDashboard() {
   const [models, setModels] = useState<AgentModel[]>([]);
   const [modelId, setModelId] = useState("");
   const [modelWarning, setModelWarning] = useState<string | null>(null);
+  const [visionCredit, setVisionCredit] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([
@@ -62,6 +63,13 @@ function AgentDashboard() {
         const current = res.current || list.find((m) => m.default) || list[0];
         if (current?.id) setModelId(current.id);
         const health = res.health;
+        const vision = health?.vision;
+        if (vision?.model) {
+          const name = vision.powered_by || vision.label || vision.model;
+          setVisionCredit(`Powered by ${name}`);
+        } else {
+          setVisionCredit(null);
+        }
         if (health?.degraded) {
           const detail = [health.text?.last_error, health.vision?.last_error].filter(Boolean).join("; ");
           setModelWarning(
@@ -162,8 +170,11 @@ function AgentDashboard() {
               </Select>
             </div>
             <p className="mt-1 text-xs text-muted-foreground">
-              {selected ? `Using ${selected.label} via ${selected.provider}` : "Server default model"}
+              {selected ? `Text · ${selected.label} via ${selected.provider}` : "Text · server default model"}
             </p>
+            {visionCredit && (
+              <p className="mt-1 text-xs text-muted-foreground">CAPTCHA vision · {visionCredit}</p>
+            )}
           </div>
           <div className="min-w-0">
             <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">Site key</p>

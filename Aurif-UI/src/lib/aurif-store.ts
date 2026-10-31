@@ -20,6 +20,8 @@ export interface MetaModelRef {
   id?: string;
   provider?: string;
   label?: string;
+  family?: string;
+  powered_by?: string;
 }
 
 export interface PurposeRisk {
@@ -120,7 +122,13 @@ function mapModelRef(model: unknown): MetaModelRef | undefined {
   if (typeof model === "string") return { id: model, label: model };
   if (typeof model === "object") {
     const row = model as MetaModelRef;
-    return { id: row.id, provider: row.provider, label: row.label || row.id };
+    return {
+      id: row.id,
+      provider: row.provider,
+      label: row.label || row.id,
+      family: row.family,
+      powered_by: row.powered_by,
+    };
   }
   return undefined;
 }
@@ -506,6 +514,9 @@ export type ModelHealthSide = {
   key_configured?: boolean;
   provider?: string;
   model?: string;
+  label?: string;
+  family?: string;
+  powered_by?: string;
 };
 
 export async function fetchAgentModels() {

@@ -1271,6 +1271,7 @@ def api_ai_models():
             "ok": True,
             "models": models,
             "current": current,
+            "vision": muse_client.vision_model_card(),
             "providers": muse_client.api_providers(),
             "health": muse_client.health_snapshot(),
         }
@@ -1380,6 +1381,10 @@ def api_public_gate():
             "api_base": config.api_public_url(),
             "health": "/api/health",
             "model_degraded": bool(muse_client.health_snapshot()["degraded"]),
+            "models": {
+                "text": muse_client.model_card(),
+                "vision": muse_client.vision_model_card(),
+            },
         }
     )
 
@@ -1441,6 +1446,10 @@ def api_human_verify():
                 "verdict": {
                     "read_as": verdict.get("read_as"),
                     "model": verdict.get("model"),
+                    "provider": verdict.get("provider"),
+                    "label": verdict.get("label"),
+                    "family": verdict.get("family"),
+                    "powered_by": verdict.get("powered_by"),
                 },
             }
         )
@@ -1552,6 +1561,10 @@ def api_human_verify():
                     "match": verdict.get("match"),
                     "human_like": verdict.get("human_like"),
                     "model": verdict.get("model"),
+                    "provider": verdict.get("provider"),
+                    "label": verdict.get("label"),
+                    "family": verdict.get("family"),
+                    "powered_by": verdict.get("powered_by"),
                 },
             }
         ), 403
