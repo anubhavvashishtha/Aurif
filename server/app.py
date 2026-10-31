@@ -25,12 +25,13 @@ from human_gate import COOKIE_NAME as HUMAN_COOKIE
 from human_gate import (
     HUMAN_TTL,
     consume_challenge,
-    human_session_valid,
+    human_access_granted,
     issue_challenge,
     issue_human_token,
     peek_challenge,
+    register_failed_attempt,
 )
-from redact import hidden_field_keys, redact_response
+from redact import hidden_field_keys, price_link_fields, redact_response
 
 PROTOCOL = "aurif-1"
 DEFAULT_SITE_ID = "demo-shop"
@@ -149,7 +150,40 @@ def deny_page(path: str, reason: str) -> dict[str, Any]:
     return {"path": path, "title": site["name"], "summary": reason, "blocked": True, "elements": []}
 
 
+def _agent_label(session: dict[str, Any] | None = None) -> str:
+    if session and session.get("agent_id"):
+        return str(session["agent_id"])
+    return (request.headers.get("X-Aurif-Agent") or "agent").strip() or "agent"
+
+
+def log_denial(
+    site: dict[str, Any],
+    *,
+    kind: str,
+    reason: str,
+    path: str | None = None,
+    action_id: str | None = None,
+    asked: dict[str, Any] | None = None,
+    session: dict[str, Any] | None = None,
+) -> None:
+    store.log_activity(
+        site["id"],
+        kind=kind,
+        agent_id=_agent_label(session),
+        path=path,
+        action_id=action_id,
+        session_token=(session or {}).get("token"),
+        detail={"accepted": False, "reason": reason, "asked": asked or {}, "navigated": []},
+    )
+
+
+def _session_denial_reason(err: tuple[Any, int]) -> str:
+    status = err[1] if len(err) > 1 else 401
+    return "no_session" if status == 401 else "scope_not_granted"
+
+
 def apply_page_redaction(site: dict[str, Any], path: str, snap: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
+    path = store.canonical_ai_path(path)
     ep = store.find_endpoint(site, path=path)
     if not ep:
         return snap
@@ -170,11 +204,10 @@ def apply_page_redaction(site: dict[str, Any], path: str, snap: dict[str, Any], 
 
 def page_snapshot(path: str, session: dict[str, Any]) -> dict[str, Any]:
     site = site_record()
-    path = path or "/"
-    if path != "/" and path.endswith("/"):
-        path = path.rstrip("/")
-
-    if not store.endpoint_allowed(site, path=path):
+    path, decision = store.page_decision(site, path)
+    if decision == "unmapped":
+        return deny_page(path, "No AI surface mapped for this path.")
+    if decision != "allow":
         return deny_page(path, "This page endpoint is blocked for AI agents by the site owner.")
 
     cart = cart_by_session.setdefault(session["token"], [])
@@ -189,8 +222,7 @@ def page_snapshot(path: str, session: dict[str, Any]) -> dict[str, Any]:
             out.append(el)
         return out
 
-    if path in ("/", "/index.html"):
-        path = "/"
+    if path == "/":
         return {
             "path": "/",
             "title": site["name"],
@@ -252,8 +284,8 @@ def page_snapshot(path: str, session: dict[str, Any]) -> dict[str, Any]:
             "meta": {"products": catalog},
         }
 
-    if path.startswith("/products/"):
-        slug = path.split("/")[-1]
+    slug = store.product_slug(path)
+    if slug is not None:
         product = PRODUCTS.get(slug)
         if not product:
             return {
@@ -317,14 +349,7 @@ def page_snapshot(path: str, session: dict[str, Any]) -> dict[str, Any]:
             },
         }
 
-    return {
-        "path": path,
-        "title": site["name"],
-        "summary": "No AI surface mapped for this path.",
-        "elements": filter_elements(
-            [{"action_id": "nav.home", "type": "link", "label": "Home", "href": "/", "scopes": ["view"]}]
-        ),
-    }
+    return deny_page(path, "No AI surface mapped for this path.")
 
 
 def run_action(session: dict[str, Any], action_id: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -352,9 +377,19 @@ def run_action(session: dict[str, Any], action_id: str, args: dict[str, Any]) ->
         if slug not in PRODUCTS:
             raise KeyError(action_id)
         cart.append(slug)
+        pub = public_product(PRODUCTS[slug])
         return {
             "cart": list(cart),
-            "added": public_product(PRODUCTS[slug]),
+            "added": {
+                "slug": pub["slug"],
+                "name": pub["name"],
+                "summary": pub.get("summary"),
+                "price": pub.get("price"),
+                "compare_at": pub.get("compare_at"),
+                "discount": pub.get("discount"),
+                "rating": pub.get("rating"),
+                "sku": pub.get("sku"),
+            },
             "page": page_snapshot("/cart", session),
         }
 
@@ -543,28 +578,51 @@ def handshake():
 @app.get("/ai/page")
 def ai_page():
     site = site_record()
-    path = request.args.get("path") or "/"
-    if path != "/" and path.endswith("/"):
-        path = path.rstrip("/")
-    asked = {"method": "GET", "path": "/ai/page", "query": {"path": path}}
+    raw_path = request.args.get("path") if request.args.get("path") is not None else "/"
+    path = store.canonical_ai_path(raw_path)
+    asked = {"method": "GET", "path": "/ai/page", "query": {"path": raw_path}}
     denied = reject_without_site_key(site, kind="page_blocked", asked=asked, path=path)
     if denied:
         return denied
     session, err = require_agent_session("view")
     if err:
-        return err
-    if not store.endpoint_allowed(site, path=path):
-        store.log_activity(
-            site["id"],
+        log_denial(
+            site,
             kind="page_blocked",
-            agent_id=session["agent_id"],
+            reason=_session_denial_reason(err),
             path=path,
-            session_token=session["token"],
-            detail={"accepted": False, "reason": "endpoint closed", "asked": asked, "navigated": []},
+            asked=asked,
         )
-        return jsonify(deny_page(path, "Endpoint blocked for AI agents.")), 403
+        return err
+    path, decision = store.page_decision(site, path)
+    if decision != "allow":
+        reason = "unmapped_path" if decision == "unmapped" else "endpoint closed"
+        message = (
+            "No AI surface mapped for this path."
+            if decision == "unmapped"
+            else "Endpoint blocked for AI agents."
+        )
+        log_denial(
+            site,
+            kind="page_blocked",
+            reason=reason,
+            path=path,
+            asked=asked,
+            session=session,
+        )
+        return jsonify(deny_page(path, message)), 403
 
     snap = page_snapshot(path, session)
+    if snap.get("blocked"):
+        log_denial(
+            site,
+            kind="page_blocked",
+            reason="endpoint closed",
+            path=path,
+            asked=asked,
+            session=session,
+        )
+        return jsonify(snap), 403
     store.log_activity(
         site["id"],
         kind="page",
@@ -594,6 +652,13 @@ def ai_actions():
         return denied
     session, err = require_agent_session("view")
     if err:
+        log_denial(
+            site,
+            kind="action_blocked",
+            reason=_session_denial_reason(err),
+            action_id=action_id or None,
+            asked=asked,
+        )
         return err
     if not action_id:
         return jsonify({"ok": False, "error": "action_id required"}), 400
@@ -621,14 +686,55 @@ def ai_actions():
 
     needs_act = action_id.startswith("product.add:") or action_id in ("cart.clear", "cart.checkout")
     if needs_act and "act" not in session["scopes"]:
+        log_denial(
+            site,
+            kind="action_blocked",
+            reason="scope_not_granted",
+            action_id=action_id,
+            asked=asked,
+            session=session,
+        )
         return jsonify({"ok": False, "error": "scope 'act' not granted"}), 403
 
+    before_cart = list(cart_by_session.get(session["token"], []))
     try:
         result = run_action(session, action_id, args)
     except KeyError:
+        log_denial(
+            site,
+            kind="action_blocked",
+            reason="unknown_action",
+            action_id=action_id,
+            asked=asked,
+            session=session,
+        )
         return jsonify({"ok": False, "error": "unknown action"}), 404
     except PermissionError:
+        log_denial(
+            site,
+            kind="action_blocked",
+            reason="scope_not_granted",
+            action_id=action_id,
+            asked=asked,
+            session=session,
+        )
         return jsonify({"ok": False, "error": "scope 'act' not granted"}), 403
+
+    page = result.get("page") if isinstance(result, dict) else None
+    if isinstance(page, dict) and page.get("blocked"):
+        cart_by_session[session["token"]] = before_cart
+        target = str(page.get("path") or "")
+        _, page_state = store.page_decision(site, target)
+        log_denial(
+            site,
+            kind="page_blocked",
+            reason="unmapped_path" if page_state == "unmapped" else "endpoint closed",
+            path=target or None,
+            action_id=action_id,
+            asked=asked,
+            session=session,
+        )
+        return jsonify({"ok": False, "error": "Endpoint blocked for AI agents.", "page": page}), 403
 
     store.log_activity(
         site["id"],
@@ -648,13 +754,19 @@ def ai_actions():
     page = result.pop("page", None)
     if page is not None and isinstance(page, dict) and page.get("path"):
         page = apply_page_redaction(site, page["path"], page, session)
-    if ep:
-        result = redact_response({"ok": True, "summary": "Action completed.", "result": result}, ep.get("response_fields") or [])
-        body = result if isinstance(result, dict) else {"ok": True, "result": result}
-    else:
-        body = {"ok": True, "result": result}
+    action_fields = (ep or {}).get("response_fields") or []
+    linked = price_link_fields(site.get("endpoints") or [])
+    body = redact_response(
+        {"ok": True, "summary": "Action completed.", "result": result},
+        action_fields,
+        linked,
+    )
+    if not isinstance(body, dict):
+        body = {"ok": True, "result": body}
     if page is not None:
         body["page"] = page
+        if linked:
+            body = redact_response(body, [], linked)
     return jsonify(body)
 
 
@@ -669,11 +781,19 @@ def ai_audit():
     )
     if denied:
         return denied
-    session = get_agent_session()
+    session, err = require_agent_session("view")
+    if err:
+        log_denial(
+            site,
+            kind="page_blocked",
+            reason=_session_denial_reason(err),
+            path="/ai/audit",
+            asked={"method": "GET", "path": "/ai/audit"},
+        )
+        return err
     events = store.activity_for_site(site["id"], limit=100)
-    if session:
-        prefix = session["token"][:8] + "…"
-        events = [e for e in events if e.get("session") == prefix]
+    prefix = session["token"][:8] + "…"
+    events = [e for e in events if e.get("session") == prefix]
     return jsonify({"ok": True, "events": events})
 
 
@@ -1239,7 +1359,7 @@ def api_human_verify():
     site = site_record()
     data = request.get_json(silent=True) or {}
     if not site.get("require_human_captcha", True):
-        token = "bypass"
+        token = issue_human_token()
         resp = jsonify({"ok": True, "human_token": token, "expires_in": HUMAN_TTL})
         resp.set_cookie(HUMAN_COOKIE, token, max_age=HUMAN_TTL, httponly=False, samesite="Lax")
         return resp
@@ -1269,12 +1389,15 @@ def api_human_verify():
         ), 502
 
     if not verdict.get("ok"):
-        # Keep challenge so they can redraw once; only consume on success.
-        # Rejected drawings (often agents) get directed to the credentialed API path.
+        # One redraw, then the challenge is consumed. Wrong drawings are sent to the API path.
+        state = register_failed_attempt(challenge_id)
+        error = verdict.get("reason") or "drawing did not match"
+        if state == "exhausted":
+            error = "too many attempts — refresh and try again"
         return jsonify(
             {
                 "ok": False,
-                "error": verdict.get("reason") or "drawing did not match",
+                "error": error,
                 "agent_access": {
                     "title": "Use the API with a site key",
                     "message": (
@@ -1328,7 +1451,7 @@ def api_human_check():
     token = request.headers.get("X-Aurif-Human") or request.cookies.get(HUMAN_COOKIE)
     site = site_record()
     required = bool(site.get("require_human_captcha", True))
-    ok = (not required) or human_session_valid(token) or token == "bypass"
+    ok = human_access_granted(token, required=required)
     return jsonify({"ok": ok, "required": required})
 
 
@@ -1340,7 +1463,7 @@ def api_products():
     site = site_record()
     if site.get("require_human_captcha", True):
         token = request.headers.get("X-Aurif-Human") or request.cookies.get(HUMAN_COOKIE)
-        if not human_session_valid(token) and token != "bypass":
+        if not human_access_granted(token, required=True):
             # Browser without CAPTCHA: no catalog JSON
             if not looks_like_anonymous_agent(request.headers):
                 return jsonify(

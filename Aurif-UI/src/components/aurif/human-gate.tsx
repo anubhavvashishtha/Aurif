@@ -57,7 +57,17 @@ export function HumanGate({ embed = false }: { embed?: boolean }) {
         if (!gate.require_human_captcha) {
           setRequired(false);
           setReady(true);
-          if (embed) release("bypass");
+          if (embed) {
+            const issued = await fetch(`${API_BASE}/api/public/human-verify`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              credentials: "include",
+              body: "{}",
+            });
+            if (cancelled) return;
+            const data = (await issued.json()) as { human_token?: string };
+            if (data.human_token) release(data.human_token);
+          }
           return;
         }
         const ok = await checkHuman();
@@ -227,7 +237,13 @@ export function HumanGate({ embed = false }: { embed?: boolean }) {
           <div className="mt-5 space-y-3">
             <div className="border border-white/15 bg-white px-4 py-3 text-center text-black">
               <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-black/50">Draw this</p>
-              <p className="mt-1 font-mono text-4xl font-medium tracking-[0.22em]">{challenge.target}</p>
+              {challenge.image ? (
+                <img
+                  src={challenge.image}
+                  alt="Characters to draw"
+                  className="mx-auto mt-2 h-16 max-w-full object-contain"
+                />
+              ) : null}
               <p className="mt-2 text-sm text-black/70">{challenge.prompt}</p>
             </div>
 

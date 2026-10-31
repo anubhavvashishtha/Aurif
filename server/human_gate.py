@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import base64
+import io
+import os
 import secrets
 import time
 from typing import Any
 
-# challenge_id -> { target, expires_at, kind }
+# challenge_id -> { target, expires_at, kind, attempts }
 _challenges: dict[str, dict[str, Any]] = {}
 # token -> expires_at
 _human_sessions: dict[str, float] = {}
@@ -14,6 +17,11 @@ _human_sessions: dict[str, float] = {}
 CHALLENGE_TTL = 10 * 60
 HUMAN_TTL = 12 * 60 * 60
 COOKIE_NAME = "aurif_human"
+# One submit plus the single redraw the failure copy promises.
+MAX_CHALLENGE_ATTEMPTS = 2
+# Demo shortcut. Off unless this flag is explicitly truthy.
+BYPASS_ENV = "AURIF_ALLOW_HUMAN_BYPASS"
+_BYPASS_TRUTHY = {"1", "true", "yes", "on"}
 
 # Avoid ambiguous lookalikes in the prompt (0/O, 1/I/l)
 _LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"
@@ -34,33 +42,91 @@ def _random_target() -> tuple[str, str]:
     return target, "code"
 
 
+def _challenge_image(target: str) -> str:
+    """Distorted PNG of the answer. The plaintext target never leaves the server."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    rng = secrets.SystemRandom()
+    width = 36 + 42 * max(1, len(target))
+    height = 84
+    img = Image.new("RGB", (width, height), (250, 250, 248))
+    draw = ImageDraw.Draw(img)
+    for _ in range(8):
+        draw.line(
+            [
+                (rng.randrange(width), rng.randrange(height)),
+                (rng.randrange(width), rng.randrange(height)),
+            ],
+            fill=(170 + rng.randrange(40), 170, 160),
+            width=1,
+        )
+    font = ImageFont.load_default()
+    glyph = Image.new("RGB", (max(8, len(target) * 14), 22), (250, 250, 248))
+    ImageDraw.Draw(glyph).text((1, 1), target, fill=(25, 25, 25), font=font)
+    glyph = glyph.resize((max(24, len(target) * 36), 52), Image.Resampling.NEAREST)
+    img.paste(glyph, (10 + rng.randrange(6), 12 + rng.randrange(8)))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
 def issue_challenge() -> dict[str, Any]:
     target, kind = _random_target()
     challenge_id = secrets.token_urlsafe(16)
     _challenges[challenge_id] = {
         "target": target,
         "kind": kind,
+        "attempts": 0,
         "expires_at": time.time() + CHALLENGE_TTL,
     }
     _prune()
-    if kind == "letter":
-        prompt = f'Draw the letter "{target}" by hand on the pad below.'
-    elif kind == "digit":
-        prompt = f'Draw the number "{target}" by hand on the pad below.'
-    else:
-        prompt = f'Draw these characters by hand: {target}'
+    # Prompt stays generic. Humans read the image; agents must not get the answer.
     return {
         "challenge_id": challenge_id,
         "type": "draw",
         "kind": kind,
-        "target": target,
-        "prompt": prompt,
+        "prompt": "Draw the characters shown above by hand on the pad below.",
+        "image": _challenge_image(target),
         "hint": (
             "Sketch with your mouse or finger. Imperfect handwriting is fine. "
             "AI agents should use Aurif /ai/* instead of this storefront."
         ),
         "expires_in": CHALLENGE_TTL,
+        "attempts_remaining": MAX_CHALLENGE_ATTEMPTS,
     }
+
+
+def register_failed_attempt(challenge_id: str) -> str:
+    """Count a wrong drawing. Returns ``retry`` or ``exhausted``.
+
+    The challenge stays valid for one redraw, then it is consumed.
+    """
+    _prune()
+    cid = (challenge_id or "").strip()
+    row = _challenges.get(cid)
+    if not row or row["expires_at"] < time.time():
+        return "exhausted"
+    row["attempts"] = int(row.get("attempts") or 0) + 1
+    if row["attempts"] >= MAX_CHALLENGE_ATTEMPTS:
+        _challenges.pop(cid, None)
+        return "exhausted"
+    return "retry"
+
+
+def bypass_enabled() -> bool:
+    """Literal ``bypass`` token. Disabled unless AURIF_ALLOW_HUMAN_BYPASS is set."""
+    return os.environ.get(BYPASS_ENV, "").strip().lower() in _BYPASS_TRUTHY
+
+
+def human_access_granted(token: str | None, *, required: bool) -> bool:
+    """Whether this caller may pass the human storefront gate."""
+    if not required:
+        return True
+    if human_session_valid(token):
+        return True
+    if bypass_enabled() and (token or "") == "bypass":
+        return True
+    return False
 
 
 def peek_challenge(challenge_id: str) -> dict[str, Any] | None:

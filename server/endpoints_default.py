@@ -92,6 +92,10 @@ SHOP_KEYS: list[tuple[str, str]] = [
     ("meta.products[].rating", "number"),
     ("meta.products[].href", "string"),
     ("meta.products[].slug", "string"),
+    ("elements[].meta.price", "number"),
+    ("elements[].meta.compare_at", "number"),
+    ("elements[].meta.discount", "number"),
+    ("elements[].meta.rating", "number"),
 ]
 
 PRODUCT_KEYS: list[tuple[str, str]] = [
