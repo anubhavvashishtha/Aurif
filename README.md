@@ -175,7 +175,7 @@ curl -s "http://127.0.0.1:8787/ai/page?path=/products" \
 
 ## Models (hackathon)
 
-Product AI runs in **server + Aurif-UI** (not Demo-client). Text and CAPTCHA vision both call a Meta model. With `MODEL_API_KEY` or `META_API_KEY`, that is **Muse Spark 1.3** on the Meta Model API (`https://api.meta.ai/v1`). With only `BASETEN_API_KEY`, text and vision stay on **Muse Spark Open** (`BASETEN_MODEL`, default `meta-models/muse-spark-open-1026`) at `https://inference.baseten.co/v1`. Startup prints which provider and model are active. A DeepSeek model id is refused. There is no Modal fallback.
+Product AI runs in **server + Aurif-UI** (not Demo-client). Text and CAPTCHA vision both call a Meta model. With `MODEL_API_KEY` or `META_API_KEY`, that is **Muse Spark 1.3** on the Meta Model API (`https://api.meta.ai/v1`). With only `BASETEN_API_KEY`, text and vision stay on **Muse Spark Open** (`BASETEN_MODEL`, default `meta-models/muse-spark-open-1026`) at `https://inference.baseten.co/v1`. Startup prints which provider and model are active. Calls time out (`META_TIMEOUT_SECONDS`, default 8s; vision 15s) and do not retry a hung read. If the model is down, handshake risk uses keyword rules (shopping purposes can still get `act`; vague or scraping purposes stay view-only) and the human gate accepts a typed code or a non-blank sketch for the storefront only. `GET /api/health` reports the failure. A DeepSeek model id is refused. There is no Modal fallback.
 
 | Feature | Where | Model |
 |---------|--------|--------|

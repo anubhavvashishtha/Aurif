@@ -421,11 +421,24 @@ export type AgentModel = {
   default?: boolean;
 };
 
+export type ModelHealthSide = {
+  degraded?: boolean;
+  last_error?: string | null;
+  key_configured?: boolean;
+  provider?: string;
+  model?: string;
+};
+
 export async function fetchAgentModels() {
   return api<{
     ok: boolean;
     models: AgentModel[];
     current?: AgentModel;
+    health?: {
+      degraded?: boolean;
+      text?: ModelHealthSide;
+      vision?: ModelHealthSide;
+    };
   }>("/api/ai/models");
 }
 

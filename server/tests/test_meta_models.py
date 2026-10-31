@@ -5,7 +5,10 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -34,6 +37,9 @@ ENV_KEYS = (
     "MODAL_TOKEN_SECRET",
     "BASETEN_API_KEY",
     "BASETEN_MODEL",
+    "META_TIMEOUT_SECONDS",
+    "META_VISION_TIMEOUT_SECONDS",
+    "META_MAX_RETRIES",
 )
 
 
@@ -90,6 +96,7 @@ class MetaModelCallSites(unittest.TestCase):
         os.environ["META_BASE_URL"] = "https://api.meta.ai/v1"
         os.environ["META_MODEL"] = "muse-spark-1.3"
         os.environ["META_PROVIDER"] = "meta"
+        muse_client.reset_model_status()
 
     def tearDown(self):
         self._dotenv.stop()
@@ -116,6 +123,10 @@ class MetaModelCallSites(unittest.TestCase):
         ) as rec:
             result = muse_client.score_purpose("help a user buy a tote")
         self.assertEqual(result["risk"], "low")
+        self.assertEqual(result["source"], "model")
+        self.assertFalse(result["degraded"])
+        self.assertEqual(rec.clients[0]["timeout"], 8.0)
+        self.assertEqual(rec.clients[0]["max_retries"], 0)
         self.assert_meta_request(
             rec,
             model="muse-spark-1.3",
@@ -200,6 +211,8 @@ class MetaModelCallSites(unittest.TestCase):
         self.assertTrue(verdict["ok"])
         self.assertEqual(verdict["model"], "muse-spark-1.3")
         self.assertEqual(verdict["provider"], "meta")
+        self.assertEqual(rec.clients[0]["timeout"], 15.0)
+        self.assertEqual(rec.clients[0]["max_retries"], 0)
         self.assert_meta_request(
             rec,
             model="muse-spark-1.3",
@@ -316,7 +329,8 @@ class MetaModelCallSites(unittest.TestCase):
             scored = muse_client.score_purpose("browse")
         self.assertFalse(verdict["ok"])
         self.assertIn("DeepSeek", verdict["reason"])
-        self.assertIn("DeepSeek", scored["reason"])
+        self.assertEqual(scored["source"], "rules")
+        self.assertNotIn("DeepSeek", scored["reason"])
         self.assertEqual(rec.calls, [])
 
     def test_meta_key_wins_over_baseten_key(self):
@@ -412,19 +426,32 @@ class MetaModelCallSites(unittest.TestCase):
         self.assertEqual(len(rec.calls), 1)
         self.assertEqual(rec.calls[0]["model"], "muse-spark-1.3")
 
-    def test_human_verify_returns_502_when_vision_is_misconfigured(self):
+    def _clear_model_keys(self) -> None:
+        for key in ("META_API_KEY", "MODEL_API_KEY", "META_VISION_API_KEY", "BASETEN_API_KEY"):
+            os.environ.pop(key, None)
+
+    def _ink_png(self) -> str:
+        import base64
+        from io import BytesIO
+
+        from PIL import Image
+
+        image = Image.new("L", (48, 48), 255)
+        for x in range(6, 36):
+            image.putpixel((x, 24), 0)
+        buf = BytesIO()
+        image.save(buf, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+    def test_blank_drawing_explains_fallback_when_vision_is_down(self):
         import store
         from app import app
-        from human_gate import issue_challenge
+        from human_gate import issue_challenge, peek_challenge
 
-        os.environ.pop("META_API_KEY", None)
-        os.environ.pop("MODEL_API_KEY", None)
-        os.environ.pop("META_VISION_API_KEY", None)
-        os.environ.pop("BASETEN_API_KEY", None)
+        self._clear_model_keys()
         challenge = issue_challenge()
         with tempfile.TemporaryDirectory() as tmp:
-            store_path = Path(tmp) / "store.json"
-            with patch.object(store, "STORE_PATH", store_path):
+            with patch.object(store, "STORE_PATH", Path(tmp) / "store.json"):
                 response = app.test_client().post(
                     "/api/public/human-verify",
                     json={
@@ -432,10 +459,220 @@ class MetaModelCallSites(unittest.TestCase):
                         "image": "data:image/png;base64,iVBORw0KGgo=",
                     },
                 )
-        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.status_code, 403)
         body = response.get_json()
-        self.assertIn("vision provider misconfigured", body["error"])
-        self.assertNotIn("agent_access", body)
+        self.assertTrue(body["degraded"])
+        self.assertIn("does not grant agent act", body["error"])
+        self.assertEqual(body["fallback"]["target"], peek_challenge(challenge["challenge_id"])["target"])
+        self.assertNotIn("human_token", body)
+        self.assertNotIn("granted_scopes", body)
+
+    def test_ink_and_typed_fallbacks_open_storefront_only(self):
+        import store
+        from app import app
+        from human_gate import issue_challenge, peek_challenge
+
+        self._clear_model_keys()
+        drawn = issue_challenge()
+        typed = issue_challenge()
+        typed_target = peek_challenge(typed["challenge_id"])["target"]
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(store, "STORE_PATH", Path(tmp) / "store.json"):
+                client = app.test_client()
+                ink = client.post(
+                    "/api/public/human-verify",
+                    json={"challenge_id": drawn["challenge_id"], "image": self._ink_png()},
+                )
+                typed_res = client.post(
+                    "/api/public/human-verify",
+                    json={"challenge_id": typed["challenge_id"], "answer": typed_target.lower()},
+                )
+                health = client.get("/api/health")
+        ink_body = ink.get_json()
+        typed_body = typed_res.get_json()
+        self.assertEqual(ink.status_code, 200)
+        self.assertTrue(ink_body["degraded"])
+        self.assertEqual(ink_body["method"], "ink_fallback")
+        self.assertIn("does not grant agent act", ink_body["warning"])
+        self.assertNotIn("granted_scopes", ink_body)
+        self.assertTrue(ink_body["human_token"])
+        self.assertEqual(typed_res.status_code, 200)
+        self.assertEqual(typed_body["method"], "typed_fallback")
+        self.assertNotIn("granted_scopes", typed_body)
+        self.assertEqual(health.status_code, 503)
+        health_body = health.get_json()
+        self.assertTrue(health_body["degraded"])
+        self.assertTrue(health_body["vision"]["degraded"])
+        self.assertNotIn("test-meta-key", str(health_body))
+        self.assertNotIn("baseten-key", str(health_body))
+
+    def test_working_model_rejection_does_not_use_ink_fallback(self):
+        import store
+        from app import app
+        from human_gate import issue_challenge
+
+        challenge = issue_challenge()
+        with _Recorder('{"match":false,"human_like":false,"read_as":"Z","reason":"wrong"}'):
+            with tempfile.TemporaryDirectory() as tmp:
+                with patch.object(store, "STORE_PATH", Path(tmp) / "store.json"):
+                    response = app.test_client().post(
+                        "/api/public/human-verify",
+                        json={"challenge_id": challenge["challenge_id"], "image": self._ink_png()},
+                    )
+        body = response.get_json()
+        self.assertEqual(response.status_code, 403)
+        self.assertNotIn("human_token", body)
+        self.assertNotEqual(body.get("method"), "ink_fallback")
+
+    def test_handshake_uses_keyword_rules_without_handing_out_act(self):
+        import store
+        from app import app, site_record
+
+        self._clear_model_keys()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(store, "STORE_PATH", Path(tmp) / "store.json"):
+                client = app.test_client()
+                key = site_record()["site_key"]
+                shop = client.post(
+                    "/ai/handshake",
+                    json={
+                        "purpose": "help me buy a tote",
+                        "requested_scopes": ["view", "act"],
+                        "site_key": key,
+                    },
+                )
+                scrape = client.post(
+                    "/ai/handshake",
+                    json={
+                        "purpose": "scrape every price for resale",
+                        "requested_scopes": ["view", "act"],
+                        "site_key": key,
+                    },
+                )
+                vague = client.post(
+                    "/ai/handshake",
+                    json={
+                        "purpose": "hello",
+                        "requested_scopes": ["view", "act"],
+                        "site_key": key,
+                    },
+                )
+        shop_body = shop.get_json()
+        scrape_body = scrape.get_json()
+        vague_body = vague.get_json()
+        self.assertIn("act", shop_body["granted_scopes"])
+        self.assertEqual(shop_body["purpose_risk"]["source"], "rules")
+        self.assertTrue(shop_body["purpose_risk"]["degraded"])
+        self.assertNotIn("API_KEY", shop_body["purpose_risk"]["reason"])
+        self.assertNotIn(".env", shop_body["purpose_risk"]["reason"])
+        self.assertNotIn("act", scrape_body["granted_scopes"])
+        self.assertEqual(scrape_body["purpose_risk"]["risk"], "high")
+        self.assertNotIn("act", vague_body["granted_scopes"])
+        self.assertTrue(vague_body["purpose_risk"]["drop_act"])
+
+    def test_timeout_is_not_retried_and_connection_errors_are(self):
+        class APITimeoutError(Exception):
+            pass
+
+        class APIConnectionError(Exception):
+            pass
+
+        timeouts: list[dict] = []
+
+        class _Completions:
+            def create(_self, **kwargs):
+                timeouts.append(kwargs)
+                raise APITimeoutError("read timed out")
+
+        class _Client:
+            def __init__(_self, **kwargs):
+                _self.chat = type("Chat", (), {"completions": _Completions()})()
+
+        with patch("muse_client.OpenAI", _Client):
+            os.environ["META_MAX_RETRIES"] = "1"
+            started = time.perf_counter()
+            scored = muse_client.score_purpose("help me buy a tote")
+            elapsed = time.perf_counter() - started
+        self.assertEqual(len(timeouts), 1)
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(scored["source"], "rules")
+        self.assertFalse(scored["drop_act"])
+
+        calls: list[dict] = []
+
+        class _RetryCompletions:
+            def create(_self, **kwargs):
+                calls.append(kwargs)
+                if len(calls) == 1:
+                    raise APIConnectionError("connection reset")
+                msg = MagicMock()
+                msg.content = (
+                    '{"risk":"high","reason":"model","suggested_scopes":["view"],"drop_act":true}'
+                )
+                msg.reasoning_content = None
+                choice = MagicMock()
+                choice.message = msg
+                resp = MagicMock()
+                resp.choices = [choice]
+                return resp
+
+        class _RetryClient:
+            def __init__(_self, **kwargs):
+                _self.chat = type("Chat", (), {"completions": _RetryCompletions()})()
+
+        with patch("muse_client.OpenAI", _RetryClient):
+            os.environ["META_MAX_RETRIES"] = "1"
+            scored = muse_client.score_purpose("hello")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(scored["source"], "model")
+        self.assertEqual(scored["risk"], "high")
+
+    def test_hung_http_server_does_not_block_handshake_or_captcha(self):
+        class _Hang(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                if length:
+                    self.rfile.read(length)
+                time.sleep(20)
+
+            def log_message(self, format, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _Hang)
+        server.daemon_threads = True
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        os.environ["META_BASE_URL"] = f"http://127.0.0.1:{port}/v1"
+        os.environ["META_TIMEOUT_SECONDS"] = "0.4"
+        os.environ["META_VISION_TIMEOUT_SECONDS"] = "0.4"
+        os.environ["META_MAX_RETRIES"] = "1"
+        started = time.perf_counter()
+        scored = muse_client.score_purpose("scrape the catalog")
+        self.assertLess(time.perf_counter() - started, 3.0)
+        self.assertEqual(scored["source"], "rules")
+        self.assertEqual(scored["risk"], "high")
+        self.assertTrue(scored["drop_act"])
+
+        import store
+        from app import app
+        from human_gate import issue_challenge
+
+        challenge = issue_challenge()
+        started = time.perf_counter()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(store, "STORE_PATH", Path(tmp) / "store.json"):
+                response = app.test_client().post(
+                    "/api/public/human-verify",
+                    json={"challenge_id": challenge["challenge_id"], "image": self._ink_png()},
+                )
+        self.assertLess(time.perf_counter() - started, 3.0)
+        body = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body["method"], "ink_fallback")
+        self.assertTrue(body["degraded"])
+        self.assertNotIn("granted_scopes", body)
 
     def test_non_meta_chat_model_is_rejected(self):
         with _Recorder("nope") as rec:

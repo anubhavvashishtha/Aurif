@@ -6,7 +6,19 @@ Aurif calls a Meta model for every LLM feature.
 - If neither Meta key is set and `BASETEN_API_KEY` is set, text and vision both use Baseten **Muse Spark Open** (`BASETEN_MODEL`, default `meta-models/muse-spark-open-1026`) at `https://inference.baseten.co/v1`. The previous CAPTCHA path already sent drawing images to that model when Modal failed, so this keeps the current demo working.
 - `python app.py` prints the active text and vision provider, model, and base URL at startup (the API key is not printed).
 
-Vision does not fall back to a non-Meta vendor. A missing key, a DeepSeek model id, or an upstream error is returned as `vision provider misconfigured` / `vision provider error`. `MODAL_*` is not read.
+Vision does not fall back to a non-Meta vendor. `MODAL_*` is not read. A missing key, a timeout, or an upstream error is logged and shown on `GET /api/health` (HTTP 503 when degraded, no API key in the body). The same snapshot is on `GET /api/ai/models` as `health`, and the agent dashboard shows it.
+
+## Timeouts and outages
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `META_TIMEOUT_SECONDS` | `8` | Text call budget, in seconds (clamped to 0.2–60) |
+| `META_VISION_TIMEOUT_SECONDS` | `15` | Vision call budget. Falls back to `META_TIMEOUT_SECONDS` when unset |
+| `META_MAX_RETRIES` | `1` | Extra attempts after the first, capped at 2. Read timeouts are not retried. Connection failures and HTTP 408/429/500/502/503/504 are |
+
+Handshake risk scoring, when the model errors or times out, uses a keyword rule instead of hanging or stripping `act` from every agent. A clear shopping purpose can still receive `act`. Scraping, bypass, resale, and vague purposes stay view-only. The handshake body says `purpose_risk.source` is `rules` and `degraded` is true. The agent-facing reason does not include env var names.
+
+CAPTCHA, when vision is unavailable: a typed `answer` matching the challenge, or a non-blank sketch from the drawing pad, opens the **human storefront only**. The response is `degraded: true` with `method` `typed_fallback` or `ink_fallback`, and it does not grant agent `act`. A blank image gets HTTP 403 with `fallback` instructions. A working vision model that rejects a drawing does not take this path.
 
 ## Why this host
 
@@ -46,7 +58,7 @@ An existing `.env` with only `BASETEN_API_KEY` (and optional `BASETEN_MODEL`) ke
 
 Searched `server/`. No other chat-completions client, SDK, or HTTP call to an LLM host. `server/agent_gate.py` lists the substring `anthropic` as a bot user-agent to block. That is not a model call.
 
-`Aurif-UI/` and `Demo-client/` on PR #1 (`cursor/import-frontend-sources-c904`) were checked and not merged here. The dashboard reads `GET /api/ai/models` as `models[]` and `current`, each with `id`, `label`, `provider`, and optional `default`. It does not read `providers`. Policy propose, activity summary, and agent chat still return `model` as a string or `{id, provider, label}`. Human verify still returns `error`, and on a rejected drawing `verdict.read_as` plus `agent_access`. Those fields are unchanged. `providers.text` and `providers.vision` are additions. `providers.baseten.base_url` is kept from the previous payload. `providers.modal` is removed because it was the DeepSeek URL and no frontend reads it.
+The dashboard reads `GET /api/ai/models` as `models[]` and `current` (`id`, `label`, `provider`, `default`) and now also `health`. Policy propose, activity summary, and agent chat still return `model` as a string or `{id, provider, label}`. A rejected drawing still returns `error`, `verdict.read_as`, and `agent_access`. When vision is down, human verify can return `degraded`, `method`, and `warning` instead of failing closed. `providers.baseten.base_url` remains. `providers.modal` stays absent.
 
 | Call site | Purpose | Before | Env before | After |
 |-----------|---------|--------|------------|-------|

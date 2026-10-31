@@ -24,7 +24,9 @@ from catalog_ai import products_by_slug, public_product
 from human_gate import COOKIE_NAME as HUMAN_COOKIE
 from human_gate import (
     HUMAN_TTL,
+    answer_matches,
     consume_challenge,
+    drawing_has_ink,
     human_access_granted,
     issue_challenge,
     issue_human_token,
@@ -1248,6 +1250,7 @@ def api_ai_models():
             "models": models,
             "current": current,
             "providers": muse_client.api_providers(),
+            "health": muse_client.health_snapshot(),
         }
     )
 
@@ -1353,8 +1356,17 @@ def api_public_gate():
             "ai_page": "/ai/page",
             "ai_actions": "/ai/actions",
             "api_base": config.api_public_url(),
+            "health": "/api/health",
+            "model_degraded": bool(muse_client.health_snapshot()["degraded"]),
         }
     )
+
+
+@app.get("/api/health")
+def api_health():
+    """Model configuration and the last text/vision call. No API keys."""
+    snap = muse_client.health_snapshot()
+    return jsonify(snap), (200 if snap["ok"] else 503)
 
 
 @app.get("/api/public/human-challenge")
@@ -1378,29 +1390,110 @@ def api_human_verify():
 
     challenge_id = str(data.get("challenge_id") or "").strip()
     image = str(data.get("image") or data.get("drawing") or "").strip()
+    answer = str(data.get("answer") or "").strip()
     row = peek_challenge(challenge_id)
     if not row:
         return jsonify({"ok": False, "error": "challenge expired — refresh and try again"}), 403
-    if not image.startswith("data:image/"):
+    target = str(row.get("target") or "")
+    if not image.startswith("data:image/") and not answer:
         return jsonify({"ok": False, "error": "drawing image required"}), 400
 
-    try:
-        verdict = muse_client.verify_drawing(image, str(row.get("target") or ""))
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"vision check failed: {e}"}), 502
+    verdict: dict[str, Any] | None = None
+    if image.startswith("data:image/"):
+        try:
+            verdict = muse_client.verify_drawing(image, target)
+        except Exception as e:
+            muse_client.note_model_failure("vision", e)
+            verdict = {"ok": False, "unavailable": True, "reason": str(e)}
 
-    reason = str(verdict.get("reason") or "")
-    if not verdict.get("ok") and reason.startswith("vision provider"):
+    if verdict and verdict.get("ok") and not verdict.get("unavailable"):
+        consume_challenge(challenge_id)
+        token = issue_human_token()
+        resp = jsonify(
+            {
+                "ok": True,
+                "human_token": token,
+                "expires_in": HUMAN_TTL,
+                "degraded": False,
+                "method": "vision",
+                "verdict": {
+                    "read_as": verdict.get("read_as"),
+                    "model": verdict.get("model"),
+                },
+            }
+        )
+        resp.set_cookie(HUMAN_COOKIE, token, max_age=HUMAN_TTL, httponly=False, samesite="Lax", path="/")
+        return resp
+
+    vision_down = bool(verdict and verdict.get("unavailable")) or (
+        verdict is None and not muse_client.vision_configured()
+    )
+    if vision_down:
+        method = ""
+        if answer_matches(target, answer):
+            method = "typed_fallback"
+        elif image.startswith("data:image/") and drawing_has_ink(image):
+            method = "ink_fallback"
+        if method:
+            muse_client.log.warning(
+                "CAPTCHA vision unavailable; accepted %s for the human storefront only (no agent act)",
+                method,
+            )
+            consume_challenge(challenge_id)
+            token = issue_human_token()
+            warning = (
+                "Vision model unavailable. This check opens the human storefront only "
+                "and does not grant agent act."
+            )
+            resp = jsonify(
+                {
+                    "ok": True,
+                    "degraded": True,
+                    "method": method,
+                    "warning": warning,
+                    "human_token": token,
+                    "expires_in": HUMAN_TTL,
+                    "model_status": muse_client.health_snapshot()["vision"],
+                }
+            )
+            resp.set_cookie(
+                HUMAN_COOKIE, token, max_age=HUMAN_TTL, httponly=False, samesite="Lax", path="/"
+            )
+            return resp
         return jsonify(
             {
                 "ok": False,
-                "error": reason,
-                "model": verdict.get("model"),
-                "provider": verdict.get("provider"),
+                "degraded": True,
+                "error": (
+                    "Vision model unavailable. Draw on the pad and submit again, or send "
+                    "answer set to the characters in the prompt. This does not grant agent act."
+                ),
+                "fallback": {
+                    "challenge_id": challenge_id,
+                    "type": "type",
+                    "target": target,
+                    "prompt": f'Type these characters to continue: {target}',
+                },
+                "model_status": muse_client.health_snapshot()["vision"],
             }
-        ), 502
+        ), 403
 
-    if not verdict.get("ok"):
+    if not verdict or not verdict.get("ok"):
+        if verdict is None:
+            return jsonify({"ok": False, "error": "drawing image required"}), 400
+        # A vision-provider result that is not marked unavailable stays a hard
+        # failure and does not spend a drawing attempt. Real outages set
+        # unavailable and already took the storefront-only fallback above.
+        reason = str(verdict.get("reason") or "")
+        if reason.startswith("vision provider") and not verdict.get("unavailable"):
+            return jsonify(
+                {
+                    "ok": False,
+                    "error": reason,
+                    "model": verdict.get("model"),
+                    "provider": verdict.get("provider"),
+                }
+            ), 502
         # One redraw, then the challenge is consumed. Wrong drawings are sent to the API path.
         state = register_failed_attempt(challenge_id)
         error = verdict.get("reason") or "drawing did not match"
@@ -1441,21 +1534,7 @@ def api_human_verify():
             }
         ), 403
 
-    consume_challenge(challenge_id)
-    token = issue_human_token()
-    resp = jsonify(
-        {
-            "ok": True,
-            "human_token": token,
-            "expires_in": HUMAN_TTL,
-            "verdict": {
-                "read_as": verdict.get("read_as"),
-                "model": verdict.get("model"),
-            },
-        }
-    )
-    resp.set_cookie(HUMAN_COOKIE, token, max_age=HUMAN_TTL, httponly=False, samesite="Lax", path="/")
-    return resp
+    return jsonify({"ok": False, "error": "drawing did not match"}), 403
 
 
 @app.get("/api/public/human-check")
