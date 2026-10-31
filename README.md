@@ -54,13 +54,12 @@ Need **Node 22+** (prefer `pnpm`) and **Python 3.11+**.
 ### 1. Env (repo root)
 
 ```bash
-# .env (gitignored)
-BASETEN_API_KEY=…
-MODAL_TOKEN_ID=…          # CAPTCHA vision (DeepSeek on Modal)
-MODAL_TOKEN_SECRET=…
-# optional:
-# BASETEN_MODEL=meta-models/muse-spark-open-1026
-# MODAL_VISION_MODEL=deepseek-ai/DeepSeek-V4.1-Flash
+# .env (gitignored) — see .env.example and docs/MODELS.md
+MODEL_API_KEY=…           # Meta Model API key (META_API_KEY also works)
+# optional overrides (defaults are Muse Spark 1.3 on https://api.meta.ai/v1):
+# META_MODEL=muse-spark-1.3
+# META_BASE_URL=https://api.meta.ai/v1
+# META_VISION_MODEL=muse-spark-1.3
 ```
 
 ### 2. Three terminals
@@ -139,14 +138,17 @@ Site key is on the dashboard (Settings / site detail).
 
 ## Models (hackathon)
 
-Product AI runs in **server + Aurif-UI** (not Demo-client). Inference via Baseten (OpenAI-compatible) and Modal for vision CAPTCHA.
+Product AI runs in **server + Aurif-UI** (not Demo-client). Text and CAPTCHA vision both call a Meta model. The default is **Muse Spark 1.3** on the Meta Model API (`https://api.meta.ai/v1`), which accepts text and images. Override the host with `META_BASE_URL` / `META_VISION_BASE_URL` if you serve Muse or Llama elsewhere (Baseten, Llama API, Modal). A misconfigured vision provider returns an error. It does not fall back to another vendor.
 
 | Feature | Where | Model |
 |---------|--------|--------|
-| Handshake purpose risk | `POST /ai/handshake` | `meta-models/muse-spark-open-1026` |
+| Handshake purpose risk | `POST /ai/handshake` | `META_MODEL` (default `muse-spark-1.3`) |
 | Policy co-pilot | Endpoints | same |
 | Activity summary | Activity | same |
-| Muse chat | Agent dashboard | Muse (Baseten) or DeepSeek vision path as configured |
+| Muse chat phrasing | Agent dashboard | same |
+| CAPTCHA vision | Human gate | `META_VISION_MODEL` (default `muse-spark-1.3`) |
+
+See [docs/MODELS.md](docs/MODELS.md).
 
 ---
 

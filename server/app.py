@@ -843,7 +843,7 @@ def api_policy_propose(site_id: str):
         proposal = muse_client.propose_policy(instruction, site.get("endpoints") or [])
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 502
-    return jsonify({"ok": True, "proposal": proposal, "model": muse_client.DEFAULT_MODEL})
+    return jsonify({"ok": True, "proposal": proposal, "model": muse_client.text_model_id()})
 
 
 @app.post("/api/sites/<site_id>/ai/policy-apply")
@@ -905,7 +905,7 @@ def api_activity_summary(site_id: str):
         summary = muse_client.summarize_activity(events)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 502
-    return jsonify({"ok": True, "summary": summary, "model": muse_client.DEFAULT_MODEL})
+    return jsonify({"ok": True, "summary": summary, "model": muse_client.text_model_id()})
 
 
 def _path_from_message(message: str) -> str:
@@ -1113,7 +1113,10 @@ def api_ai_models():
     if err:
         return err
     _ = owner
-    models = muse_client.list_agent_models()
+    try:
+        models = muse_client.list_agent_models()
+    except RuntimeError as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
     current = next((m for m in models if m.get("default")), models[0] if models else None)
     return jsonify(
         {
@@ -1121,8 +1124,8 @@ def api_ai_models():
             "models": models,
             "current": current,
             "providers": {
-                "baseten": {"base_url": muse_client.BASETEN_BASE_URL},
-                "modal": {"base_url": muse_client.MODAL_BASE_URL},
+                "text": muse_client.public_settings(muse_client.text_settings()),
+                "vision": muse_client.public_settings(muse_client.vision_settings()),
             },
         }
     )
@@ -1145,7 +1148,10 @@ def api_agent_chat():
     # Owner toggle: only attach site key when explicitly enabled in the Agent dashboard.
     use_site_key = bool(data.get("use_site_key"))
     site_key = str(data.get("site_key") or "").strip() if use_site_key else ""
-    model_info = muse_client.resolve_model(str(data.get("model") or "").strip() or None)
+    try:
+        model_info = muse_client.resolve_model(str(data.get("model") or "").strip() or None)
+    except RuntimeError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
     result = muse_browse.browse_as_agent(
         site=site,
         path=path,
@@ -1261,6 +1267,17 @@ def api_human_verify():
         verdict = muse_client.verify_drawing(image, str(row.get("target") or ""))
     except Exception as e:
         return jsonify({"ok": False, "error": f"vision check failed: {e}"}), 502
+
+    reason = str(verdict.get("reason") or "")
+    if not verdict.get("ok") and reason.startswith("vision provider"):
+        return jsonify(
+            {
+                "ok": False,
+                "error": reason,
+                "model": verdict.get("model"),
+                "provider": verdict.get("provider"),
+            }
+        ), 502
 
     if not verdict.get("ok"):
         # Keep challenge so they can redraw once; only consume on success.
