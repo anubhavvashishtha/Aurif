@@ -1241,7 +1241,7 @@ def _muse_report_site_response(fallback: str, *, seen_fields: list[tuple[str, st
     try:
         polished = muse_client.complete(
             [{"role": "user", "content": prompt}],
-            max_tokens=320,
+            max_tokens=1024,
             temperature=0.25,
         )
         cleaned = polished.strip()

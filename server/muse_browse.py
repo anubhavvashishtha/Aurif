@@ -1067,7 +1067,7 @@ def _compose_reply(
                 ],
                 model=model,
                 provider=provider,
-                max_tokens=60,
+                max_tokens=1024,
                 temperature=0.1,
             ).strip()
             if _polish_ok(polished, message, facts, fields):

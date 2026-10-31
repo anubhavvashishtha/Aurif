@@ -565,6 +565,8 @@ def _public_model_error(
             return f"vision model {model_name}: {access}, check {host} model access or slug"
     name = type(exc).__name__
     text = str(exc).lower()
+    if isinstance(exc, ReasoningOnly) or "returned only reasoning" in text:
+        return "model returned only reasoning"
     if "timeout" in name.lower() or "timed out" in text:
         return "model timed out"
     # Match the text-model refusal itself, before the generic misconfigured
@@ -773,17 +775,26 @@ def health_snapshot() -> dict[str, Any]:
     }
 
 
+class ReasoningOnly(Exception):
+    """The call succeeded, but message.content was empty and only reasoning came back."""
+
+
+def _reasoning_blob(msg: Any) -> str:
+    for name in ("reasoning", "reasoning_content"):
+        value = getattr(msg, name, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def _message_text(msg: Any) -> str:
     """Visible answer only. Reasoning is never the reply."""
     content = getattr(msg, "content", None)
     text = content.strip() if isinstance(content, str) else (str(content).strip() if content else "")
     if text:
         return text
-    for name in ("reasoning", "reasoning_content"):
-        value = getattr(msg, name, None)
-        if isinstance(value, str) and value.strip():
-            log.warning("model returned only reasoning")
-            break
+    if _reasoning_blob(msg):
+        log.warning("model returned only reasoning")
     return ""
 
 
@@ -819,7 +830,6 @@ def complete(
     temperature: float = 0.2,
     model: str | None = None,
     provider: str | None = None,
-    limit_reasoning: bool = False,
 ) -> str:
     cfg = text_settings()
     resolved = resolve_model(model)
@@ -835,8 +845,10 @@ def complete(
     # Send temperature only. Meta Model API rejects temperature together with top_p.
     if temperature is not None:
         kwargs["temperature"] = temperature
+    # Every Muse text call asks for a short reasoning pass. api.meta.ai already
+    # sends reasoning_effort. Baseten Muse Spark Open defaults to a long one.
     extra = dict(_meta_extra(cfg["base_url"]))
-    limited = _reasoning_limit_extra(cfg["base_url"]) if limit_reasoning else {}
+    limited = _reasoning_limit_extra(cfg["base_url"])
     if limited:
         extra.update(limited)
     if extra:
@@ -852,7 +864,11 @@ def complete(
         if base_extra:
             kwargs["extra_body"] = base_extra
         response = _chat(cfg, kind="text", **kwargs)
-    return _message_text(response.choices[0].message)
+    msg = response.choices[0].message
+    text = _message_text(msg)
+    if not text and _reasoning_blob(msg):
+        raise ReasoningOnly("model returned only reasoning")
+    return text
 
 
 def extract_json(text: str) -> Any:
@@ -908,8 +924,10 @@ Purpose: {purpose}
 
     try:
         data = extract_json(
-            complete([{"role": "user", "content": prompt}], max_tokens=800, temperature=0.1)
+            complete([{"role": "user", "content": prompt}], max_tokens=2048, temperature=0.1)
         )
+    except ReasoningOnly as exc:
+        return rules(exc)
     except Exception as exc:
         log.warning(
             "handshake risk model unavailable (%s); using keyword rules",
@@ -1152,6 +1170,12 @@ Owner instruction: {instruction}
         data = extract_json(
             complete([{"role": "user", "content": prompt}], max_tokens=2500, temperature=0.1)
         )
+    except ReasoningOnly as exc:
+        return _stamp_call(
+            rule_propose_policy(instruction, endpoints, unavailable=_public_model_error(exc)),
+            started=started,
+            card=card,
+        )
     except Exception as exc:
         return rules(exc)
     if not isinstance(data, dict):
@@ -1342,19 +1366,51 @@ def _number_value(token: str) -> int | None:
 
 
 def _count_gap_ok(between: str) -> bool:
-    """A number applies to the next count noun, not to one several clauses later."""
-    if re.search(r"\bof\b", between or "", re.I):
+    """A number binds only to the noun phrase directly after it."""
+    gap = between or ""
+    if re.search(r"[.!?\n]", gap):
         return False
-    return len(re.findall(r"[A-Za-z0-9]+", between or "")) <= 2
+    if re.search(r"\bof\b", gap, re.I):
+        return False
+    return len(re.findall(r"[A-Za-z0-9]+", gap)) == 0
 
 
-def _count_claims(text: str) -> dict[str, int] | None:
-    """Map each stated count to a number. None when one category is given two values."""
+def _digit_in_identifier(text: str, start: int, end: int) -> bool:
+    """True for version tails and id fragments such as price-harvester/0.9."""
+    if start > 0 and text[start - 1] in "./":
+        return True
+    if end < len(text) and text[end] == "." and end + 1 < len(text) and text[end + 1].isdigit():
+        return True
+    if end < len(text) and text[end] == "/":
+        return True
+    if start > 1 and text[start - 1] == "-" and (text[start - 2].isalnum() or text[start - 2] in "._/"):
+        return True
+    return False
+
+
+def _without_agent_ids(text: str, agent_ids: list[str]) -> str:
+    cleaned = text or ""
+    for agent_id in sorted({item for item in agent_ids if item}, key=len, reverse=True):
+        if len(agent_id) < 2:
+            continue
+        cleaned = re.sub(re.escape(agent_id), " ", cleaned, flags=re.I)
+    return cleaned
+
+
+def _count_claims(text: str) -> tuple[dict[str, int] | None, str, dict[str, str]]:
+    """Map each stated count to a number.
+
+    Returns (claims, reason, phrases). claims is None when one category is
+    given two values. reason describes that contradiction.
+    """
     blob = text or ""
     marks: list[tuple[int, int, str, int | None]] = []
     for match in _COUNT_TOKEN.finditer(blob):
-        value = _number_value(match.group(0))
+        token = match.group(0)
+        value = _number_value(token)
         if value is None:
+            continue
+        if token[:1].isdigit() and _digit_in_identifier(blob, match.start(), match.end()):
             continue
         marks.append((match.start(), match.end(), "num", value))
     for key, pattern in _COUNT_CATEGORIES:
@@ -1363,6 +1419,7 @@ def _count_claims(text: str) -> dict[str, int] | None:
     marks.sort(key=lambda item: (item[0], 0 if item[2] == "num" else 1))
 
     found: dict[str, int] = {}
+    phrases: dict[str, str] = {}
     index = 0
     while index < len(marks):
         start, end, kind, value = marks[index]
@@ -1370,32 +1427,62 @@ def _count_claims(text: str) -> dict[str, int] | None:
             index += 1
             continue
         claimed: int | None = None
+        phrase_at = (start, end)
         if index > 0 and marks[index - 1][2] == "num" and _count_gap_ok(blob[marks[index - 1][1] : start]):
             claimed = marks[index - 1][3]
+            phrase_at = (marks[index - 1][0], end)
         elif index + 1 < len(marks) and marks[index + 1][2] == "num":
             nxt = marks[index + 1]
             bridge = blob[end : nxt[0]]
             if re.fullmatch(r"[\s:]*(?:is|was|were|are|=)?[\s:]*", bridge, re.I):
                 claimed = nxt[3]
+                phrase_at = (start, nxt[1])
                 index += 1
         if claimed is not None:
             if kind in found and found[kind] != claimed:
-                return None
+                phrase = blob[phrase_at[0] : phrase_at[1]].strip()
+                return None, f"{kind} stated both {found[kind]} and {claimed}", {kind: phrase}
             found[kind] = claimed
+            phrases[kind] = blob[phrase_at[0] : phrase_at[1]].strip()
         index += 1
-    return found
+    return found, "", phrases
 
 
-def summary_respects_counts(text: str, facts: dict[str, int]) -> bool:
+def summary_count_failure(
+    text: str,
+    facts: dict[str, int],
+    *,
+    agent_ids: list[str] | None = None,
+) -> tuple[str, str] | None:
+    """None when every stated count matches. Otherwise (reason, offending phrase)."""
+    cleaned = _without_agent_ids(text, agent_ids or [])
+    found, reason, phrases = _count_claims(cleaned)
+    if found is None:
+        phrase = next(iter(phrases.values()), "") if phrases else ""
+        return reason or "contradictory counts", phrase or (cleaned or "")[:160]
+    if not found:
+        return "no counts stated", (cleaned or "")[:160]
+    for key, value in found.items():
+        actual = facts.get(key)
+        if actual != value:
+            return f"{key} stated {value}, counted {actual}", phrases.get(key) or (cleaned or "")[:160]
+    return None
+
+
+def summary_respects_counts(
+    text: str,
+    facts: dict[str, int],
+    *,
+    agent_ids: list[str] | None = None,
+) -> bool:
     """True when every count the text states matches `facts`.
 
     Digits and number words count as the same value. Omitted counts are fine.
     A text that states none of the counts, or states one of them wrong, is not.
+    Digits inside version strings and agent ids are not counts, and a number
+    does not bind across a sentence boundary.
     """
-    found = _count_claims(text)
-    if not found:
-        return False
-    return all(facts.get(key) == value for key, value in found.items())
+    return summary_count_failure(text, facts, agent_ids=agent_ids) is None
 
 
 def _activity_facts(
@@ -1522,15 +1609,14 @@ Return ONLY JSON: {{"summary":"...","risks":["..."],"suggested_blocked_agents":[
             ],
             max_tokens=2048,
             temperature=0.1,
-            limit_reasoning=True,
         )
+    except ReasoningOnly:
+        model_error = "model returned only reasoning"
     except Exception as exc:
         model_error = _public_model_error(exc)
         log.warning("activity summary model unavailable (%s); using counted brief", model_error)
     else:
         if not (raw_reply or "").strip():
-            # Reasoning-only replies are already logged. Do not run them through
-            # the count check; there is no summary to accept.
             model_error = "model returned only reasoning"
         else:
             try:
@@ -1551,7 +1637,9 @@ Return ONLY JSON: {{"summary":"...","risks":["..."],"suggested_blocked_agents":[
         risks = polished.get("risks") if isinstance(polished.get("risks"), list) else []
         risk_text = "\n".join(str(item) for item in risks[:3])
         stated = summary if not risk_text else f"{summary}\n{risk_text}"
-        if summary_respects_counts(stated, facts):
+        agent_ids = list(agents.keys()) + risky_ids
+        failure = summary_count_failure(stated, facts, agent_ids=agent_ids)
+        if failure is None:
             known = {row["agent_id"] for row in high_risk} | set(denied)
             blocked = polished.get("suggested_blocked_agents")
             if not isinstance(blocked, list):
@@ -1564,6 +1652,12 @@ Return ONLY JSON: {{"summary":"...","risks":["..."],"suggested_blocked_agents":[
             }
             used_model = True
         else:
+            reason, phrase = failure
+            log.warning(
+                "activity summary rejected: %s; phrase: %s",
+                reason,
+                _scrub_secrets(phrase)[:300],
+            )
             _log_rejected_summary(raw_reply)
     elif raw_reply and model_error is None:
         _log_rejected_summary(raw_reply)

@@ -18,9 +18,10 @@ SERVER = Path(__file__).resolve().parents[1]
 if str(SERVER) not in sys.path:
     sys.path.insert(0, str(SERVER))
 
+import muse_browse  # noqa: E402
 import muse_client  # noqa: E402
 import store  # noqa: E402
-from app import app  # noqa: E402
+from app import _muse_report_site_response, app  # noqa: E402
 
 ENV_KEYS = (
     "META_API_KEY",
@@ -549,6 +550,7 @@ class ActivitySummaryGrounding(unittest.TestCase):
             self.assertNotIn("4 handshake", result["summary"])
             blob = "\n".join(logs.output)
             self.assertIn("activity summary rejected", blob)
+            self.assertIn("phrase:", blob)
             self.assertIn(text.split(",")[0][:24], blob)
             self.assertNotIn("test-meta-key", blob)
             self.assertNotIn("sk-supersecretvalue", blob)
@@ -577,7 +579,10 @@ class ActivitySummaryGrounding(unittest.TestCase):
         self.assertEqual(result["fallback"], "activity_counts")
         self.assertIn("2 events", result["summary"])
         self.assertNotIn("Restating the prompt", result["summary"])
-        self.assertIn("model returned only reasoning", "\n".join(logs.output))
+        blob = "\n".join(logs.output)
+        self.assertIn("model returned only reasoning", blob)
+        self.assertNotIn("model request failed", blob)
+        self.assertNotIn("model unavailable", blob.lower())
         self.assertEqual(rec.calls[0]["max_tokens"], 2048)
         self.assertEqual(rec.clients[0]["timeout"], 8.0)
         self.assertNotIn("chat_template_kwargs", rec.calls[0].get("extra_body") or {})
@@ -624,6 +629,153 @@ class ActivitySummaryGrounding(unittest.TestCase):
         self.assertEqual(rec.calls[1]["max_tokens"], 2048)
         self.assertEqual(rec.clients[0]["timeout"], 8.0)
         self.assertEqual(rec.clients[0]["base_url"], "https://inference.baseten.co/v1")
+
+    def test_version_digits_and_sentence_breaks_are_not_counts(self):
+        facts = {**_SHOP_FACTS, "high_risk_agents": 1}
+        versioned = (
+            "Two events from one agent included one handshake and one page read. "
+            "price-harvester/0.9 High-risk agent detected."
+        )
+        hidden = (
+            "Two events from one agent included one handshake and one page read. "
+            "No fields hidden. High-risk agent detected."
+        )
+        self.assertTrue(muse_client.summary_respects_counts(versioned, facts))
+        self.assertTrue(muse_client.summary_respects_counts(hidden, facts))
+        self.assertFalse(
+            muse_client.summary_respects_counts("No high-risk agents.", facts)
+        )
+        events = [
+            {
+                "kind": "handshake",
+                "agent_id": "price-harvester/0.9",
+                "detail": {"purpose_risk": {"risk": "high", "reason": "scraping"}},
+            },
+            {"kind": "page", "agent_id": "price-harvester/0.9", "detail": {}},
+        ]
+        for text in (versioned, hidden):
+            payload = json.dumps(
+                {"summary": text, "risks": [], "suggested_blocked_agents": []}
+            )
+            with _Recorder(payload):
+                result = muse_client.summarize_activity(events)
+            self.assertEqual(result["source"], "model", text)
+            self.assertEqual(result["summary"], text)
+
+    def test_handshake_reasoning_only_is_logged_without_a_request_failure(self):
+        reasoning = "Only reasoning, about 255 characters, no final answer."
+        with self.assertLogs("aurif.models", level="WARNING") as logs:
+            with _Recorder("", reasoning=reasoning) as rec:
+                result = muse_client.score_purpose("compare tote prices")
+        blob = "\n".join(logs.output)
+        self.assertEqual(result["source"], "rules")
+        self.assertTrue(result["degraded"])
+        self.assertEqual(result["fallback"], "keyword_rules")
+        self.assertIn("model returned only reasoning", blob)
+        self.assertNotIn("model request failed", blob)
+        self.assertNotIn("model unavailable", blob.lower())
+        self.assertEqual(rec.calls[0]["max_tokens"], 2048)
+        self.assertEqual(rec.clients[0]["timeout"], 8.0)
+        self.assertNotIn(reasoning, result["reason"])
+
+    def test_handshake_keeps_model_content_for_a_shopper_question(self):
+        payload = (
+            '{"risk":"low","reason":"comparing tote prices for a shopper",'
+            '"suggested_scopes":["view","act"],"drop_act":false}'
+        )
+        with _Recorder(payload, reasoning="thinking about stock and prices") as rec:
+            result = muse_client.score_purpose("check if the field tote is in stock")
+        self.assertEqual(result["source"], "model")
+        self.assertEqual(result["risk"], "low")
+        self.assertFalse(result["drop_act"])
+        self.assertIn("act", result["suggested_scopes"])
+        self.assertEqual(rec.calls[0]["max_tokens"], 2048)
+        self.assertEqual(rec.clients[0]["timeout"], 8.0)
+
+    def test_browse_polish_reasoning_only_uses_the_field_answer(self):
+        fields = [
+            {"label": "name", "value": "Field Tote"},
+            {"label": "price", "value": "$68"},
+        ]
+        reasoning = "Products: Field Tote (68). Name: Field Tote; Title: Tote; Sku: FT."
+        with self.assertLogs("aurif.models", level="WARNING") as logs:
+            with _Recorder("", reasoning=reasoning) as rec:
+                reply = muse_browse._compose_reply(
+                    message="how much is the field tote",
+                    steps=[],
+                    fields=fields,
+                    denied=False,
+                )
+        blob = "\n".join(logs.output)
+        self.assertIn("68", reply)
+        self.assertNotIn("Sku", reply)
+        self.assertNotIn("Products:", reply)
+        self.assertIn("model returned only reasoning", blob)
+        self.assertNotIn("model request failed", blob)
+        self.assertNotIn("model unavailable", blob.lower())
+        self.assertEqual(rec.calls[0]["max_tokens"], 1024)
+
+    def test_baseten_budgets_and_reasoning_control_on_every_muse_call(self):
+        os.environ.pop("META_API_KEY", None)
+        os.environ.pop("META_BASE_URL", None)
+        os.environ.pop("META_MODEL", None)
+        os.environ.pop("META_PROVIDER", None)
+        os.environ["BASETEN_API_KEY"] = "test-baseten-key"
+
+        def extra_ok(call: dict) -> None:
+            extra = call["extra_body"]
+            self.assertEqual(extra["reasoning_effort"], "low")
+            self.assertEqual(extra["chat_template_kwargs"], {"reasoning_effort": "low"})
+
+        with _Recorder(
+            '{"risk":"low","reason":"shopper","suggested_scopes":["view","act"],"drop_act":false}'
+        ) as rec:
+            muse_client.score_purpose("compare tote prices")
+        self.assertEqual(rec.calls[0]["max_tokens"], 2048)
+        self.assertEqual(rec.clients[0]["timeout"], 8.0)
+        extra_ok(rec.calls[0])
+
+        with _Recorder('{"summary":"Hide prices.","patches":[],"blocked_agents_add":[]}') as rec:
+            muse_client.propose_policy("hide prices", [])
+        self.assertEqual(rec.calls[0]["max_tokens"], 2500)
+        extra_ok(rec.calls[0])
+
+        with _Recorder(
+            json.dumps(
+                {
+                    "summary": "Two events from one agent included one handshake and one page read.",
+                    "risks": [],
+                    "suggested_blocked_agents": [],
+                }
+            )
+        ) as rec:
+            muse_client.summarize_activity(_SHOP_EVENTS)
+        self.assertEqual(rec.calls[0]["max_tokens"], 2048)
+        extra_ok(rec.calls[0])
+
+        fields = [
+            {"label": "name", "value": "Field Tote"},
+            {"label": "price", "value": "$68"},
+        ]
+        with _Recorder("The price of Field Tote is $68.") as rec:
+            muse_browse._compose_reply(
+                message="how much is the field tote",
+                steps=[],
+                fields=fields,
+                denied=False,
+            )
+        self.assertEqual(rec.calls[0]["max_tokens"], 1024)
+        extra_ok(rec.calls[0])
+
+        with _Recorder(
+            "I can see the product name and the listed price on this page for the owner."
+        ) as rec:
+            _muse_report_site_response(
+                "Name: Field Tote; Title: Tote; Sku: FT-1.",
+                seen_fields=[("Name", "Field Tote")],
+            )
+        self.assertEqual(rec.calls[0]["max_tokens"], 1024)
+        extra_ok(rec.calls[0])
 
 
 if __name__ == "__main__":
