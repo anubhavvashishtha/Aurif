@@ -36,10 +36,11 @@ export function MetaCredit({
   fallback?: string | null;
   warning?: string | null;
 }) {
-  const latency = typeof latencyMs === "number" ? `${latencyMs} ms` : null;
   const usingFallback = Boolean(degraded || fallback);
   const metaFamily =
     !model || typeof model === "string" ? !model || !looksNonMeta(model) : !model.family || model.family === "meta";
+  const latency = typeof latencyMs === "number" && latencyMs > 0 ? `${latencyMs} ms` : null;
+  const credit = usingFallback ? fallbackCredit(fallback) : poweredByLine(model);
   return (
     <div className="space-y-1">
       {degraded && (
@@ -54,10 +55,15 @@ export function MetaCredit({
         <p className="text-sm text-muted-foreground">{warning || "Showing the fallback result."}</p>
       )}
       <p className="font-mono text-[11px] uppercase tracking-wider text-muted-foreground">
-        {poweredByLine(model)}
-        {latency ? ` · ${latency}` : ""}
-        {usingFallback ? " · fallback" : ""}
+        {credit}
+        {!usingFallback && latency ? ` · ${latency}` : ""}
       </p>
     </div>
   );
+}
+
+function fallbackCredit(fallback?: string | null) {
+  if (fallback === "keyword_rules") return "Fallback · keyword rules";
+  if (fallback === "activity_counts") return "Fallback · counted locally";
+  return "Fallback";
 }
