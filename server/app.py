@@ -953,6 +953,28 @@ def _owner_site(site_id: str, session: dict[str, Any]):
     return site, None
 
 
+def _ai_feature_body(feature: str, result: dict[str, Any]):
+    """Owner AI response. `model` stays a string; `model_info` is the safe card."""
+    card = result.get("model") if isinstance(result.get("model"), dict) else muse_client.model_card()
+    body: dict[str, Any] = {
+        "ok": True,
+        feature: result,
+        "model": card.get("id") or muse_client.text_model_id(),
+        "model_info": {
+            "id": card.get("id") or "",
+            "provider": card.get("provider") or "",
+            "label": card.get("label") or "",
+        },
+        "latency_ms": result.get("latency_ms"),
+        "source": result.get("source") or "model",
+        "degraded": bool(result.get("degraded")),
+        "fallback": result.get("fallback"),
+    }
+    if result.get("warning"):
+        body["warning"] = result["warning"]
+    return body
+
+
 @app.post("/api/sites/<site_id>/ai/policy-propose")
 def api_policy_propose(site_id: str):
     session, err = owner_auth()
@@ -965,11 +987,9 @@ def api_policy_propose(site_id: str):
     instruction = (data.get("instruction") or "").strip()
     if not instruction:
         return jsonify({"ok": False, "error": "instruction required"}), 400
-    try:
-        proposal = muse_client.propose_policy(instruction, site.get("endpoints") or [])
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 502
-    return jsonify({"ok": True, "proposal": proposal, "model": muse_client.text_model_id()})
+    # propose_policy catches model errors and returns a keyword draft. It does not write policy.
+    proposal = muse_client.propose_policy(instruction, site.get("endpoints") or [])
+    return jsonify(_ai_feature_body("proposal", proposal))
 
 
 @app.post("/api/sites/<site_id>/ai/policy-apply")
@@ -1027,11 +1047,9 @@ def api_activity_summary(site_id: str):
     if err:
         return err
     events = store.activity_for_site(site_id, limit=80)
-    try:
-        summary = muse_client.summarize_activity(events)
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 502
-    return jsonify({"ok": True, "summary": summary, "model": muse_client.text_model_id()})
+    # summarize_activity keeps the counted brief when the model call fails.
+    summary = muse_client.summarize_activity(events)
+    return jsonify(_ai_feature_body("summary", summary))
 
 
 def _path_from_message(message: str) -> str:

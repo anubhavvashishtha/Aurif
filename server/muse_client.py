@@ -142,6 +142,39 @@ def text_model_id() -> str:
     return text_settings()["model"]
 
 
+def model_card() -> dict[str, str]:
+    """Configured text model, safe to show in the dashboard. No API key."""
+    cfg = text_settings()
+    model = cfg.get("model") or ""
+    return {
+        "id": model,
+        "provider": cfg.get("provider") or "",
+        "label": _model_label(model),
+    }
+
+
+def _stamp_call(result: dict[str, Any], *, started: float, card: dict[str, str]) -> dict[str, Any]:
+    out = dict(result)
+    out["model"] = card
+    out["latency_ms"] = max(0, int(round((time.perf_counter() - started) * 1000)))
+    return out
+
+
+def _owner_warning(kind: str, exc: BaseException | None = None) -> str:
+    """Dashboard copy when the Meta call did not produce the result. No secrets."""
+    detail = _public_model_error(exc) if exc else "model request failed"
+    if kind == "policy":
+        return (
+            f"Meta model unavailable ({detail}). "
+            "This proposal is a keyword-rules fallback and is not applied until you confirm."
+        )
+    if kind == "activity":
+        return (
+            f"Meta model unavailable ({detail}). Showing the counted activity fallback."
+        )
+    return f"Meta model unavailable ({detail}). This score is the keyword-rules fallback."
+
+
 def _looks_non_meta(model: str) -> bool:
     if _META_MODEL_OK.search(model or ""):
         return False
@@ -381,40 +414,37 @@ def rule_score_purpose(purpose: str) -> dict[str, Any]:
     """
     text = (purpose or "").strip()
     if not text or text == "(empty)":
-        return {
+        scored = {
             "risk": "medium",
             "reason": "keyword rule: empty purpose, view only",
             "suggested_scopes": ["view"],
             "drop_act": True,
-            "source": "rules",
-            "degraded": True,
         }
-    if _HIGH_RISK.search(text):
-        return {
+    elif _HIGH_RISK.search(text):
+        scored = {
             "risk": "high",
             "reason": "keyword rule: purpose looks like scraping or bypass",
             "suggested_scopes": ["view"],
             "drop_act": True,
-            "source": "rules",
-            "degraded": True,
         }
-    if _SHOPPER.search(text):
-        return {
+    elif _SHOPPER.search(text):
+        scored = {
             "risk": "low",
             "reason": "keyword rule: purpose looks like shopping help",
             "suggested_scopes": ["view", "act"],
             "drop_act": False,
-            "source": "rules",
-            "degraded": True,
         }
-    return {
-        "risk": "medium",
-        "reason": "keyword rule: purpose is not clearly a shopper task, view only",
-        "suggested_scopes": ["view"],
-        "drop_act": True,
-        "source": "rules",
-        "degraded": True,
-    }
+    else:
+        scored = {
+            "risk": "medium",
+            "reason": "keyword rule: purpose is not clearly a shopper task, view only",
+            "suggested_scopes": ["view"],
+            "drop_act": True,
+        }
+    scored["source"] = "rules"
+    scored["degraded"] = True
+    scored["fallback"] = "keyword_rules"
+    return scored
 
 
 def _status_side(kind: str, cfg: dict[str, str]) -> dict[str, Any]:
@@ -537,6 +567,8 @@ def extract_json(text: str) -> Any:
 def score_purpose(purpose: str) -> dict[str, Any]:
     """Classify agent handshake purpose for risk."""
     purpose = (purpose or "").strip() or "(empty)"
+    started = time.perf_counter()
+    card = model_card()
     prompt = f"""You are Aurif's handshake risk classifier for a commerce website.
 Score this AI agent purpose. Reply with ONLY valid JSON:
 {{"risk":"low"|"medium"|"high","reason":"short reason","suggested_scopes":["view"] or ["view","act"],"drop_act":true|false}}
@@ -548,6 +580,12 @@ Rules:
 
 Purpose: {purpose}
 """
+
+    def rules(exc: BaseException | None) -> dict[str, Any]:
+        scored = rule_score_purpose(purpose)
+        scored["warning"] = _owner_warning("handshake", exc)
+        return _stamp_call(scored, started=started, card=card)
+
     try:
         data = extract_json(
             complete([{"role": "user", "content": prompt}], max_tokens=800, temperature=0.1)
@@ -557,11 +595,11 @@ Purpose: {purpose}
             "handshake risk model unavailable (%s); using keyword rules",
             _public_model_error(exc),
         )
-        return rule_score_purpose(purpose)
+        return rules(exc)
     if not isinstance(data, dict):
         log.warning("handshake risk model returned a non-object payload; using keyword rules")
         note_model_failure("text", RuntimeError("risk model returned a non-object payload"))
-        return rule_score_purpose(purpose)
+        return rules(RuntimeError("risk model returned a non-object payload"))
     risk = str(data.get("risk") or "medium").lower()
     if risk not in ("low", "medium", "high"):
         risk = "medium"
@@ -574,13 +612,168 @@ Purpose: {purpose}
     drop_act = bool(data.get("drop_act")) or risk == "high"
     if drop_act:
         scopes = [s for s in scopes if s != "act"] or ["view"]
+    return _stamp_call(
+        {
+            "risk": risk,
+            "reason": str(data.get("reason") or "")[:300],
+            "suggested_scopes": scopes,
+            "drop_act": drop_act,
+            "source": "model",
+            "degraded": False,
+            "fallback": None,
+        },
+        started=started,
+        card=card,
+    )
+
+
+_CLOSE = re.compile(
+    r"\b(disable|disabled|turn off|turns off|close|closed|block|blocked|deny|denied|shut|stop)\b",
+    re.I,
+)
+_HIDE = re.compile(r"\b(hide|hidden|omit|omitted|redact|redacted|strip|mask|conceal|private)\b", re.I)
+_PRICE = re.compile(r"\b(prices?|pricing|compare[- ]?at|discounts?)\b", re.I)
+_EMAIL = re.compile(r"\b(e-?mails?)\b", re.I)
+_SENSITIVE_KEY = re.compile(r"price|compare_at|compareat|discount", re.I)
+_POLICY_STOP = {
+    "page",
+    "pages",
+    "action",
+    "actions",
+    "agent",
+    "agents",
+    "from",
+    "with",
+    "this",
+    "that",
+    "your",
+    "site",
+    "the",
+    "and",
+    "for",
+    "all",
+    "any",
+    "endpoint",
+    "endpoints",
+    "field",
+    "fields",
+    "json",
+    "access",
+    "hide",
+    "disable",
+    "close",
+    "block",
+    "turn",
+    "stop",
+    "deny",
+    "shut",
+    "off",
+}
+
+
+def _endpoint_terms(ep: dict[str, Any]) -> set[str]:
+    blob = " ".join(
+        str(ep.get(key) or "") for key in ("id", "label", "path", "action_id", "ref")
+    ).lower()
     return {
-        "risk": risk,
-        "reason": str(data.get("reason") or "")[:300],
-        "suggested_scopes": scopes,
-        "drop_act": drop_act,
-        "source": "model",
-        "degraded": False,
+        part
+        for part in re.split(r"[^a-z0-9]+", blob)
+        if len(part) >= 4 and part not in _POLICY_STOP
+    }
+
+
+def rule_propose_policy(
+    instruction: str,
+    endpoints: list[dict[str, Any]],
+    *,
+    unavailable: str | None = None,
+) -> dict[str, Any]:
+    """Keyword policy draft used only when the Meta model cannot answer.
+
+    The result is a proposal. Callers must not write it until the owner applies it.
+    """
+    text = (instruction or "").strip()
+    hide_price = bool(_HIDE.search(text) and _PRICE.search(text))
+    hide_email = bool((_HIDE.search(text) or _CLOSE.search(text)) and _EMAIL.search(text))
+    wants_close = bool(_CLOSE.search(text))
+    by_id: dict[str, dict[str, Any]] = {}
+
+    def slot(endpoint_id: str) -> dict[str, Any]:
+        row = by_id.get(endpoint_id)
+        if row is None:
+            row = {"endpoint_id": endpoint_id}
+            by_id[endpoint_id] = row
+        return row
+
+    notes: list[str] = []
+    if hide_price:
+        touched = 0
+        for ep in endpoints:
+            fields = []
+            for field in ep.get("response_fields") or []:
+                key = str(field.get("key") or "")
+                if key and _SENSITIVE_KEY.search(key):
+                    fields.append({"key": key, "agent_visible": False})
+            if fields:
+                slot(str(ep.get("id")))["response_fields"] = fields
+                touched += 1
+        if touched:
+            notes.append(f"hide price fields on {touched} endpoint(s)")
+
+    if hide_email:
+        touched = 0
+        for ep in endpoints:
+            fields = []
+            for field in ep.get("request_fields") or []:
+                key = str(field.get("key") or "")
+                if "email" in key.lower():
+                    fields.append({"key": key, "agent_allowed": False})
+            if fields:
+                slot(str(ep.get("id")))["request_fields"] = fields
+                touched += 1
+        if touched:
+            notes.append("reject email on agent requests")
+
+    if wants_close:
+        instruction_terms = {
+            part
+            for part in re.split(r"[^a-z0-9]+", text.lower())
+            if len(part) >= 4 and part not in _POLICY_STOP
+        }
+        closed: list[str] = []
+        for ep in endpoints:
+            if not (_endpoint_terms(ep) & instruction_terms):
+                continue
+            slot(str(ep.get("id")))["agent_access"] = False
+            closed.append(str(ep.get("label") or ep.get("id")))
+        if closed:
+            notes.append("close " + ", ".join(closed[:6]))
+
+    blocked: list[str] = []
+    for match in re.finditer(r"\bblock(?:ed)?\s+agent\s+([A-Za-z0-9_.:-]{2,64})", text, re.I):
+        name = match.group(1)
+        if name not in blocked:
+            blocked.append(name)
+    if blocked:
+        notes.append("block " + ", ".join(blocked))
+
+    if notes:
+        summary = "Keyword rule: " + "; ".join(notes) + "."
+    else:
+        summary = "Keyword rule: no page, field, or agent matched this instruction. Nothing is proposed."
+
+    detail = unavailable or "model request failed"
+    return {
+        "summary": summary,
+        "patches": list(by_id.values()),
+        "blocked_agents_add": blocked,
+        "source": "rules",
+        "degraded": True,
+        "fallback": "keyword_rules",
+        "warning": (
+            f"Meta model unavailable ({detail}). "
+            "This proposal is a keyword-rules fallback and is not applied until you confirm."
+        ),
     }
 
 
@@ -621,21 +814,49 @@ Only reference endpoint ids and field keys from this schema:
 
 Owner instruction: {instruction}
 """
-    data = extract_json(
-        complete([{"role": "user", "content": prompt}], max_tokens=2500, temperature=0.1)
-    )
+    started = time.perf_counter()
+    card = model_card()
+
+    def rules(exc: BaseException) -> dict[str, Any]:
+        log.warning(
+            "policy model unavailable (%s); using keyword rules",
+            _public_model_error(exc),
+        )
+        return _stamp_call(
+            rule_propose_policy(instruction, endpoints, unavailable=_public_model_error(exc)),
+            started=started,
+            card=card,
+        )
+
+    try:
+        data = extract_json(
+            complete([{"role": "user", "content": prompt}], max_tokens=2500, temperature=0.1)
+        )
+    except Exception as exc:
+        return rules(exc)
     if not isinstance(data, dict):
-        raise ValueError("policy model did not return a JSON object")
+        note_model_failure("text", RuntimeError("policy model returned a non-object payload"))
+        return rules(RuntimeError("policy model returned a non-object payload"))
     patches = data.get("patches") or []
     if not isinstance(patches, list):
         patches = []
     known = {ep.get("id") for ep in endpoints}
     patches = [p for p in patches if isinstance(p, dict) and p.get("endpoint_id") in known]
-    return {
-        "summary": str(data.get("summary") or "Policy proposal"),
-        "patches": patches,
-        "blocked_agents_add": data.get("blocked_agents_add") or [],
-    }
+    blocked = data.get("blocked_agents_add") or []
+    if not isinstance(blocked, list):
+        blocked = []
+    return _stamp_call(
+        {
+            "summary": str(data.get("summary") or "Policy proposal"),
+            "patches": patches,
+            "blocked_agents_add": blocked,
+            "source": "model",
+            "degraded": False,
+            "fallback": None,
+        },
+        started=started,
+        card=card,
+    )
 
 
 def _activity_brief(
@@ -770,7 +991,7 @@ def summarize_activity(events: list[dict[str, Any]]) -> dict[str, Any]:
         event_count=min(len(events), 100),
     )
 
-    # Optional Muse polish — keep only if terse and grounded
+    # Optional Muse polish — keep only if terse and grounded. Counts stay local.
     polish_prompt = f"""Tighten this Aurif audit into JSON.
 Rules: max 2 sentences in summary; max 3 risk bullets; each risk ≤12 words; keep every number exact; invent nothing.
 Return ONLY JSON: {{"summary":"...","risks":["..."],"suggested_blocked_agents":["..."]}}
@@ -778,6 +999,10 @@ Return ONLY JSON: {{"summary":"...","risks":["..."],"suggested_blocked_agents":[
 Draft:
 {json.dumps(brief)}
 """
+    started = time.perf_counter()
+    card = model_card()
+    model_error: str | None = None
+    polished: Any = None
     try:
         polished = extract_json(
             complete(
@@ -792,10 +1017,13 @@ Draft:
                 temperature=0.1,
             )
         )
-    except Exception:
+    except Exception as exc:
+        model_error = _public_model_error(exc)
+        log.warning("activity summary model unavailable (%s); using counted brief", model_error)
         polished = None
 
     data = brief
+    used_model = False
     if isinstance(polished, dict):
         summary = str(polished.get("summary") or "").strip()
         words = len(summary.split())
@@ -814,14 +1042,41 @@ Draft:
                 "risks": risks or brief["risks"],
                 "suggested_blocked_agents": blocked or brief["suggested_blocked_agents"],
             }
+            used_model = True
 
-    return {
-        "summary": str(data.get("summary") or "").strip(),
-        "risks": data.get("risks") if isinstance(data.get("risks"), list) else [],
-        "suggested_blocked_agents": data.get("suggested_blocked_agents")
-        if isinstance(data.get("suggested_blocked_agents"), list)
-        else [],
-    }
+    if model_error:
+        source = "rules"
+        degraded = True
+        fallback = "activity_counts"
+        warning = _owner_warning("activity", RuntimeError(model_error))
+    elif used_model:
+        source = "model"
+        degraded = False
+        fallback = None
+        warning = None
+    else:
+        source = "rules"
+        degraded = False
+        fallback = "activity_counts"
+        warning = "The model reply did not keep the counted facts. Showing the local summary."
+
+    stamped = _stamp_call(
+        {
+            "summary": str(data.get("summary") or "").strip(),
+            "risks": data.get("risks") if isinstance(data.get("risks"), list) else [],
+            "suggested_blocked_agents": data.get("suggested_blocked_agents")
+            if isinstance(data.get("suggested_blocked_agents"), list)
+            else [],
+            "source": source,
+            "degraded": degraded,
+            "fallback": fallback,
+        },
+        started=started,
+        card=card,
+    )
+    if warning:
+        stamped["warning"] = warning
+    return stamped
 
 
 def _vision_config_error(cfg: dict[str, str]) -> str | None:

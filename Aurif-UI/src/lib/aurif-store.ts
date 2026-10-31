@@ -16,6 +16,24 @@ export type EventKind =
   | "handshake_denied"
   | "field_redacted";
 
+export interface MetaModelRef {
+  id?: string;
+  provider?: string;
+  label?: string;
+}
+
+export interface PurposeRisk {
+  risk: string;
+  reason: string;
+  source?: string;
+  degraded?: boolean;
+  fallback?: string | null;
+  warning?: string;
+  latencyMs?: number;
+  dropAct?: boolean;
+  model?: MetaModelRef;
+}
+
 export interface AgentEvent {
   id: string;
   time: string;
@@ -27,6 +45,9 @@ export interface AgentEvent {
   reason?: string;
   asked?: unknown;
   navigated?: string[];
+  purpose?: string;
+  grantedScopes?: string[];
+  purposeRisk?: PurposeRisk;
 }
 
 export interface Endpoint {
@@ -94,6 +115,34 @@ function mapEndpoint(raw: any): Endpoint {
   };
 }
 
+function mapModelRef(model: unknown): MetaModelRef | undefined {
+  if (!model) return undefined;
+  if (typeof model === "string") return { id: model, label: model };
+  if (typeof model === "object") {
+    const row = model as MetaModelRef;
+    return { id: row.id, provider: row.provider, label: row.label || row.id };
+  }
+  return undefined;
+}
+
+function mapPurposeRisk(raw: unknown): PurposeRisk | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const risk = raw as Record<string, unknown>;
+  const level = String(risk.risk || "").toLowerCase();
+  if (!level) return undefined;
+  return {
+    risk: level,
+    reason: String(risk.reason || ""),
+    source: typeof risk.source === "string" ? risk.source : undefined,
+    degraded: Boolean(risk.degraded),
+    fallback: typeof risk.fallback === "string" ? risk.fallback : risk.source === "rules" ? "keyword_rules" : null,
+    warning: typeof risk.warning === "string" ? risk.warning : undefined,
+    latencyMs: typeof risk.latency_ms === "number" ? risk.latency_ms : undefined,
+    dropAct: Boolean(risk.drop_act),
+    model: mapModelRef(risk.model),
+  };
+}
+
 function mapEvent(raw: any): AgentEvent {
   const kind = (raw.kind || "page") as EventKind;
   const detail = raw.detail || {};
@@ -102,6 +151,9 @@ function mapEvent(raw: any): AgentEvent {
     asked && typeof asked === "object"
       ? [asked.method, asked.path || asked.action_id, asked.query?.path].filter(Boolean).join(" ")
       : "";
+  const scopes = Array.isArray(detail.granted_scopes)
+    ? detail.granted_scopes.filter((scope: unknown) => typeof scope === "string")
+    : undefined;
   return {
     id: raw.id || crypto.randomUUID(),
     time: raw.ts ? new Date(raw.ts * 1000).toISOString() : new Date().toISOString(),
@@ -113,6 +165,9 @@ function mapEvent(raw: any): AgentEvent {
     reason: detail.reason,
     asked,
     navigated: Array.isArray(detail.navigated) ? detail.navigated.filter(Boolean) : raw.path ? [raw.path] : [],
+    purpose: typeof detail.purpose === "string" ? detail.purpose : undefined,
+    grantedScopes: scopes,
+    purposeRisk: mapPurposeRisk(detail.purpose_risk),
   };
 }
 
@@ -362,16 +417,33 @@ export async function refreshActivity(siteId: string) {
   replaceSite({ ...site, events: (data.events || []).map(mapEvent) });
 }
 
+export interface MetaFeatureResponse {
+  model: string;
+  model_info?: MetaModelRef;
+  latency_ms?: number | null;
+  source?: string;
+  degraded?: boolean;
+  fallback?: string | null;
+  warning?: string | null;
+}
+
 export async function proposePolicy(siteId: string, instruction: string) {
-  return api<{
-    ok: boolean;
-    proposal: {
-      summary: string;
-      patches: Array<Record<string, unknown>>;
-      blocked_agents_add?: string[];
-    };
-    model: string;
-  }>(`/api/sites/${siteId}/ai/policy-propose`, {
+  return api<
+    MetaFeatureResponse & {
+      ok: boolean;
+      proposal: {
+        summary: string;
+        patches: Array<Record<string, unknown>>;
+        blocked_agents_add?: string[];
+        source?: string;
+        degraded?: boolean;
+        fallback?: string | null;
+        warning?: string | null;
+        latency_ms?: number | null;
+        model?: MetaModelRef | string;
+      };
+    }
+  >(`/api/sites/${siteId}/ai/policy-propose`, {
     method: "POST",
     body: JSON.stringify({ instruction }),
   });
@@ -391,15 +463,22 @@ export async function applyPolicy(
 }
 
 export async function summarizeActivity(siteId: string) {
-  return api<{
-    ok: boolean;
-    summary: {
-      summary: string;
-      risks: string[];
-      suggested_blocked_agents: string[];
-    };
-    model: string;
-  }>(`/api/sites/${siteId}/ai/activity-summary`, { method: "POST", body: "{}" });
+  return api<
+    MetaFeatureResponse & {
+      ok: boolean;
+      summary: {
+        summary: string;
+        risks: string[];
+        suggested_blocked_agents: string[];
+        source?: string;
+        degraded?: boolean;
+        fallback?: string | null;
+        warning?: string | null;
+        latency_ms?: number | null;
+        model?: MetaModelRef | string;
+      };
+    }
+  >(`/api/sites/${siteId}/ai/activity-summary`, { method: "POST", body: "{}" });
 }
 
 export type MuseStep = {
