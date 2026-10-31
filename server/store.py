@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import secrets
 import threading
 import time
@@ -357,16 +356,12 @@ def set_endpoint_fields(
     return update_site(site_id, owner_id, {"endpoints": [patch]})
 
 
-_PRODUCT_PATH = re.compile(r"^/products/([a-z0-9-]+)$")
-
-
 def canonical_ai_path(raw: str | None) -> str:
     """Collapse an agent path to one canonical form.
 
     Duplicate slashes, dot segments, percent-encoding, and case differences
-    all land on the same path the page policy uses. Anything that is not
-    ``/``, ``/products``, ``/products/<slug>``, or ``/cart`` stays a distinct
-    path so callers can default-deny it.
+    all land on one path. Which of those paths an agent may open is decided
+    later, from the site's configured page endpoints — not from a fixed list.
     """
     text = unquote(str("/" if raw is None else raw))
     text = text.replace("\\", "/").replace("\x00", "").strip()
@@ -393,50 +388,59 @@ def canonical_ai_path(raw: str | None) -> str:
     return path
 
 
-def product_slug(path: str | None) -> str | None:
-    match = _PRODUCT_PATH.fullmatch(canonical_ai_path(path))
-    if not match:
-        return None
-    return match.group(1)
+def canonical_page_pattern(pattern: str | None) -> str:
+    """Normalize an owner-configured page path, keeping a trailing ``/*`` wildcard."""
+    text = str(pattern or "").strip()
+    if not text:
+        return ""
+    if text.endswith("/*"):
+        base = canonical_ai_path(text[:-2] or "/")
+        if base == "/":
+            return "/*"
+        return base.rstrip("/") + "/*"
+    return canonical_ai_path(text)
 
 
-def classify_ai_path(path: str | None) -> str:
-    """Return home, products, product, cart, or unmapped."""
+def capture_wildcard(pattern: str | None, path: str | None) -> str | None:
+    """Return the single path segment captured by a configured ``/*`` pattern."""
+    pattern = canonical_page_pattern(pattern)
     path = canonical_ai_path(path)
-    if path == "/":
-        return "home"
-    if path == "/products":
-        return "products"
-    if path == "/cart":
-        return "cart"
-    if _PRODUCT_PATH.fullmatch(path):
-        return "product"
-    return "unmapped"
+    if not pattern.endswith("/*"):
+        return None
+    prefix = pattern[:-1]
+    if not path.startswith(prefix):
+        return None
+    rest = path[len(prefix) :]
+    if not rest or "/" in rest:
+        return None
+    return rest
 
 
 def page_decision(site: dict[str, Any], raw: str | None) -> tuple[str, str]:
-    """Return ``(canonical_path, decision)`` where decision is allow, closed, or unmapped."""
+    """Return ``(canonical_path, decision)`` where decision is allow, closed, or unmapped.
+
+    The allow set is that site's page endpoints (the same rows the dashboard
+    toggles). A path that matches none of them is denied.
+    """
     path = canonical_ai_path(raw)
-    if classify_ai_path(path) == "unmapped":
-        return path, "unmapped"
     ep = find_endpoint(site, path=path)
-    if ep is None or not bool(ep.get("agent_access", True)):
+    if ep is None:
+        return path, "unmapped"
+    if not bool(ep.get("agent_access", True)):
         return path, "closed"
     return path, "allow"
 
 
 def _path_matches(pattern: str, path: str) -> bool:
-    """Exact or single-segment wildcard: `/products/*` → `/products/field-tote`."""
+    """Exact or single-segment wildcard from the site's own page patterns."""
+    pattern = canonical_page_pattern(pattern)
+    path = canonical_ai_path(path)
     if not pattern or not path:
         return False
     if pattern == path:
         return True
     if pattern.endswith("/*"):
-        prefix = pattern[:-1]  # keep trailing slash, e.g. /products/
-        if not path.startswith(prefix):
-            return False
-        rest = path[len(prefix) :]
-        return bool(rest) and "/" not in rest
+        return capture_wildcard(pattern, path) is not None
     return False
 
 
@@ -459,8 +463,10 @@ def find_endpoint(site: dict[str, Any], *, path: str | None = None, action_id: s
     pattern_hit: dict[str, Any] | None = None
     for ep in site.get("endpoints") or []:
         if path is not None and ep.get("kind") == "page":
-            ep_path = ep.get("path") or ""
-            if ep_path == path:
+            ep_path = canonical_page_pattern(ep.get("path") or "")
+            if not ep_path:
+                continue
+            if not ep_path.endswith("/*") and ep_path == path:
                 return ep
             if pattern_hit is None and _path_matches(ep_path, path):
                 pattern_hit = ep
