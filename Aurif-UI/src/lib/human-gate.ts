@@ -8,7 +8,10 @@ export type Challenge = {
   challenge_id?: string;
   type?: string;
   kind?: string;
+  /** Server-side only. Older responses may still include it; do not render it. */
   target?: string;
+  /** Distorted PNG of the characters to draw. The plaintext answer is not in this payload. */
+  image?: string;
   prompt?: string;
   hint?: string;
 };

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 import threading
 import time
@@ -11,6 +12,7 @@ import uuid
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import config
 from endpoints_default import DEFAULT_ENDPOINTS, ensure_endpoint_shape
@@ -90,6 +92,7 @@ def _migrate(data: dict[str, Any]) -> bool:
         home_keys = {f.get("key") for f in (home or {}).get("response_fields") or [] if isinstance(f, dict)}
         shop_keys = {f.get("key") for f in (shop or {}).get("response_fields") or [] if isinstance(f, dict)}
         # Migrate widget leftovers, per-product rows, and pre–page-type schemas.
+        # Shop element prices were added later; refresh so owners can see that toggle.
         legacy = any(
             (e.get("path") or "").endswith("/widget")
             or (e.get("action_id") or "").endswith(":widget")
@@ -103,6 +106,7 @@ def _migrate(data: dict[str, Any]) -> bool:
             and (
                 "page.product" not in ids
                 or "meta.products" not in shop_keys
+                or "elements[].meta.price" not in shop_keys
                 or bool(home_keys & {"meta.price", "rating", "discount", "reviews"})
             )
         )
@@ -353,6 +357,74 @@ def set_endpoint_fields(
     return update_site(site_id, owner_id, {"endpoints": [patch]})
 
 
+_PRODUCT_PATH = re.compile(r"^/products/([a-z0-9-]+)$")
+
+
+def canonical_ai_path(raw: str | None) -> str:
+    """Collapse an agent path to one canonical form.
+
+    Duplicate slashes, dot segments, percent-encoding, and case differences
+    all land on the same path the page policy uses. Anything that is not
+    ``/``, ``/products``, ``/products/<slug>``, or ``/cart`` stays a distinct
+    path so callers can default-deny it.
+    """
+    text = unquote(str("/" if raw is None else raw))
+    text = text.replace("\\", "/").replace("\x00", "").strip()
+    if not text:
+        return "/"
+    text = text.split("?", 1)[0].split("#", 1)[0].strip()
+    if not text:
+        return "/"
+    if not text.startswith("/"):
+        text = "/" + text
+    parts: list[str] = []
+    for part in text.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(part)
+    path = "/" + "/".join(parts)
+    path = path.lower()
+    if path in ("/index.html", "/index.htm"):
+        return "/"
+    return path
+
+
+def product_slug(path: str | None) -> str | None:
+    match = _PRODUCT_PATH.fullmatch(canonical_ai_path(path))
+    if not match:
+        return None
+    return match.group(1)
+
+
+def classify_ai_path(path: str | None) -> str:
+    """Return home, products, product, cart, or unmapped."""
+    path = canonical_ai_path(path)
+    if path == "/":
+        return "home"
+    if path == "/products":
+        return "products"
+    if path == "/cart":
+        return "cart"
+    if _PRODUCT_PATH.fullmatch(path):
+        return "product"
+    return "unmapped"
+
+
+def page_decision(site: dict[str, Any], raw: str | None) -> tuple[str, str]:
+    """Return ``(canonical_path, decision)`` where decision is allow, closed, or unmapped."""
+    path = canonical_ai_path(raw)
+    if classify_ai_path(path) == "unmapped":
+        return path, "unmapped"
+    ep = find_endpoint(site, path=path)
+    if ep is None or not bool(ep.get("agent_access", True)):
+        return path, "closed"
+    return path, "allow"
+
+
 def _path_matches(pattern: str, path: str) -> bool:
     """Exact or single-segment wildcard: `/products/*` → `/products/field-tote`."""
     if not pattern or not path:
@@ -382,6 +454,8 @@ def _action_matches(pattern: str, action_id: str) -> bool:
 
 def find_endpoint(site: dict[str, Any], *, path: str | None = None, action_id: str | None = None) -> dict[str, Any] | None:
     """Resolve page/action endpoint. Exact match wins, then wildcard patterns."""
+    if path is not None:
+        path = canonical_ai_path(path)
     pattern_hit: dict[str, Any] | None = None
     for ep in site.get("endpoints") or []:
         if path is not None and ep.get("kind") == "page":
@@ -401,13 +475,10 @@ def find_endpoint(site: dict[str, Any], *, path: str | None = None, action_id: s
 
 def endpoint_allowed(site: dict[str, Any], *, path: str | None = None, action_id: str | None = None) -> bool:
     if path is not None:
-        norm = path if path.startswith("/") else "/" + path
-        if norm != "/" and norm.endswith("/"):
-            norm = norm.rstrip("/")
-        ep = find_endpoint(site, path=norm)
-        if ep is None:
-            return True
-        return bool(ep.get("agent_access", True))
+        # Unmapped paths are denied. A miss used to allow the request, which
+        # let /products/x/<slug> skip the product-page policy.
+        _, decision = page_decision(site, path)
+        return decision == "allow"
     if action_id is not None:
         ep = find_endpoint(site, action_id=action_id)
         if ep is None:
