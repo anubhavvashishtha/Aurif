@@ -104,10 +104,11 @@ Browsing pages with `view` works without keys. Adding to the cart still works fo
 
 Set **one** key in the repo-root `.env`. See [`.env.example`](.env.example) and [docs/MODELS.md](docs/MODELS.md).
 
-- `MODEL_API_KEY` or `META_API_KEY` — Muse Spark 1.3 on the Meta Model API (text and CAPTCHA vision).
-- Or `BASETEN_API_KEY` alone — Muse Spark Open (`BASETEN_MODEL`, default `meta-models/muse-spark-open-1026`) for both. Optional `META_*` overrides are in `docs/MODELS.md`.
+- `MODEL_API_KEY` or `META_API_KEY` — Muse Spark 1.3 on the Meta Model API for text (handshake, policy, activity, Muse chat).
+- Or `BASETEN_API_KEY` alone — Muse Spark Open (`BASETEN_MODEL`, default `meta-models/muse-spark-open-1026`) for text.
+- The same `BASETEN_API_KEY` is the draw-CAPTCHA vision key. Vision defaults to DeepSeek V4.1 Flash (`VISION_MODEL`, default `deepseek-ai/DeepSeek-V4.1-Flash-1017`) at `https://inference.baseten.co/v1`. It does not follow the text model. Optional `VISION_*` and `META_VISION_*` overrides are in `docs/MODELS.md`.
 
-`MODAL_*` is not read. A DeepSeek model id is refused. Startup prints the active provider and model (not the key).
+`MODAL_*` is not read. A DeepSeek model id is refused for text and is the vision default. Startup prints the active provider and model (not the key).
 
 ---
 
@@ -175,7 +176,7 @@ curl -s "http://127.0.0.1:8787/ai/page?path=/products" \
 
 ## Models (hackathon)
 
-Product AI runs in **server + Aurif-UI** (not Demo-client). Text and CAPTCHA vision both call a Meta model. With `MODEL_API_KEY` or `META_API_KEY`, that is **Muse Spark 1.3** on the Meta Model API (`https://api.meta.ai/v1`). With only `BASETEN_API_KEY`, text and vision stay on **Muse Spark Open** (`BASETEN_MODEL`, default `meta-models/muse-spark-open-1026`) at `https://inference.baseten.co/v1`. Startup prints which provider and model are active. Calls time out (`META_TIMEOUT_SECONDS`, default 8s; vision 15s) and do not retry a hung read. If the model is down, handshake risk uses keyword rules (shopping purposes can still get `act`; vague or scraping purposes stay view-only) and the human gate accepts a typed code or a non-blank sketch for the storefront only. `GET /api/health` reports the failure. A DeepSeek model id is refused. There is no Modal fallback.
+Product AI runs in **server + Aurif-UI** (not Demo-client). Text calls a Meta model. With `MODEL_API_KEY` or `META_API_KEY`, that is **Muse Spark 1.3** on the Meta Model API (`https://api.meta.ai/v1`). With only `BASETEN_API_KEY`, text stays on **Muse Spark Open** (`BASETEN_MODEL`, default `meta-models/muse-spark-open-1026`) at `https://inference.baseten.co/v1`. Draw-CAPTCHA vision is **DeepSeek V4.1 Flash** (`deepseek-ai/DeepSeek-V4.1-Flash-1017`) on that same Baseten endpoint, using `BASETEN_API_KEY`. Health and the dashboard show the two models separately. DeepSeek is not labelled as Meta. Startup prints which provider and model are active. Calls time out (`META_TIMEOUT_SECONDS`, default 8s; vision `META_VISION_TIMEOUT_SECONDS`, default 15s) and do not retry a hung read. If the model is down, handshake risk uses keyword rules (shopping purposes can still get `act`; vague or scraping purposes stay view-only) and the human gate accepts a typed code or a non-blank sketch for the storefront only. `GET /api/health` reports the failure. A DeepSeek model id is refused for text. There is no Modal fallback.
 
 | Feature | Where | Model |
 |---------|--------|--------|
@@ -183,7 +184,7 @@ Product AI runs in **server + Aurif-UI** (not Demo-client). Text and CAPTCHA vis
 | Policy co-pilot | Endpoints | same |
 | Activity summary | Activity | same |
 | Muse chat phrasing | Agent dashboard | same |
-| CAPTCHA vision | Human gate | active vision model (same as text unless `META_VISION_*` is set) |
+| CAPTCHA vision | Human gate | DeepSeek V4.1 Flash on Baseten, unless `VISION_*` or `META_VISION_*` is set |
 
 See [docs/MODELS.md](docs/MODELS.md).
 

@@ -1,9 +1,14 @@
-"""Meta model client for Aurif product AI features.
+"""Model client for Aurif product AI features.
 
-Preferred host is the Meta Model API (Muse Spark 1.3). If that key is unset
-and BASETEN_API_KEY is present, text and vision stay on Baseten Muse Spark
-Open (meta-models/muse-spark-open-1026), which already accepted CAPTCHA images.
-DeepSeek and Modal are not used.
+Text (handshake risk, policy co-pilot, activity summaries, Muse chat) stays on
+a Meta model: Muse Spark 1.3 on the Meta Model API, or Muse Spark Open on
+Baseten when only BASETEN_API_KEY is set.
+
+Draw-CAPTCHA vision is separate. It defaults to DeepSeek V4.1 Flash on
+Baseten's OpenAI-compatible endpoint and uses BASETEN_API_KEY. VISION_* (and
+the older META_VISION_* names, when the matching VISION_* var is unset) can
+point that call at another host later. Modal is not used. A non-Meta id is
+refused for text only.
 """
 
 from __future__ import annotations
@@ -33,6 +38,10 @@ META_DEFAULT_MODEL = "muse-spark-1.3"
 # draw-CAPTCHA path already sent images to this id when Modal was down.
 BASETEN_BASE_URL = "https://inference.baseten.co/v1"
 BASETEN_DEFAULT_MODEL = "meta-models/muse-spark-open-1026"
+
+# Draw-CAPTCHA only. Text never reads these defaults.
+VISION_DEFAULT_MODEL = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+VISION_DEFAULT_BASE_URL = BASETEN_BASE_URL
 
 log = logging.getLogger("aurif.models")
 
@@ -119,22 +128,68 @@ def text_settings() -> dict[str, str]:
 
 
 def vision_settings() -> dict[str, str]:
-    """Vision endpoint. Unset vision vars inherit the text Meta endpoint."""
-    text = text_settings()
+    """Draw-CAPTCHA endpoint. Does not inherit the text model.
+
+    VISION_MODEL / VISION_BASE_URL / VISION_API_KEY / VISION_PROVIDER are the
+    canonical knobs. Each META_VISION_* var still applies when the matching
+    VISION_* var is unset, so an existing vision override keeps working.
+    The default is DeepSeek on Baseten, authenticated with BASETEN_API_KEY.
+    """
+    _refresh_env()
+    model = _first_env("VISION_MODEL", "META_VISION_MODEL") or VISION_DEFAULT_MODEL
+    base_url = (
+        _first_env("VISION_BASE_URL", "META_VISION_BASE_URL") or VISION_DEFAULT_BASE_URL
+    ).rstrip("/")
+    provider = _first_env("VISION_PROVIDER", "META_VISION_PROVIDER") or _infer_vision_provider(base_url)
+    # A DeepSeek (or other non-Meta) id must not be labelled as Meta, even if
+    # someone set VISION_PROVIDER=meta by mistake.
+    if _model_family(model) != "meta" and provider.lower() == "meta":
+        provider = _infer_vision_provider(base_url)
     return {
-        "provider": _first_env("META_VISION_PROVIDER") or text["provider"],
-        "base_url": (_first_env("META_VISION_BASE_URL") or text["base_url"]).rstrip("/"),
-        "model": _first_env("META_VISION_MODEL") or text["model"],
-        "api_key": _first_env("META_VISION_API_KEY") or text["api_key"],
+        "provider": provider,
+        "base_url": base_url,
+        "model": model,
+        "api_key": _vision_api_key(base_url, model),
     }
+
+
+def _infer_vision_provider(base_url: str) -> str:
+    host = (base_url or "").lower()
+    if "baseten" in host:
+        return "baseten"
+    if "api.meta.ai" in host:
+        return "meta"
+    if "modal" in host:
+        return "modal"
+    return "openai-compatible"
+
+
+def _vision_api_key(base_url: str, model: str) -> str:
+    """Key for the vision host. Explicit vision keys win, then a host default.
+
+    Baseten (the default) uses BASETEN_API_KEY. The Meta Model API uses the
+    Meta key so the owner can point vision back at Muse without a new secret.
+    Any other host still defaults to BASETEN_API_KEY until VISION_API_KEY is set.
+    """
+    explicit = _first_env("VISION_API_KEY", "META_VISION_API_KEY")
+    if explicit:
+        return explicit
+    host = (base_url or "").lower()
+    if "api.meta.ai" in host or (_model_family(model) == "meta" and "baseten" not in host):
+        return _first_env("META_API_KEY", "MODEL_API_KEY", "BASETEN_API_KEY")
+    return _first_env("BASETEN_API_KEY")
 
 
 def public_settings(cfg: dict[str, str]) -> dict[str, str]:
     """Settings safe to return from an API (no key)."""
+    card = _public_card(cfg)
     return {
         "provider": cfg.get("provider") or "",
         "base_url": cfg.get("base_url") or "",
         "model": cfg.get("model") or "",
+        "label": card["label"],
+        "family": card["family"],
+        "powered_by": card["powered_by"],
     }
 
 
@@ -144,13 +199,12 @@ def text_model_id() -> str:
 
 def model_card() -> dict[str, str]:
     """Configured text model, safe to show in the dashboard. No API key."""
-    cfg = text_settings()
-    model = cfg.get("model") or ""
-    return {
-        "id": model,
-        "provider": cfg.get("provider") or "",
-        "label": _model_label(model),
-    }
+    return _public_card(text_settings())
+
+
+def vision_model_card() -> dict[str, str]:
+    """Configured vision model. DeepSeek is never labelled as Meta."""
+    return _public_card(vision_settings())
 
 
 def _stamp_call(result: dict[str, Any], *, started: float, card: dict[str, str]) -> dict[str, Any]:
@@ -223,6 +277,16 @@ def _meta_extra(base_url: str) -> dict[str, Any]:
     return {"reasoning_effort": effort}
 
 
+def _model_family(model_id: str) -> str:
+    """meta, deepseek, or other. Used so labels never call DeepSeek a Meta model."""
+    mid = model_id or ""
+    if "deepseek" in mid.lower():
+        return "deepseek"
+    if _META_MODEL_OK.search(mid):
+        return "meta"
+    return "other"
+
+
 def _model_label(model_id: str) -> str:
     tail = (model_id or "").split("/")[-1]
     if "muse-spark-open" in model_id:
@@ -233,16 +297,57 @@ def _model_label(model_id: str) -> str:
     return tail or model_id
 
 
+def _public_model_label(model_id: str) -> str:
+    mid = model_id or ""
+    low = mid.lower()
+    if "deepseek" in low and "flash" in low:
+        return "DeepSeek V4.1 Flash"
+    if "deepseek" in low:
+        tail = mid.split("/")[-1]
+        return tail or "DeepSeek"
+    return _model_label(mid)
+
+
+def _public_card(cfg: dict[str, str]) -> dict[str, str]:
+    """Safe model card. `powered_by` already includes "Meta" only for Meta models."""
+    model = cfg.get("model") or ""
+    family = _model_family(model)
+    label = _public_model_label(model)
+    powered = f"Meta {label}" if family == "meta" else label
+    return {
+        "id": model,
+        "provider": cfg.get("provider") or "",
+        "label": label,
+        "family": family,
+        "powered_by": powered,
+    }
+
+
+def _vision_identity(cfg: dict[str, str]) -> dict[str, str]:
+    card = _public_card(cfg)
+    return {
+        "model": card["id"],
+        "provider": card["provider"],
+        "label": card["label"],
+        "family": card["family"],
+        "powered_by": card["powered_by"],
+    }
+
+
 def log_active_models(*, echo: bool = False) -> None:
     """Log the text and vision provider/model. Never includes the API key."""
     lines: list[str] = []
     for kind, loader in (("text", text_settings), ("vision", vision_settings)):
         cfg = loader()
         try:
-            _reject_non_meta_target(cfg["model"], cfg["base_url"], kind=kind)
+            # Non-Meta ids are refused for text only. Vision may be DeepSeek.
+            if kind != "vision":
+                _reject_non_meta_target(cfg["model"], cfg["base_url"], kind=kind)
+            card = _public_card(cfg)
             line = (
                 f"Aurif {kind} model: provider={cfg['provider']} "
-                f"model={cfg['model']} base_url={cfg['base_url']} "
+                f"model={cfg['model']} label={card['label']} family={card['family']} "
+                f"base_url={cfg['base_url']} "
                 f"key={'set' if cfg.get('api_key') else 'missing'}"
             )
             log.info(line)
@@ -258,8 +363,9 @@ def log_active_models(*, echo: bool = False) -> None:
 def api_providers() -> dict[str, Any]:
     """Model-catalog providers. `text` and `vision` are the live endpoints.
 
-    `baseten.base_url` is the previous response field. `modal` is omitted:
-    it was the DeepSeek host, and the dashboard does not read `providers`.
+    Text is a Meta model. Vision defaults to DeepSeek on Baseten and is not
+    described as Meta. `baseten.base_url` is the previous response field.
+    `modal` is omitted: Modal is not a vision host.
     """
     return {
         "text": public_settings(text_settings()),
@@ -299,7 +405,7 @@ def _client(cfg: dict[str, str], *, kind: str) -> OpenAI:
             f"{kind} provider misconfigured: set META_API_KEY, MODEL_API_KEY, "
             "or BASETEN_API_KEY in the repo root .env"
             + (
-                " (or META_VISION_API_KEY for vision)"
+                " (or VISION_API_KEY / META_VISION_API_KEY for vision)"
                 if kind == "vision"
                 else ""
             )
@@ -308,7 +414,9 @@ def _client(cfg: dict[str, str], *, kind: str) -> OpenAI:
         raise RuntimeError(f"{kind} provider misconfigured: base URL is empty")
     if not cfg.get("model"):
         raise RuntimeError(f"{kind} provider misconfigured: model name is empty")
-    _reject_non_meta_target(cfg["model"], cfg["base_url"], kind=kind)
+    # Text stays on Meta. Vision is allowed to call DeepSeek or a later model.
+    if kind != "vision":
+        _reject_non_meta_target(cfg["model"], cfg["base_url"], kind=kind)
     return OpenAI(
         api_key=cfg["api_key"],
         base_url=cfg["base_url"],
@@ -327,7 +435,11 @@ def _bounded_float(raw: str, default: float, *, lo: float, hi: float) -> float:
 
 def _timeout_seconds(kind: str) -> float:
     if kind == "vision":
-        raw = _first_env("META_VISION_TIMEOUT_SECONDS", "META_TIMEOUT_SECONDS")
+        raw = _first_env(
+            "VISION_TIMEOUT_SECONDS",
+            "META_VISION_TIMEOUT_SECONDS",
+            "META_TIMEOUT_SECONDS",
+        )
         default = _DEFAULT_VISION_TIMEOUT
     else:
         raw = _first_env("META_TIMEOUT_SECONDS")
@@ -350,10 +462,12 @@ def _public_model_error(exc: BaseException) -> str:
     text = str(exc).lower()
     if "timeout" in name.lower() or "timed out" in text:
         return "model timed out"
+    # Match the text-model refusal itself, before the generic misconfigured
+    # check. A vision error that only quotes the DeepSeek model id is not this.
+    if "not a meta model" in text or "refusing deepseek" in text:
+        return "non-Meta model refused"
     if "misconfigured" in text or "api_key" in text or "key missing" in text or "not set" in text:
         return "model key missing or provider misconfigured"
-    if "deepseek" in text or "not a meta model" in text:
-        return "non-Meta model refused"
     status = getattr(exc, "status_code", None)
     if status:
         return f"model request failed ({status})"
@@ -471,9 +585,13 @@ def _status_side(kind: str, cfg: dict[str, str]) -> dict[str, Any]:
             configured = False
     last_ok = state["ok"]
     degraded = (not configured) or last_ok is False
+    card = _public_card(cfg)
     return {
         "provider": cfg.get("provider") or "",
         "model": cfg.get("model") or "",
+        "label": card["label"],
+        "family": card["family"],
+        "powered_by": card["powered_by"],
         "base_url": cfg.get("base_url") or "",
         "key_configured": key_ok,
         "timeout_seconds": _timeout_seconds(kind),
@@ -1093,72 +1211,151 @@ Draft:
 
 
 def _vision_config_error(cfg: dict[str, str]) -> str | None:
-    try:
-        if not cfg.get("api_key"):
-            return (
-                "vision provider misconfigured: set META_VISION_API_KEY, "
-                "META_API_KEY, MODEL_API_KEY, or BASETEN_API_KEY in the repo root .env"
-            )
-        if not cfg.get("base_url"):
-            return "vision provider misconfigured: META_VISION_BASE_URL / META_BASE_URL is empty"
-        if not cfg.get("model"):
-            return "vision provider misconfigured: META_VISION_MODEL / META_MODEL is empty"
-        _reject_non_meta_target(cfg["model"], cfg["base_url"], kind="vision")
-    except RuntimeError as e:
-        return str(e)
+    if not cfg.get("api_key"):
+        return (
+            "vision provider misconfigured: set VISION_API_KEY or BASETEN_API_KEY "
+            "in the repo root .env (META_VISION_API_KEY still applies when VISION_API_KEY is unset)"
+        )
+    if not cfg.get("base_url"):
+        return "vision provider misconfigured: VISION_BASE_URL / META_VISION_BASE_URL is empty"
+    if not cfg.get("model"):
+        return "vision provider misconfigured: VISION_MODEL / META_VISION_MODEL is empty"
     return None
 
 
-def verify_drawing(image_data_url: str, target: str) -> dict[str, Any]:
-    """Vision check: does the sketch show the target?
+def _as_bool(value: Any) -> bool:
+    """True only for real truthy flags. The string \"false\" must not pass."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "yes", "1"}
+    return False
 
-    Uses only the configured Meta vision model. A missing key, a DeepSeek model
-    id, or an upstream error is returned to the caller. There is no fallback.
+
+def _norm_glyph(value: str) -> str:
+    return "".join(ch for ch in (value or "").upper() if ch.isalnum())
+
+
+# First token of the vision reason. A lenient model that says match=true and
+# also admits the pad is blank or scribbled is still a rejection.
+_REJECT_REASONS = {
+    "blank",
+    "empty",
+    "scribble",
+    "scribbled",
+    "doodle",
+    "mismatch",
+    "wrong",
+    "unrelated",
+    "gibberish",
+    "unclear",
+    "unreadable",
+    "typed",
+    "typed_or_machine",
+    "machine",
+    "screenshot",
+}
+
+
+def _reason_code(reason: str) -> str:
+    token = (reason or "").strip().lower().split(" ", 1)[0] if reason else ""
+    return token.strip(".,:;\"'")
+
+
+def _judge_drawing(data: dict[str, Any], target: str) -> dict[str, Any]:
+    """Strict parse of the vision JSON.
+
+    A pass needs match, a hand-drawn flag, and read_as equal to the prompt.
+    Blank, scribbled, or non-matching drawings fail. A correct read_as does
+    not override match=false.
+    """
+    match = _as_bool(data.get("match"))
+    human_like = _as_bool(data.get("human_like")) if "human_like" in data else False
+    read_as = _norm_glyph(str(data.get("read_as") or ""))
+    expected = _norm_glyph(target)
+    reason = str(data.get("reason") or "")[:200]
+    if _reason_code(reason) in _REJECT_REASONS:
+        match = False
+    if "confidence" in data and data.get("confidence") is not None:
+        try:
+            confidence = float(data.get("confidence"))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if confidence < 0.8:
+            match = False
+            if not reason:
+                reason = "low confidence"
+    if not read_as or read_as != expected:
+        match = False
+        if not reason:
+            reason = "drawing does not match the prompt" if read_as else "could not read the drawing"
+    if match and not human_like and not reason:
+        reason = "looks machine-made, not hand-drawn"
+    ok = bool(match and human_like and read_as == expected and expected)
+    return {
+        "ok": ok,
+        "match": match,
+        "human_like": human_like,
+        "read_as": read_as,
+        "reason": reason,
+    }
+
+
+def verify_drawing(image_data_url: str, target: str) -> dict[str, Any]:
+    """Vision check: does the sketch show the requested characters?
+
+    Calls the configured vision model (DeepSeek on Baseten by default).
+    A missing key or an upstream error is returned as unavailable so the
+    human gate can open the storefront without granting agent act.
+    A readable judgement that does not match is a hard rejection.
     """
     cfg = vision_settings()
-    model = cfg["model"]
-    provider = cfg["provider"]
+    identity = _vision_identity(cfg)
     target = (target or "").strip().upper()
     raw = (image_data_url or "").strip()
     if not raw.startswith("data:image/"):
-        return {"ok": False, "reason": "expected a drawing image", "model": model, "provider": provider}
+        return {"ok": False, "reason": "expected a drawing image", **identity}
     if len(raw) > 1_800_000:
-        return {"ok": False, "reason": "drawing too large", "model": model, "provider": provider}
+        return {"ok": False, "reason": "drawing too large", **identity}
 
     problem = _vision_config_error(cfg)
     if problem:
         note_model_failure("vision", RuntimeError(problem))
-        return {
-            "ok": False,
-            "unavailable": True,
-            "reason": problem,
-            "model": model,
-            "provider": provider,
-        }
+        return {"ok": False, "unavailable": True, "reason": problem, **identity}
 
-    prompt = f"""CAPTCHA check. Target to draw: "{target}"
+    prompt = f"""CAPTCHA check. The required drawing is exactly "{target}".
 
-Look at the image. Decide if a human roughly hand-drew "{target}".
-Imperfect strokes OK.
+You are a strict vision judge. Pass only a hand-drawn "{target}".
+Reject anything else.
 
-Rules:
-- match=true only if the drawing shows "{target}"
-- human_like=true only for messy hand strokes (mouse/finger sketch)
-- human_like=false for typed fonts, perfect glyphs, screenshots, blank, or bot-rendered text
-- Reject blank or wrong characters with match=false
+Set match=false when any of these are true:
+- the pad is blank, nearly blank, a single stroke, a scribble, a doodle, or random marks
+- the drawing is a different character, word, number, or object than "{target}"
+- you are unsure what the strokes depict
+- the marks are typed text, a font, a screenshot, or machine-rendered
 
-End your reply with ONE JSON object (no markdown):
-{{"match":true,"human_like":true,"read_as":"{target}","reason":"ok"}}
-or
-{{"match":false,"human_like":false,"read_as":"","reason":"blank"}}
-or
-{{"match":true,"human_like":false,"read_as":"{target}","reason":"typed_or_machine"}}
+Set match=true only when the strokes are clearly "{target}" and nothing else.
+Set human_like=true only for uneven mouse or finger strokes.
+Set human_like=false for typed, perfect, blank, or machine-made marks.
+Set read_as to only the characters you can actually see, in order, or "" if you cannot read them.
+Do not copy "{target}" into read_as unless those exact characters are visible.
+Set confidence from 0 to 1. Use a value below 0.8 when the drawing is unclear, partial, or scribbled.
+
+Reply with ONE JSON object and no markdown:
+{{"match":false,"human_like":false,"read_as":"","confidence":0,"reason":"blank"}}
+or, only for a clear hand drawing of "{target}":
+{{"match":true,"human_like":true,"read_as":"{target}","confidence":0.95,"reason":"ok"}}
 """
     # Images are only honored on user messages (Meta Model API returns 400 otherwise).
     messages = [
         {
             "role": "system",
-            "content": "You verify drawings. Always end with a single JSON object.",
+            "content": (
+                "You are a strict CAPTCHA judge. Reject blank, scribbled, and "
+                "non-matching drawings. End with one JSON object."
+            ),
         },
         {
             "role": "user",
@@ -1171,7 +1368,7 @@ or
 
     try:
         kwargs: dict[str, Any] = {
-            "model": model,
+            "model": cfg["model"],
             "messages": messages,
             "stream": False,
             "max_tokens": _output_tokens(2048, cfg["base_url"]),
@@ -1186,9 +1383,8 @@ or
         return {
             "ok": False,
             "unavailable": True,
-            "reason": f"vision provider error ({provider} {model}): {err}",
-            "model": model,
-            "provider": provider,
+            "reason": f"vision provider error ({identity['provider']} {identity['model']}): {err}",
+            **identity,
         }
 
     try:
@@ -1208,8 +1404,7 @@ or
                 "unavailable": True,
                 "reason": "vision model returned unreadable result",
                 "raw": text[:200],
-                "model": model,
-                "provider": provider,
+                **identity,
             }
     if not isinstance(data, dict):
         note_model_failure("vision", RuntimeError("invalid vision response"))
@@ -1217,28 +1412,8 @@ or
             "ok": False,
             "unavailable": True,
             "reason": "invalid vision response",
-            "model": model,
-            "provider": provider,
+            **identity,
         }
 
-    match = bool(data.get("match"))
-    # Default False: missing human_like must not accidentally pass bots.
-    human_like = bool(data.get("human_like")) if "human_like" in data else False
-    read_as = str(data.get("read_as") or "").strip().upper().replace(" ", "")
-    reason = str(data.get("reason") or "")[:200]
-    # Correct glyph alone is not enough — typed/bot renders often match the target.
-    if not match and read_as == target and human_like:
-        match = True
-    ok = bool(match and human_like)
-    if match and not human_like and not reason:
-        reason = "looks machine-made, not hand-drawn"
-    return {
-        "ok": ok,
-        "unavailable": False,
-        "match": match,
-        "human_like": human_like,
-        "read_as": read_as,
-        "reason": reason,
-        "model": model,
-        "provider": provider,
-    }
+    judged = _judge_drawing(data, target)
+    return {"unavailable": False, **judged, **identity}

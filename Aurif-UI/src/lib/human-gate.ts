@@ -16,11 +16,23 @@ export type Challenge = {
   hint?: string;
 };
 
+export type VisionModelCard = {
+  id?: string;
+  provider?: string;
+  label?: string;
+  family?: string;
+  powered_by?: string;
+};
+
 export type GateStatus = {
   ok?: boolean;
   site_name?: string;
   require_human_captcha?: boolean;
   api_base?: string;
+  models?: {
+    text?: VisionModelCard;
+    vision?: VisionModelCard;
+  };
 };
 
 export function getHumanToken(): string {

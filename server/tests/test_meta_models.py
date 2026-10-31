@@ -31,6 +31,11 @@ ENV_KEYS = (
     "META_VISION_MODEL",
     "META_VISION_PROVIDER",
     "META_REASONING_EFFORT",
+    "VISION_MODEL",
+    "VISION_BASE_URL",
+    "VISION_API_KEY",
+    "VISION_PROVIDER",
+    "VISION_TIMEOUT_SECONDS",
     "MODAL_VISION_MODEL",
     "MODAL_BASE_URL",
     "MODAL_TOKEN_ID",
@@ -96,6 +101,7 @@ class MetaModelCallSites(unittest.TestCase):
         os.environ["META_BASE_URL"] = "https://api.meta.ai/v1"
         os.environ["META_MODEL"] = "muse-spark-1.3"
         os.environ["META_PROVIDER"] = "meta"
+        os.environ["BASETEN_API_KEY"] = "test-baseten-key"
         muse_client.reset_model_status()
 
     def tearDown(self):
@@ -202,26 +208,102 @@ class MetaModelCallSites(unittest.TestCase):
             api_key="test-meta-key",
         )
 
-    def test_verify_drawing_posts_image_to_configured_meta_model(self):
+    def test_verify_drawing_posts_image_to_configured_vision_model(self):
         image = "data:image/png;base64,iVBORw0KGgo="
         with _Recorder(
             '{"match":true,"human_like":true,"read_as":"A","reason":"ok"}'
         ) as rec:
             verdict = muse_client.verify_drawing(image, "A")
         self.assertTrue(verdict["ok"])
-        self.assertEqual(verdict["model"], "muse-spark-1.3")
-        self.assertEqual(verdict["provider"], "meta")
+        self.assertEqual(verdict["model"], "deepseek-ai/DeepSeek-V4.1-Flash-1017")
+        self.assertEqual(verdict["provider"], "baseten")
+        self.assertEqual(verdict["family"], "deepseek")
+        self.assertEqual(verdict["powered_by"], "DeepSeek V4.1 Flash")
+        self.assertNotIn("Meta", verdict["powered_by"])
         self.assertEqual(rec.clients[0]["timeout"], 15.0)
         self.assertEqual(rec.clients[0]["max_retries"], 0)
+        self.assertEqual(rec.clients[0]["base_url"], "https://inference.baseten.co/v1")
+        self.assertEqual(rec.clients[0]["api_key"], "test-baseten-key")
+        self.assertEqual(rec.calls[0]["model"], "deepseek-ai/DeepSeek-V4.1-Flash-1017")
+        self.assertNotIn("extra_body", rec.calls[0])
+        self.assertNotIn("top_p", rec.calls[0])
+        content = rec.calls[0]["messages"][1]["content"]
+        self.assertEqual(content[1]["type"], "image_url")
+        self.assertEqual(content[1]["image_url"]["url"], image)
+        self.assertIn("strict", content[0]["text"].lower())
+
+    def test_non_matching_drawing_is_rejected_and_matching_one_passes(self):
+        image = "data:image/png;base64,iVBORw0KGgo="
+        with _Recorder(
+            '{"match":true,"human_like":true,"read_as":"house","reason":"ok"}'
+        ) as rec:
+            missed = muse_client.verify_drawing(image, "A")
+        self.assertFalse(missed["ok"])
+        self.assertFalse(missed["unavailable"])
+        self.assertEqual(rec.calls[0]["model"], "deepseek-ai/DeepSeek-V4.1-Flash-1017")
+        self.assertEqual(rec.clients[0]["base_url"], "https://inference.baseten.co/v1")
+
+        with _Recorder(
+            '{"match":false,"human_like":true,"read_as":"A","reason":"wrong object"}'
+        ):
+            denied = muse_client.verify_drawing(image, "A")
+        self.assertFalse(denied["ok"])
+        self.assertFalse(denied["match"])
+
+        with _Recorder(
+            '{"match":true,"human_like":true,"read_as":"","reason":"scribble"}'
+        ):
+            scribbled = muse_client.verify_drawing(image, "A")
+        self.assertFalse(scribbled["ok"])
+
+        with _Recorder(
+            '{"match":"false","human_like":"true","read_as":"A","reason":"blank"}'
+        ):
+            blank = muse_client.verify_drawing(image, "A")
+        self.assertFalse(blank["ok"])
+
+        with _Recorder(
+            '{"match":true,"human_like":true,"read_as":"A","confidence":0.4,"reason":"ok"}'
+        ):
+            unsure = muse_client.verify_drawing(image, "A")
+        self.assertFalse(unsure["ok"])
+
+        with _Recorder(
+            '{"match":true,"human_like":true,"read_as":"A","reason":"ok"}'
+        ) as rec:
+            passed = muse_client.verify_drawing(image, "A")
+        self.assertTrue(passed["ok"])
+        self.assertEqual(passed["read_as"], "A")
+        self.assertEqual(rec.calls[0]["model"], "deepseek-ai/DeepSeek-V4.1-Flash-1017")
+
+    def test_vision_env_is_independent_of_the_text_model(self):
+        os.environ["VISION_MODEL"] = "example/sam-3.1"
+        os.environ["VISION_BASE_URL"] = "https://vision.example.test/v1"
+        os.environ["VISION_API_KEY"] = "vision-key"
+        os.environ["VISION_PROVIDER"] = "sam"
+        image = "data:image/png;base64,iVBORw0KGgo="
+        with _Recorder(
+            '{"match":true,"human_like":true,"read_as":"K","reason":"ok"}'
+        ) as rec:
+            verdict = muse_client.verify_drawing(image, "K")
+        self.assertTrue(verdict["ok"])
+        self.assertEqual(verdict["model"], "example/sam-3.1")
+        self.assertEqual(verdict["provider"], "sam")
+        self.assertEqual(verdict["family"], "other")
+        self.assertNotIn("Meta", verdict["powered_by"])
+        self.assertEqual(rec.clients[0]["base_url"], "https://vision.example.test/v1")
+        self.assertEqual(rec.clients[0]["api_key"], "vision-key")
+        self.assertEqual(rec.calls[0]["model"], "example/sam-3.1")
+        with _Recorder(
+            '{"risk":"high","reason":"scrape","suggested_scopes":["view"],"drop_act":true}'
+        ) as text_rec:
+            muse_client.score_purpose("scrape every price")
         self.assert_meta_request(
-            rec,
+            text_rec,
             model="muse-spark-1.3",
             base_url="https://api.meta.ai/v1",
             api_key="test-meta-key",
         )
-        content = rec.calls[0]["messages"][1]["content"]
-        self.assertEqual(content[1]["type"], "image_url")
-        self.assertEqual(content[1]["image_url"]["url"], image)
 
     def test_vision_override_is_independent_of_text_model(self):
         os.environ["META_VISION_API_KEY"] = "vision-key"
@@ -277,7 +359,7 @@ class MetaModelCallSites(unittest.TestCase):
         else:
             os.environ["BASETEN_MODEL"] = model
 
-    def test_baseten_key_serves_text_and_vision(self):
+    def test_baseten_key_serves_text_on_muse_and_vision_on_deepseek(self):
         self._use_baseten_only()
         os.environ["MODAL_VISION_MODEL"] = "deepseek-ai/DeepSeek-V4.1-Flash"
         os.environ["MODAL_BASE_URL"] = (
@@ -290,13 +372,12 @@ class MetaModelCallSites(unittest.TestCase):
             verdict = muse_client.verify_drawing(image, "A")
         self.assertTrue(verdict["ok"])
         self.assertEqual(verdict["provider"], "baseten")
-        self.assertEqual(verdict["model"], "meta-models/muse-spark-open-1026")
-        self.assert_meta_request(
-            rec,
-            model="meta-models/muse-spark-open-1026",
-            base_url="https://inference.baseten.co/v1",
-            api_key="baseten-key",
-        )
+        self.assertEqual(verdict["family"], "deepseek")
+        self.assertEqual(verdict["model"], "deepseek-ai/DeepSeek-V4.1-Flash-1017")
+        self.assertNotIn("modal", rec.clients[0]["base_url"])
+        self.assertEqual(rec.clients[0]["base_url"], "https://inference.baseten.co/v1")
+        self.assertEqual(rec.clients[0]["api_key"], "baseten-key")
+        self.assertEqual(rec.calls[0]["model"], "deepseek-ai/DeepSeek-V4.1-Flash-1017")
         self.assertNotIn("extra_body", rec.calls[0])
         with _Recorder(
             '{"risk":"low","reason":"ok","suggested_scopes":["view"],"drop_act":false}'
@@ -311,6 +392,7 @@ class MetaModelCallSites(unittest.TestCase):
         catalog = muse_client.list_agent_models()
         self.assertEqual(catalog[0]["label"], "Muse Spark Open")
         self.assertEqual(catalog[0]["provider"], "baseten")
+        self.assertNotIn("deepseek", catalog[0]["id"].lower())
 
     def test_baseten_model_env_overrides_the_dated_default(self):
         self._use_baseten_only("meta-models/muse-spark-open")
@@ -321,17 +403,20 @@ class MetaModelCallSites(unittest.TestCase):
         self.assertEqual(rec.calls[0]["model"], "meta-models/muse-spark-open")
         self.assertEqual(rec.clients[0]["base_url"], "https://inference.baseten.co/v1")
 
-    def test_baseten_deepseek_model_is_refused(self):
+    def test_baseten_deepseek_model_is_refused_for_text_only(self):
         self._use_baseten_only("deepseek-ai/DeepSeek-V4.1-Flash")
         image = "data:image/png;base64,iVBORw0KGgo="
-        with _Recorder('{"match":true}') as rec:
+        with _Recorder(
+            '{"match":true,"human_like":true,"read_as":"A","reason":"ok"}'
+        ) as rec:
             verdict = muse_client.verify_drawing(image, "A")
             scored = muse_client.score_purpose("browse")
-        self.assertFalse(verdict["ok"])
-        self.assertIn("DeepSeek", verdict["reason"])
+        self.assertTrue(verdict["ok"])
+        self.assertEqual(verdict["model"], "deepseek-ai/DeepSeek-V4.1-Flash-1017")
+        self.assertEqual(rec.calls[0]["model"], "deepseek-ai/DeepSeek-V4.1-Flash-1017")
         self.assertEqual(scored["source"], "rules")
         self.assertNotIn("DeepSeek", scored["reason"])
-        self.assertEqual(rec.calls, [])
+        self.assertEqual(len(rec.calls), 1)
 
     def test_meta_key_wins_over_baseten_key(self):
         os.environ.pop("META_BASE_URL", None)
@@ -359,16 +444,37 @@ class MetaModelCallSites(unittest.TestCase):
         self.assertIn("Aurif text model: provider=baseten", text)
         self.assertIn("Aurif vision model: provider=baseten", text)
         self.assertIn("model=meta-models/muse-spark-open-1026", text)
+        self.assertIn("model=deepseek-ai/DeepSeek-V4.1-Flash-1017", text)
+        self.assertIn("family=deepseek", text)
+        self.assertIn("label=DeepSeek V4.1 Flash", text)
         self.assertIn("base_url=https://inference.baseten.co/v1", text)
         self.assertIn("key=set", text)
         self.assertNotIn("baseten-key", text)
+        vision_line = next(line for line in logs.output if "Aurif vision model:" in line)
+        self.assertNotIn("family=meta", vision_line)
+        self.assertNotIn("Powered by Meta", vision_line)
         providers = muse_client.api_providers()
         self.assertEqual(providers["text"]["model"], "meta-models/muse-spark-open-1026")
+        self.assertEqual(providers["text"]["family"], "meta")
+        self.assertTrue(providers["text"]["powered_by"].startswith("Meta "))
         self.assertEqual(providers["vision"]["provider"], "baseten")
+        self.assertEqual(providers["vision"]["model"], "deepseek-ai/DeepSeek-V4.1-Flash-1017")
+        self.assertEqual(providers["vision"]["family"], "deepseek")
+        self.assertEqual(providers["vision"]["powered_by"], "DeepSeek V4.1 Flash")
+        self.assertNotIn("Meta", providers["vision"]["powered_by"])
         self.assertEqual(
             providers["baseten"]["base_url"], "https://inference.baseten.co/v1"
         )
         self.assertNotIn("modal", providers)
+        health = muse_client.health_snapshot()
+        self.assertEqual(health["text"]["model"], "meta-models/muse-spark-open-1026")
+        self.assertEqual(health["text"]["family"], "meta")
+        self.assertTrue(health["text"]["powered_by"].startswith("Meta "))
+        self.assertEqual(health["vision"]["model"], "deepseek-ai/DeepSeek-V4.1-Flash-1017")
+        self.assertEqual(health["vision"]["family"], "deepseek")
+        self.assertEqual(health["vision"]["powered_by"], "DeepSeek V4.1 Flash")
+        self.assertNotIn("Meta", health["vision"]["powered_by"])
+        self.assertNotIn("baseten-key", str(health))
 
     def test_legacy_deepseek_env_is_ignored(self):
         os.environ["MODAL_VISION_MODEL"] = "deepseek-ai/DeepSeek-V4.1-Flash"
@@ -383,19 +489,29 @@ class MetaModelCallSites(unittest.TestCase):
         with _Recorder('{"match":true,"human_like":true,"read_as":"K","reason":"ok"}') as rec:
             verdict = muse_client.verify_drawing(image, "K")
         self.assertTrue(verdict["ok"])
-        self.assertEqual(verdict["model"], "muse-spark-1.3")
+        self.assertEqual(verdict["model"], "deepseek-ai/DeepSeek-V4.1-Flash-1017")
+        self.assertNotEqual(verdict["model"], os.environ["MODAL_VISION_MODEL"])
+        self.assertEqual(rec.clients[0]["base_url"], "https://inference.baseten.co/v1")
+        self.assertNotIn("modal", rec.clients[0]["base_url"])
+        self.assertEqual(rec.clients[0]["api_key"], "baseten-should-not-be-used")
+        self.assertEqual(rec.calls[0]["model"], "deepseek-ai/DeepSeek-V4.1-Flash-1017")
+        self.assertEqual(len(rec.clients), 1)
+        with _Recorder(
+            '{"risk":"low","reason":"ok","suggested_scopes":["view"],"drop_act":false}'
+        ) as text_rec:
+            muse_client.score_purpose("browse the catalog")
         self.assert_meta_request(
-            rec,
+            text_rec,
             model="muse-spark-1.3",
             base_url="https://api.meta.ai/v1",
             api_key="test-meta-key",
         )
-        self.assertEqual(len(rec.clients), 1)
 
     def test_vision_misconfigured_does_not_call_or_fall_back(self):
         os.environ.pop("META_API_KEY", None)
         os.environ.pop("MODEL_API_KEY", None)
         os.environ.pop("META_VISION_API_KEY", None)
+        os.environ.pop("VISION_API_KEY", None)
         os.environ.pop("BASETEN_API_KEY", None)
         image = "data:image/png;base64,iVBORw0KGgo="
         with _Recorder('{"match":true}') as rec:
@@ -405,14 +521,22 @@ class MetaModelCallSites(unittest.TestCase):
         self.assertEqual(rec.clients, [])
         self.assertEqual(rec.calls, [])
 
-    def test_deepseek_vision_model_is_rejected_without_a_request(self):
+    def test_meta_vision_override_still_accepts_a_deepseek_id(self):
         os.environ["META_VISION_MODEL"] = "deepseek-ai/DeepSeek-V4.1-Flash"
+        os.environ["META_VISION_BASE_URL"] = "https://inference.baseten.co/v1"
+        os.environ["META_VISION_API_KEY"] = "legacy-vision-key"
         image = "data:image/png;base64,iVBORw0KGgo="
-        with _Recorder('{"match":true}') as rec:
+        with _Recorder(
+            '{"match":true,"human_like":true,"read_as":"A","reason":"ok"}'
+        ) as rec:
             verdict = muse_client.verify_drawing(image, "A")
-        self.assertFalse(verdict["ok"])
-        self.assertIn("DeepSeek", verdict["reason"])
-        self.assertEqual(rec.calls, [])
+        self.assertTrue(verdict["ok"])
+        self.assertEqual(verdict["model"], "deepseek-ai/DeepSeek-V4.1-Flash")
+        self.assertEqual(verdict["family"], "deepseek")
+        self.assertNotIn("Meta", verdict["powered_by"])
+        self.assertEqual(rec.calls[0]["model"], "deepseek-ai/DeepSeek-V4.1-Flash")
+        self.assertEqual(rec.clients[0]["api_key"], "legacy-vision-key")
+        self.assertEqual(rec.clients[0]["base_url"], "https://inference.baseten.co/v1")
 
     def test_vision_upstream_error_does_not_fall_back(self):
         image = "data:image/png;base64,iVBORw0KGgo="
@@ -424,10 +548,17 @@ class MetaModelCallSites(unittest.TestCase):
         self.assertNotIn("fallback", verdict["reason"].lower())
         self.assertEqual(len(rec.clients), 1)
         self.assertEqual(len(rec.calls), 1)
-        self.assertEqual(rec.calls[0]["model"], "muse-spark-1.3")
+        self.assertEqual(rec.calls[0]["model"], "deepseek-ai/DeepSeek-V4.1-Flash-1017")
+        self.assertEqual(rec.clients[0]["base_url"], "https://inference.baseten.co/v1")
 
     def _clear_model_keys(self) -> None:
-        for key in ("META_API_KEY", "MODEL_API_KEY", "META_VISION_API_KEY", "BASETEN_API_KEY"):
+        for key in (
+            "META_API_KEY",
+            "MODEL_API_KEY",
+            "META_VISION_API_KEY",
+            "VISION_API_KEY",
+            "BASETEN_API_KEY",
+        ):
             os.environ.pop(key, None)
 
     def _ink_png(self) -> str:
@@ -701,6 +832,8 @@ class MetaModelCallSites(unittest.TestCase):
         thread.start()
         self.addCleanup(server.shutdown)
         os.environ["META_BASE_URL"] = f"http://127.0.0.1:{port}/v1"
+        os.environ["VISION_BASE_URL"] = f"http://127.0.0.1:{port}/v1"
+        os.environ["VISION_API_KEY"] = "test-baseten-key"
         os.environ["META_TIMEOUT_SECONDS"] = "0.4"
         os.environ["META_VISION_TIMEOUT_SECONDS"] = "0.4"
         os.environ["META_MAX_RETRIES"] = "1"
