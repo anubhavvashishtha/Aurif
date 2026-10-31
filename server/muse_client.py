@@ -1091,6 +1091,178 @@ def _activity_brief(
     }
 
 
+# Count words the model may use. "a handshake" is one handshake. "no actions" is zero.
+_COUNT_WORDS = {
+    "zero": 0,
+    "none": 0,
+    "no": 0,
+    "a": 1,
+    "an": 1,
+    "one": 1,
+    "single": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20,
+    "thirty": 30,
+    "forty": 40,
+    "fifty": 50,
+    "sixty": 60,
+    "seventy": 70,
+    "eighty": 80,
+    "ninety": 90,
+}
+_COUNT_ONES = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9}
+_COUNT_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90}
+_COUNT_TOKEN = re.compile(
+    r"\b(?:\d+|zero|none|no|a|an|one|single|two|three|four|five|six|seven|eight|nine|"
+    r"ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|"
+    r"twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)"
+    r"(?:[-\s](?:one|two|three|four|five|six|seven|eight|nine))?\b",
+    re.I,
+)
+# Longer phrases first so "page reads" is not split into a later "reads".
+_COUNT_CATEGORIES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("field_hides", re.compile(r"\b(?:field hides|field hide|hidden fields|hidden field|redactions|redaction)\b", re.I)),
+    ("page_reads", re.compile(r"\b(?:page reads|page read|pages read|page views|page view|pages)\b", re.I)),
+    ("high_risk_agents", re.compile(r"\bhigh[- ]risk agents?\b", re.I)),
+    ("handshakes", re.compile(r"\bhandshakes?\b", re.I)),
+    ("actions", re.compile(r"\bactions?\b", re.I)),
+    ("blocks", re.compile(r"\b(?:blocks|block|denials|denial)\b", re.I)),
+    ("agents", re.compile(r"\bagents?\b", re.I)),
+    ("events", re.compile(r"\bevents?\b", re.I)),
+)
+
+
+def _number_value(token: str) -> int | None:
+    raw = (token or "").lower().replace("-", " ")
+    parts = raw.split()
+    if len(parts) == 1 and parts[0].isdigit():
+        return int(parts[0])
+    if len(parts) == 1:
+        return _COUNT_WORDS.get(parts[0])
+    if len(parts) == 2 and parts[0] in _COUNT_TENS and parts[1] in _COUNT_ONES:
+        return _COUNT_TENS[parts[0]] + _COUNT_ONES[parts[1]]
+    return None
+
+
+def _count_gap_ok(between: str) -> bool:
+    """A number applies to the next count noun, not to one several clauses later."""
+    if re.search(r"\bof\b", between or "", re.I):
+        return False
+    return len(re.findall(r"[A-Za-z0-9]+", between or "")) <= 2
+
+
+def _count_claims(text: str) -> dict[str, int] | None:
+    """Map each stated count to a number. None when one category is given two values."""
+    blob = text or ""
+    marks: list[tuple[int, int, str, int | None]] = []
+    for match in _COUNT_TOKEN.finditer(blob):
+        value = _number_value(match.group(0))
+        if value is None:
+            continue
+        marks.append((match.start(), match.end(), "num", value))
+    for key, pattern in _COUNT_CATEGORIES:
+        for match in pattern.finditer(blob):
+            marks.append((match.start(), match.end(), key, None))
+    marks.sort(key=lambda item: (item[0], 0 if item[2] == "num" else 1))
+
+    found: dict[str, int] = {}
+    index = 0
+    while index < len(marks):
+        start, end, kind, value = marks[index]
+        if kind == "num":
+            index += 1
+            continue
+        claimed: int | None = None
+        if index > 0 and marks[index - 1][2] == "num" and _count_gap_ok(blob[marks[index - 1][1] : start]):
+            claimed = marks[index - 1][3]
+        elif index + 1 < len(marks) and marks[index + 1][2] == "num":
+            nxt = marks[index + 1]
+            bridge = blob[end : nxt[0]]
+            if re.fullmatch(r"[\s:]*(?:is|was|were|are|=)?[\s:]*", bridge, re.I):
+                claimed = nxt[3]
+                index += 1
+        if claimed is not None:
+            if kind in found and found[kind] != claimed:
+                return None
+            found[kind] = claimed
+        index += 1
+    return found
+
+
+def summary_respects_counts(text: str, facts: dict[str, int]) -> bool:
+    """True when every count the text states matches `facts`.
+
+    Digits and number words count as the same value. Omitted counts are fine.
+    A text that states none of the counts, or states one of them wrong, is not.
+    """
+    found = _count_claims(text)
+    if not found:
+        return False
+    return all(facts.get(key) == value for key, value in found.items())
+
+
+def _activity_facts(
+    kinds: Counter[str],
+    agents: Counter[str],
+    high_risk: list[dict[str, str]],
+    event_count: int,
+) -> dict[str, int]:
+    blocks = (
+        kinds.get("handshake_denied", 0)
+        + kinds.get("action_blocked", 0)
+        + kinds.get("page_blocked", 0)
+    )
+    return {
+        "events": event_count,
+        "agents": len(agents),
+        "handshakes": kinds.get("handshake", 0),
+        "page_reads": kinds.get("page", 0),
+        "actions": kinds.get("action", 0),
+        "blocks": blocks,
+        "field_hides": kinds.get("field_redacted", 0),
+        "high_risk_agents": len({row["agent_id"] for row in high_risk}),
+    }
+
+
+def _scrub_secrets(text: str) -> str:
+    """Strip key material before a debug log. The model reply should not have any."""
+    cleaned = text or ""
+    for name in (
+        "META_API_KEY",
+        "MODEL_API_KEY",
+        "BASETEN_API_KEY",
+        "META_VISION_API_KEY",
+        "VISION_API_KEY",
+    ):
+        secret = (os.environ.get(name) or "").strip()
+        if len(secret) >= 6:
+            cleaned = cleaned.replace(secret, "[redacted]")
+    cleaned = re.sub(r"(?i)\bsk-[A-Za-z0-9_\-]{8,}", "[redacted]", cleaned)
+    cleaned = re.sub(r"(?i)\bBearer\s+\S+", "Bearer [redacted]", cleaned)
+    return cleaned
+
+
+def _log_rejected_summary(raw: str) -> None:
+    log.debug("activity summary rejected; raw model reply: %s", _scrub_secrets(raw)[:2000])
+
+
 def summarize_activity(events: list[dict[str, Any]]) -> dict[str, Any]:
     kinds: Counter[str] = Counter()
     agents: Counter[str] = Counter()
@@ -1121,6 +1293,8 @@ def summarize_activity(events: list[dict[str, Any]]) -> dict[str, Any]:
         if e.get("action_id"):
             actions[str(e.get("action_id"))] += 1
 
+    event_count = min(len(events), 100)
+    facts = _activity_facts(kinds, agents, high_risk, event_count)
     brief = _activity_brief(
         kinds,
         agents,
@@ -1128,61 +1302,85 @@ def summarize_activity(events: list[dict[str, Any]]) -> dict[str, Any]:
         denied,
         redacted,
         actions,
-        event_count=min(len(events), 100),
+        event_count=event_count,
     )
+    risky_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for row in high_risk:
+        aid = row["agent_id"]
+        if aid in seen_ids:
+            continue
+        seen_ids.add(aid)
+        risky_ids.append(aid)
 
-    # Optional Muse polish — keep only if terse and grounded. Counts stay local.
-    polish_prompt = f"""Tighten this Aurif audit into JSON.
-Rules: max 2 sentences in summary; max 3 risk bullets; each risk ≤12 words; keep every number exact; invent nothing.
+    # The model rewrites these counts. It may say them as words, in any order.
+    polish_prompt = f"""Write an owner-facing activity summary as JSON.
+Use only these counts. Digits or words are both fine, and the order does not matter.
+Do not change a count or invent events, agents, handshakes, page reads, actions, blocks, or hides.
+You may omit a zero count or say none. A little extra prose is fine.
+
+Counts:
+{json.dumps(facts)}
+
+High-risk agent ids (names only; do not invent others): {json.dumps(risky_ids[:5])}
+
 Return ONLY JSON: {{"summary":"...","risks":["..."],"suggested_blocked_agents":["..."]}}
-
-Draft:
-{json.dumps(brief)}
 """
     started = time.perf_counter()
     card = model_card()
     model_error: str | None = None
     polished: Any = None
+    raw_reply = ""
     try:
-        polished = extract_json(
-            complete(
-                [
-                    {
-                        "role": "system",
-                        "content": "Return one terse JSON object. Never invent facts.",
-                    },
-                    {"role": "user", "content": polish_prompt},
-                ],
-                max_tokens=600,
-                temperature=0.1,
-            )
+        raw_reply = complete(
+            [
+                {
+                    "role": "system",
+                    "content": "Return one JSON object. Never invent counts.",
+                },
+                {"role": "user", "content": polish_prompt},
+            ],
+            max_tokens=600,
+            temperature=0.1,
         )
     except Exception as exc:
         model_error = _public_model_error(exc)
         log.warning("activity summary model unavailable (%s); using counted brief", model_error)
-        polished = None
+    else:
+        try:
+            polished = extract_json(raw_reply)
+        except Exception:
+            # A sentence with the right counts is still a summary. JSON is preferred.
+            log.debug("activity summary model reply was not JSON")
+            polished = {
+                "summary": (raw_reply or "").strip(),
+                "risks": [],
+                "suggested_blocked_agents": [],
+            }
 
     data = brief
     used_model = False
     if isinstance(polished, dict):
         summary = str(polished.get("summary") or "").strip()
-        words = len(summary.split())
-        event_n = str(min(len(events), 100))
-        grounded = event_n in summary and "agent" in summary.lower()
-        if 15 <= words <= 50 and grounded:
-            known = {h["agent_id"] for h in high_risk} | set(denied)
-            risks = polished.get("risks") if isinstance(polished.get("risks"), list) else []
-            risks = [str(r)[:120] for r in risks[:3]]
+        risks = polished.get("risks") if isinstance(polished.get("risks"), list) else []
+        risk_text = "\n".join(str(item) for item in risks[:3])
+        stated = summary if not risk_text else f"{summary}\n{risk_text}"
+        if summary_respects_counts(stated, facts):
+            known = {row["agent_id"] for row in high_risk} | set(denied)
             blocked = polished.get("suggested_blocked_agents")
             if not isinstance(blocked, list):
                 blocked = brief["suggested_blocked_agents"]
-            blocked = [str(a) for a in blocked[:5] if str(a) in known]
+            blocked = [str(agent) for agent in blocked[:5] if str(agent) in known]
             data = {
                 "summary": summary,
-                "risks": risks or brief["risks"],
+                "risks": [str(item)[:120] for item in risks[:3]] or brief["risks"],
                 "suggested_blocked_agents": blocked or brief["suggested_blocked_agents"],
             }
             used_model = True
+        else:
+            _log_rejected_summary(raw_reply)
+    elif raw_reply and model_error is None:
+        _log_rejected_summary(raw_reply)
 
     if model_error:
         source = "rules"

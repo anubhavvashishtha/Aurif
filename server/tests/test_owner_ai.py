@@ -18,6 +18,7 @@ SERVER = Path(__file__).resolve().parents[1]
 if str(SERVER) not in sys.path:
     sys.path.insert(0, str(SERVER))
 
+import muse_client  # noqa: E402
 import store  # noqa: E402
 from app import app  # noqa: E402
 
@@ -382,6 +383,157 @@ class OwnerMetaEndpoints(unittest.TestCase):
         self.assertEqual(shop_event["detail"]["purpose_risk"]["source"], "rules")
         self.assertTrue(shop_event["detail"]["purpose_risk"]["degraded"])
         self.assertEqual(shop_event["detail"]["purpose_risk"]["model"]["label"], "Muse Spark 1.3")
+
+
+# One handshake and one page read by shop-bot. Counts the model must keep.
+_SHOP_EVENTS = [
+    {"kind": "handshake", "agent_id": "shop-bot", "detail": {}},
+    {"kind": "page", "agent_id": "shop-bot", "detail": {}},
+]
+_SHOP_FACTS = {
+    "events": 2,
+    "agents": 1,
+    "handshakes": 1,
+    "page_reads": 1,
+    "actions": 0,
+    "blocks": 0,
+    "field_hides": 0,
+    "high_risk_agents": 0,
+}
+
+
+class ActivitySummaryGrounding(unittest.TestCase):
+    """Faithful Muse phrasings stay. A changed or invented count does not."""
+
+    def setUp(self):
+        self._saved = {key: os.environ.get(key) for key in ENV_KEYS}
+        self._dotenv = patch("muse_client.load_dotenv", lambda *args, **kwargs: False)
+        self._dotenv.start()
+        for key in ENV_KEYS:
+            os.environ.pop(key, None)
+        os.environ["META_API_KEY"] = "test-meta-key"
+        os.environ["META_BASE_URL"] = "https://api.meta.ai/v1"
+        os.environ["META_MODEL"] = "muse-spark-1.3"
+        os.environ["META_PROVIDER"] = "meta"
+
+    def tearDown(self):
+        self._dotenv.stop()
+        for key, value in self._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def _summarize(self, content: str):
+        with _Recorder(content) as rec:
+            result = muse_client.summarize_activity(_SHOP_EVENTS)
+        return result, rec
+
+    def test_count_words_reordered_facts_and_extra_prose_pass(self):
+        samples = [
+            "Two events from one agent included one handshake and one page read.",
+            "One page read, then one handshake: two events in all, from a single agent. Nothing else happened.",
+            "No actions. One handshake and one page read across two events for one agent, with a little quiet browsing in between.",
+        ]
+        for text in samples:
+            result, rec = self._summarize(
+                json.dumps(
+                    {
+                        "summary": text,
+                        "risks": ["The shop agent stayed inside view."],
+                        "suggested_blocked_agents": [],
+                    }
+                )
+            )
+            self.assertEqual(result["source"], "model", text)
+            self.assertFalse(result["degraded"], text)
+            self.assertIsNone(result["fallback"], text)
+            self.assertEqual(result["summary"], text)
+            prompt = rec.calls[0]["messages"][1]["content"]
+            self.assertIn('"events": 2', prompt)
+            self.assertIn('"handshakes": 1', prompt)
+            self.assertIn('"page_reads": 1', prompt)
+
+    def test_plain_prose_with_the_same_counts_passes(self):
+        text = (
+            "Across this window there were two events from one agent: "
+            "one handshake and one page read. No blocks."
+        )
+        result, _rec = self._summarize(text)
+        self.assertEqual(result["source"], "model")
+        self.assertEqual(result["summary"], text)
+        self.assertIsNone(result["fallback"])
+
+    def test_semantic_checker_accepts_words_and_rejects_a_changed_count(self):
+        self.assertTrue(
+            muse_client.summary_respects_counts(
+                "no actions and one handshake",
+                _SHOP_FACTS,
+            )
+        )
+        self.assertTrue(
+            muse_client.summary_respects_counts(
+                "one page read by the shop agent",
+                _SHOP_FACTS,
+            )
+        )
+        self.assertFalse(
+            muse_client.summary_respects_counts(
+                "no actions",
+                {**_SHOP_FACTS, "actions": 2},
+            )
+        )
+        self.assertFalse(muse_client.summary_respects_counts("12 events", _SHOP_FACTS))
+        self.assertFalse(
+            muse_client.summary_respects_counts(
+                "one of the agents did something vague",
+                _SHOP_FACTS,
+            )
+        )
+
+    def test_wrong_count_is_rejected_and_logged_without_secrets(self):
+        wrong = [
+            "Nine events from one agent, with one handshake and one page read.",
+            "2 events from 1 agent: 4 handshakes and 1 page read.",
+        ]
+        for text in wrong:
+            raw = json.dumps(
+                {
+                    "summary": text + " leak test-meta-key sk-supersecretvalue",
+                    "risks": [],
+                    "suggested_blocked_agents": [],
+                }
+            )
+            with self.assertLogs("aurif.models", level="DEBUG") as logs:
+                result, _rec = self._summarize(raw)
+            self.assertEqual(result["source"], "rules", text)
+            self.assertFalse(result["degraded"], text)
+            self.assertEqual(result["fallback"], "activity_counts", text)
+            self.assertIn("counted facts", result["warning"])
+            self.assertIn("2 events", result["summary"])
+            self.assertIn("1 handshake", result["summary"])
+            self.assertNotIn("Nine", result["summary"])
+            self.assertNotIn("4 handshake", result["summary"])
+            blob = "\n".join(logs.output)
+            self.assertIn("activity summary rejected", blob)
+            self.assertIn(text.split(",")[0][:24], blob)
+            self.assertNotIn("test-meta-key", blob)
+            self.assertNotIn("sk-supersecretvalue", blob)
+            self.assertIn("[redacted]", blob)
+
+    def test_a_wrong_count_inside_a_risk_bullet_rejects_the_reply(self):
+        raw = json.dumps(
+            {
+                "summary": "Two events from one agent included one handshake and one page read.",
+                "risks": ["Twelve events look like scraping."],
+                "suggested_blocked_agents": [],
+            }
+        )
+        result, _rec = self._summarize(raw)
+        self.assertEqual(result["source"], "rules")
+        self.assertEqual(result["fallback"], "activity_counts")
+        self.assertIn("2 events", result["summary"])
+        self.assertNotIn("Twelve", result["summary"])
 
 
 if __name__ == "__main__":
