@@ -2,6 +2,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { ChevronRight, SlidersHorizontal, Sparkles } from "lucide-react";
 import { useState } from "react";
 import { Badge, PageHeader, Panel } from "@/components/aurif/ui";
+import { MetaCredit } from "@/components/aurif/meta-credit";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -18,6 +19,7 @@ import {
   updateResponseFields,
   useActiveSite,
   type Endpoint,
+  type MetaFeatureResponse,
 } from "@/lib/aurif-store";
 
 export const Route = createFileRoute("/dashboard/endpoints")({
@@ -27,23 +29,59 @@ export const Route = createFileRoute("/dashboard/endpoints")({
 
 const DIRECTION = { read: "Returns JSON", write: "Accepts JSON", both: "Both" };
 
-function PolicyCopilot({ siteId }: { siteId: string }) {
+type PolicyProposal = {
+  summary: string;
+  patches: Array<Record<string, unknown>>;
+  blocked_agents_add?: string[];
+  meta: MetaFeatureResponse;
+};
+
+function fieldKeys(value: unknown, flag: string): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((row): row is Record<string, unknown> => !!row && typeof row === "object")
+    .filter((row) => row[flag] === false && typeof row.key === "string")
+    .map((row) => String(row.key));
+}
+
+function describePatch(patch: Record<string, unknown>, endpoints: Endpoint[]) {
+  const id = String(patch.endpoint_id || "");
+  const endpoint = endpoints.find((row) => row.id === id);
+  const name = endpoint?.label || id || "Endpoint";
+  const bits: string[] = [];
+  if ("agent_access" in patch) bits.push(patch.agent_access ? "open to agents" : "close to agents");
+  const hidden = fieldKeys(patch.response_fields, "agent_visible");
+  const rejected = fieldKeys(patch.request_fields, "agent_allowed");
+  if (hidden.length) bits.push(`hide ${hidden.join(", ")}`);
+  if (rejected.length) bits.push(`reject ${rejected.join(", ")}`);
+  return `${name}: ${bits.join("; ") || "update"}`;
+}
+
+function PolicyCopilot({ siteId, endpoints }: { siteId: string; endpoints: Endpoint[] }) {
   const [instruction, setInstruction] = useState("Hide prices from agents and disable checkout");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [proposal, setProposal] = useState<{
-    summary: string;
-    patches: Array<Record<string, unknown>>;
-    blocked_agents_add?: string[];
-    model?: string;
-  } | null>(null);
+  const [proposal, setProposal] = useState<PolicyProposal | null>(null);
 
   const run = async () => {
     setBusy(true);
     setError("");
     try {
       const res = await proposePolicy(siteId, instruction);
-      setProposal({ ...res.proposal, model: res.model });
+      setProposal({
+        summary: res.proposal.summary,
+        patches: res.proposal.patches || [],
+        blocked_agents_add: res.proposal.blocked_agents_add || [],
+        meta: {
+          model: res.model,
+          model_info: res.model_info || (typeof res.proposal.model === "object" ? res.proposal.model : undefined),
+          latency_ms: res.latency_ms ?? res.proposal.latency_ms,
+          source: res.source || res.proposal.source,
+          degraded: res.degraded ?? res.proposal.degraded,
+          fallback: res.fallback ?? res.proposal.fallback,
+          warning: res.warning || res.proposal.warning,
+        },
+      });
     } catch (e) {
       setError(e instanceof Error ? e.message : "Propose failed");
     } finally {
@@ -65,14 +103,17 @@ function PolicyCopilot({ siteId }: { siteId: string }) {
     }
   };
 
+  const canApply = !!proposal && (proposal.patches.length > 0 || (proposal.blocked_agents_add || []).length > 0);
+
   return (
     <Panel className="mb-6 space-y-3 border-ink/15 bg-frost p-5">
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         <Sparkles className="size-4 text-accent" />
-        <h2 className="text-lg text-ink">Muse policy co-pilot</h2>
+        <h2 className="text-lg text-ink">Policy co-pilot</h2>
+        {proposal?.meta.degraded && <Badge tone="danger">Fallback</Badge>}
       </div>
       <p className="text-sm text-muted-foreground">
-        Describe policy in plain English. Muse Spark Open proposes endpoint patches — you confirm before apply.
+        Describe a policy in plain language. A Meta model proposes page and action changes for you to review. Nothing is applied until you click Apply.
       </p>
       <div className="space-y-1.5">
         <Label>Instruction</Label>
@@ -80,19 +121,46 @@ function PolicyCopilot({ siteId }: { siteId: string }) {
       </div>
       <div className="flex flex-wrap gap-2">
         <Button disabled={busy || !instruction.trim()} onClick={() => void run()}>
-          {busy ? "Thinking…" : "Propose with Muse"}
+          {busy ? "Thinking…" : "Propose with Meta"}
         </Button>
         {proposal && (
-          <Button variant="outline" disabled={busy} onClick={() => void apply()}>
+          <Button variant="outline" disabled={busy || !canApply} onClick={() => void apply()}>
             Apply proposal
           </Button>
         )}
       </div>
       {error && <p className="text-sm text-destructive">{error}</p>}
       {proposal && (
-        <pre className="max-h-64 overflow-auto rounded-lg bg-ink p-4 font-mono text-xs text-ink-foreground">
-          {JSON.stringify(proposal, null, 2)}
-        </pre>
+        <div className="space-y-2">
+          <p className="text-sm text-ink">{proposal.summary}</p>
+          {proposal.patches.length > 0 ? (
+            <ul className="list-disc pl-5 text-sm text-muted-foreground">
+              {proposal.patches.map((patch, index) => (
+                <li key={`${String(patch.endpoint_id)}-${index}`}>{describePatch(patch, endpoints)}</li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-sm text-muted-foreground">No page or field changes in this proposal.</p>
+          )}
+          {!!proposal.blocked_agents_add?.length && (
+            <p className="text-sm text-muted-foreground">Block agents: {proposal.blocked_agents_add.join(", ")}</p>
+          )}
+          <MetaCredit
+            model={proposal.meta.model_info || proposal.meta.model}
+            latencyMs={proposal.meta.latency_ms}
+            degraded={proposal.meta.degraded}
+            fallback={proposal.meta.fallback}
+            warning={proposal.meta.warning}
+          />
+          <details>
+            <summary className="cursor-pointer font-mono text-[11px] uppercase tracking-wider text-muted-foreground">
+              Proposed patches
+            </summary>
+            <pre className="mt-2 max-h-64 overflow-auto rounded-lg bg-ink p-4 font-mono text-xs text-ink-foreground">
+              {JSON.stringify({ patches: proposal.patches, blocked_agents_add: proposal.blocked_agents_add || [] }, null, 2)}
+            </pre>
+          </details>
+        </div>
       )}
     </Panel>
   );
@@ -105,7 +173,7 @@ function Endpoints() {
   return (
     <>
       <PageHeader title="Endpoint control" description="Agents can use the endpoint, but only the fields you allow. Turning an endpoint off blocks agents with 403." />
-      <PolicyCopilot siteId={site.id} />
+      <PolicyCopilot siteId={site.id} endpoints={site.endpoints} />
       {["page", "action"].map((kind) => (
         <section key={kind} className="mb-6">
           <h2 className="mb-2 inline-block rounded-sm border border-ink/15 bg-frost px-2 py-0.5 font-mono text-sm uppercase tracking-wider text-ink">{kind}s</h2>

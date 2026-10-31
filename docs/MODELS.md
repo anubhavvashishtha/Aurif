@@ -16,7 +16,9 @@ Vision does not fall back to a non-Meta vendor. `MODAL_*` is not read. A missing
 | `META_VISION_TIMEOUT_SECONDS` | `15` | Vision call budget. Falls back to `META_TIMEOUT_SECONDS` when unset |
 | `META_MAX_RETRIES` | `1` | Extra attempts after the first, capped at 2. Read timeouts are not retried. Connection failures and HTTP 408/429/500/502/503/504 are |
 
-Handshake risk scoring, when the model errors or times out, uses a keyword rule instead of hanging or stripping `act` from every agent. A clear shopping purpose can still receive `act`. Scraping, bypass, resale, and vague purposes stay view-only. The handshake body says `purpose_risk.source` is `rules` and `degraded` is true. The agent-facing reason does not include env var names.
+Handshake risk scoring, when the model errors or times out, uses a keyword rule instead of hanging or stripping `act` from every agent. A clear shopping purpose can still receive `act`. Scraping, bypass, resale, and vague purposes stay view-only. The handshake body says `purpose_risk.source` is `rules`, `degraded` is true, and `fallback` is `keyword_rules`. The score also carries the configured model (`id`, `provider`, `label`) and `latency_ms`. The agent-facing `reason` does not include env var names. A separate `warning` says the model was unavailable.
+
+Policy propose and activity summary use the same client and the same timeout. If that call errors or times out, policy propose returns HTTP 200 with a keyword-rules draft (`fallback` `keyword_rules`) and activity summary returns HTTP 200 with the counted brief (`fallback` `activity_counts`). Both set `source` to `rules` and `degraded` to true. Neither path writes policy. The owner applies a proposal with a separate request. The dashboard labels the fallback and shows `Powered by Meta <model>` plus latency.
 
 CAPTCHA, when vision is unavailable: a typed `answer` matching the challenge, or a non-blank sketch from the drawing pad, opens the **human storefront only**. The response is `degraded: true` with `method` `typed_fallback` or `ink_fallback`, and it does not grant agent `act`. A blank image gets HTTP 403 with `fallback` instructions. A working vision model that rejects a drawing does not take this path.
 
@@ -63,8 +65,8 @@ The dashboard reads `GET /api/ai/models` as `models[]` and `current` (`id`, `lab
 | Call site | Purpose | Before | Env before | After |
 |-----------|---------|--------|------------|-------|
 | `muse_client.score_purpose` → `complete` | Handshake purpose risk (`POST /ai/handshake`) | Baseten `meta-models/muse-spark-open-1026` | `BASETEN_API_KEY`, `BASETEN_MODEL`; base URL hardcoded to `https://inference.baseten.co/v1` | Meta Model API when `META_API_KEY` or `MODEL_API_KEY` is set; otherwise the same Baseten model via `BASETEN_API_KEY` / `BASETEN_MODEL` |
-| `muse_client.propose_policy` → `complete` | Owner policy co-pilot (`POST /api/sites/<id>/ai/policy-propose`) | same Baseten Muse | same | same text endpoint |
-| `muse_client.summarize_activity` → `complete` | Activity summary polish. Counts are computed locally in `_activity_brief`; the model only rewrites that draft (`POST /api/sites/<id>/ai/activity-summary`) | same Baseten Muse | same | same text endpoint |
+| `muse_client.propose_policy` → `complete` | Owner policy co-pilot (`POST /api/sites/<id>/ai/policy-propose`). Model failure returns a keyword draft and does not apply it | same Baseten Muse | same | same text endpoint |
+| `muse_client.summarize_activity` → `complete` | Activity summary polish. Counts are computed locally in `_activity_brief`; the model only rewrites that draft. Model failure returns the counted brief (`POST /api/sites/<id>/ai/activity-summary`) | same Baseten Muse | same | same text endpoint |
 | `muse_browse._compose_reply` → `complete` | One-sentence Muse dashboard answer when the page already returned the asked field | Dashboard model: Baseten Muse by default, or Modal DeepSeek if that id was selected | `BASETEN_*` or `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`, `MODAL_BASE_URL`, `MODAL_VISION_MODEL` | same text endpoint. A non-Meta id in the request is rejected |
 | `app._muse_report_site_response` → `complete` | Plain-English polish of a page the agent saw. Defined in `server/app.py`; no route calls it today | Baseten Muse | `BASETEN_*` | same text endpoint |
 | `muse_client.verify_drawing` | Draw-CAPTCHA vision (`POST /api/public/human-verify`, and the dashboard bot path that posts there) | Modal `deepseek-ai/DeepSeek-V4.1-Flash`, then a silent fallback to Baseten Muse | `MODAL_BASE_URL`, `MODAL_VISION_MODEL`, `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`; fallback used `BASETEN_API_KEY` and `BASETEN_MODEL` | Same resolved endpoint as text, unless `META_VISION_*` is set. The old image fallback target (`BASETEN_MODEL`, default `meta-models/muse-spark-open-1026`) is the Baseten path. No DeepSeek call |
@@ -73,7 +75,7 @@ Nothing was left on a non-Meta model. Local helpers (`_activity_brief`, field fo
 
 ## Tests
 
-`server/tests/test_meta_models.py` mocks the OpenAI client. No API key is required. From `server/`:
+`server/tests/test_meta_models.py` mocks the OpenAI client. `server/tests/test_owner_ai.py` covers the owner handshake, policy, and activity endpoints, including the fallback path. No API key is required. From `server/`:
 
 ```bash
 python -m unittest tests.test_meta_models
