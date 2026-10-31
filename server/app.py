@@ -222,9 +222,12 @@ def page_snapshot(path: str, session: dict[str, Any]) -> dict[str, Any]:
             out.append(el)
         return out
 
-    if path == "/":
+    ep = store.find_endpoint(site, path=path) or {}
+    endpoint_id = str(ep.get("id") or "")
+
+    if endpoint_id == "page.home":
         return {
-            "path": "/",
+            "path": path,
             "title": site["name"],
             "summary": welcome or "Gear for slow weekends.",
             "elements": filter_elements(
@@ -242,7 +245,7 @@ def page_snapshot(path: str, session: dict[str, Any]) -> dict[str, Any]:
             "meta": {"name": site["name"], "summary": welcome},
         }
 
-    if path == "/products":
+    if endpoint_id == "page.products":
         elements: list[dict[str, Any]] = [
             {"action_id": "nav.home", "type": "link", "label": "Home", "href": "/", "scopes": ["view"]}
         ]
@@ -277,16 +280,16 @@ def page_snapshot(path: str, session: dict[str, Any]) -> dict[str, Any]:
                 }
             )
         return {
-            "path": "/products",
+            "path": path,
             "title": "Shop — " + site["name"],
             "summary": f"{welcome} {len(PRODUCTS)} products available.".strip(),
             "elements": filter_elements(elements),
             "meta": {"products": catalog},
         }
 
-    slug = store.product_slug(path)
-    if slug is not None:
-        product = PRODUCTS.get(slug)
+    if endpoint_id == "page.product":
+        slug = store.capture_wildcard(str(ep.get("path") or ""), path) or ""
+        product = PRODUCTS.get(slug) if slug else None
         if not product:
             return {
                 "path": path,
@@ -298,7 +301,7 @@ def page_snapshot(path: str, session: dict[str, Any]) -> dict[str, Any]:
             }
         pub = public_product(product)
         return {
-            "path": f"/products/{slug}",
+            "path": path,
             "title": pub["name"],
             "summary": f"{welcome} {pub['summary']}".strip(),
             "elements": filter_elements(
@@ -326,9 +329,9 @@ def page_snapshot(path: str, session: dict[str, Any]) -> dict[str, Any]:
             "reviews": pub["reviews"],
         }
 
-    if path == "/cart":
+    if endpoint_id == "page.cart":
         return {
-            "path": "/cart",
+            "path": path,
             "title": "Cart — " + site["name"],
             "summary": f"{welcome} {len(cart)} item(s) in cart.".strip(),
             "elements": filter_elements(
@@ -349,7 +352,16 @@ def page_snapshot(path: str, session: dict[str, Any]) -> dict[str, Any]:
             },
         }
 
-    return deny_page(path, "No AI surface mapped for this path.")
+    sample = ep.get("sample_response") if isinstance(ep.get("sample_response"), dict) else {}
+    elements = sample.get("elements") if isinstance(sample.get("elements"), list) else []
+    meta = sample.get("meta") if isinstance(sample.get("meta"), dict) else {}
+    return {
+        "path": path,
+        "title": sample.get("title") or ep.get("label") or site["name"],
+        "summary": sample.get("summary") or welcome,
+        "elements": filter_elements([item for item in elements if isinstance(item, dict)]),
+        "meta": dict(meta),
+    }
 
 
 def run_action(session: dict[str, Any], action_id: str, args: dict[str, Any]) -> dict[str, Any]:

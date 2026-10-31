@@ -19,6 +19,7 @@ if str(SERVER) not in sys.path:
 import human_gate  # noqa: E402
 import store  # noqa: E402
 from app import app, cart_by_session, sessions  # noqa: E402
+from endpoints_default import ensure_endpoint_shape  # noqa: E402
 from redact import redact_agent_payload  # noqa: E402
 
 BROWSER = {
@@ -36,6 +37,19 @@ LOW_RISK = {
 PRICE_KEYS = {"price", "compare_at", "discount"}
 
 
+def _string_values(value) -> list[str]:
+    found: list[str] = []
+    if isinstance(value, str):
+        found.append(value)
+    elif isinstance(value, dict):
+        for child in value.values():
+            found.extend(_string_values(child))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(_string_values(child))
+    return found
+
+
 def _keys_named(value, names: set[str]) -> list[str]:
     found: list[str] = []
     if isinstance(value, dict):
@@ -50,17 +64,60 @@ def _keys_named(value, names: set[str]) -> list[str]:
 
 
 class PathAndRedaction(unittest.TestCase):
-    def test_canonical_path_collapses_the_reported_bypasses(self):
+    def test_canonical_path_matches_configured_page_patterns(self):
         self.assertEqual(store.canonical_ai_path("/products//field-tote"), "/products/field-tote")
         self.assertEqual(store.canonical_ai_path("/products/x/field-tote"), "/products/x/field-tote")
-        self.assertEqual(store.classify_ai_path("/products/x/field-tote"), "unmapped")
         self.assertEqual(store.canonical_ai_path("/products/../cart"), "/cart")
         self.assertEqual(store.canonical_ai_path("/products/%2e%2e/cart"), "/cart")
         self.assertEqual(store.canonical_ai_path("/CART"), "/cart")
         self.assertEqual(store.canonical_ai_path("cart"), "/cart")
         self.assertEqual(store.canonical_ai_path("/products/Field-Tote/"), "/products/field-tote")
-        self.assertEqual(store.product_slug("/products/x/field-tote"), None)
-        self.assertEqual(store.product_slug("/products//field-tote"), "field-tote")
+        site = {
+            "endpoints": [
+                {"id": "page.home", "kind": "page", "path": "/", "agent_access": True},
+                {"id": "page.products", "kind": "page", "path": "/products", "agent_access": True},
+                {"id": "page.product", "kind": "page", "path": "/products/*", "agent_access": True},
+                {"id": "page.cart", "kind": "page", "path": "/cart", "agent_access": False},
+                {"id": "page.about", "kind": "page", "path": "/About", "agent_access": True},
+                {"id": "page.stories", "kind": "page", "path": "/stories/*", "agent_access": True},
+            ]
+        }
+        self.assertEqual(store.page_decision(site, "/products/x/field-tote")[1], "unmapped")
+        self.assertEqual(store.page_decision(site, "/products//field-tote"), ("/products/field-tote", "allow"))
+        self.assertEqual(store.page_decision(site, "/CART")[1], "closed")
+        self.assertEqual(store.page_decision(site, "/about")[1], "allow")
+        self.assertEqual(store.page_decision(site, "/stories/portland"), ("/stories/portland", "allow"))
+        self.assertEqual(store.page_decision(site, "/stories/a/b")[1], "unmapped")
+        self.assertEqual(store.page_decision(site, "/shop")[1], "unmapped")
+        self.assertEqual(store.capture_wildcard("/products/*", "/products//field-tote"), "field-tote")
+        self.assertIsNone(store.capture_wildcard("/products/*", "/products/x/field-tote"))
+
+    def test_custom_page_survives_schema_upgrade(self):
+        upgraded = ensure_endpoint_shape(
+            [
+                {
+                    "id": "page.about",
+                    "kind": "page",
+                    "path": "/about",
+                    "agent_access": False,
+                    "response_fields": [],
+                },
+                {
+                    "id": "page.product.field-tote",
+                    "kind": "page",
+                    "path": "/products/field-tote",
+                    "agent_access": False,
+                    "response_fields": [],
+                },
+            ]
+        )
+        ids = {row["id"] for row in upgraded}
+        self.assertIn("page.about", ids)
+        self.assertIn("page.home", ids)
+        self.assertNotIn("page.product.field-tote", ids)
+        about = next(row for row in upgraded if row["id"] == "page.about")
+        self.assertFalse(about["agent_access"])
+        self.assertEqual(about["path"], "/about")
 
     def test_hidden_price_strips_compare_at_discount_and_element_meta(self):
         payload = {
@@ -179,6 +236,104 @@ class EnforcementApi(unittest.TestCase):
         leaked_body = leaked.get_json()
         self.assertEqual(leaked.status_code, 403, leaked_body)
         self.assertNotIn("NL-BG-001", json.dumps(leaked_body))
+
+    def _add_page(self, endpoint: dict) -> None:
+        def mut(data: dict) -> None:
+            data["sites"]["demo-shop"]["endpoints"].append(endpoint)
+
+        store.save(mut)
+
+    def test_m1_owner_configured_page_outside_the_demo_routes(self):
+        """Access follows the site's page endpoints, not a hardcoded path list."""
+        session = self._handshake()["session_token"]
+        headers = self._headers(session)
+        for path in ("/", "/products", "/products/field-tote", "/cart"):
+            response = self.client.get("/ai/page", query_string={"path": path}, headers=headers)
+            body = response.get_json()
+            self.assertEqual(response.status_code, 200, body)
+            self.assertFalse(body.get("blocked"))
+            self.assertEqual(body["path"], store.canonical_ai_path(path))
+
+        # Storefront routes that have no agent endpoint stay denied.
+        for path in ("/shop", "/about", "/bags", "/notebooks", "/tools", "/contact", "/shipping", "/checkout"):
+            response = self.client.get("/ai/page", query_string={"path": path}, headers=headers)
+            body = response.get_json()
+            self.assertEqual(response.status_code, 403, body)
+            self.assertTrue(body.get("blocked"))
+
+        self._add_page(
+            {
+                "id": "page.about",
+                "label": "About",
+                "kind": "page",
+                "path": "/about",
+                "ref": "/about",
+                "agent_access": True,
+                "direction": "read",
+                "response_fields": [
+                    {"key": "title", "label": "title", "type": "string", "agent_visible": True},
+                    {"key": "summary", "label": "summary", "type": "string", "agent_visible": True},
+                    {"key": "meta.blurb", "label": "blurb", "type": "string", "agent_visible": False},
+                ],
+                "request_fields": [],
+                "sample_response": {
+                    "title": "Our story",
+                    "summary": "Made in Portland.",
+                    "elements": [],
+                    "meta": {"blurb": "workshop notes"},
+                },
+                "sample_request": {},
+            }
+        )
+        self._add_page(
+            {
+                "id": "page.stories",
+                "label": "Stories",
+                "kind": "page",
+                "path": "/stories/*",
+                "ref": "/stories/*",
+                "agent_access": True,
+                "direction": "read",
+                "response_fields": [{"key": "title", "label": "title", "type": "string", "agent_visible": True}],
+                "request_fields": [],
+                "sample_response": {"title": "Field notes", "summary": "A configured wildcard page.", "elements": [], "meta": {}},
+                "sample_request": {},
+            }
+        )
+
+        about = self.client.get("/ai/page", query_string={"path": "/ABOUT/"}, headers=headers)
+        about_body = about.get_json()
+        self.assertEqual(about.status_code, 200, about_body)
+        self.assertFalse(about_body.get("blocked"))
+        self.assertEqual(about_body["path"], "/about")
+        self.assertEqual(about_body["title"], "Our story")
+        self.assertNotIn("blurb", json.dumps(about_body))
+        self.assertNotIn("workshop notes", json.dumps(about_body))
+
+        story = self.client.get("/ai/page", query_string={"path": "/stories//portland"}, headers=headers)
+        story_body = story.get_json()
+        self.assertEqual(story.status_code, 200, story_body)
+        self.assertEqual(story_body["path"], "/stories/portland")
+        self.assertEqual(story_body["title"], "Field notes")
+        nested = self.client.get("/ai/page", query_string={"path": "/stories/a/b"}, headers=headers)
+        self.assertEqual(nested.status_code, 403, nested.get_json())
+
+        owner = self._owner()
+        self._set_access(owner, "page.about", False)
+        self._set_access(owner, "page.stories", False)
+        closed = self.client.get("/ai/page", query_string={"path": "/about"}, headers=headers)
+        closed_body = closed.get_json()
+        self.assertEqual(closed.status_code, 403, closed_body)
+        self.assertTrue(closed_body.get("blocked"))
+        self.assertNotIn("Our story", json.dumps(closed_body))
+        self.assertNotIn("workshop notes", json.dumps(closed_body))
+        closed_story = self.client.get("/ai/page", query_string={"path": "/stories/portland"}, headers=headers)
+        self.assertEqual(closed_story.status_code, 403, closed_story.get_json())
+
+        # The same owner toggle still controls the original shop page.
+        self._set_access(owner, "page.products", False)
+        shop = self.client.get("/ai/page", query_string={"path": "/products"}, headers=headers)
+        self.assertEqual(shop.status_code, 403, shop.get_json())
 
     def test_m1_case_and_dot_segments_follow_the_closed_page(self):
         owner = self._owner()
@@ -378,7 +533,12 @@ class EnforcementApi(unittest.TestCase):
         self.assertIsNotNone(row)
         target = row["target"]
         public = {key: value for key, value in body.items() if key != "image"}
-        self.assertNotIn(target, json.dumps(public))
+        # A one-letter answer can occur inside unrelated copy ("Aurif", "AI").
+        # Reject it as its own value, and reject longer answers anywhere in the copy.
+        values = list(_string_values(public))
+        self.assertNotIn(target, values)
+        if len(target) > 1:
+            self.assertFalse(any(target in text for text in values))
         self.assertTrue(body["image"].startswith("data:image/png;base64,"))
         png = base64.b64decode(body["image"].split(",", 1)[1])
         self.assertTrue(png.startswith(b"\x89PNG"))

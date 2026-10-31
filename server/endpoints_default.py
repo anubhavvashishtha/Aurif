@@ -363,4 +363,16 @@ def ensure_endpoint_shape(endpoints: list[dict[str, Any]]) -> list[dict[str, Any
                         f["agent_allowed"] = bool(allowed[f["key"]])
 
         out.append(merged)
+
+    # Owner-configured pages that are not part of the demo template stay in
+    # the policy set. Legacy per-product rows are still collapsed above.
+    known = {row["id"] for row in out}
+    for eid, row in by_id.items():
+        if eid in known or row.get("kind") != "page":
+            continue
+        if eid in LEGACY_PRODUCT_PAGE_IDS or eid.startswith("page.product."):
+            continue
+        if not str(row.get("path") or "").strip():
+            continue
+        out.append(deepcopy(row))
     return out
