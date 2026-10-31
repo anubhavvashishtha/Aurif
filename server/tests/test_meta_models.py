@@ -36,6 +36,9 @@ ENV_KEYS = (
     "VISION_API_KEY",
     "VISION_PROVIDER",
     "VISION_TIMEOUT_SECONDS",
+    "VISION_FALLBACK_MODEL",
+    "VISION_FALLBACK_BASE_URL",
+    "VISION_FALLBACK_API_KEY",
     "MODAL_VISION_MODEL",
     "MODAL_BASE_URL",
     "MODAL_TOKEN_ID",
@@ -476,26 +479,39 @@ class MetaModelCallSites(unittest.TestCase):
         self.assertNotIn("Meta", health["vision"]["powered_by"])
         self.assertNotIn("baseten-key", str(health))
 
-    def test_legacy_deepseek_env_is_ignored(self):
+    def test_modal_credentials_route_vision_and_leave_text_on_meta(self):
         os.environ["MODAL_VISION_MODEL"] = "deepseek-ai/DeepSeek-V4.1-Flash"
         os.environ["MODAL_BASE_URL"] = (
             "https://anubhavvashishtha-iitd--ep-deepseek-v4-1-flash-server.us-west.modal.direct/v1"
         )
         os.environ["MODAL_TOKEN_ID"] = "tid"
         os.environ["MODAL_TOKEN_SECRET"] = "secret"
+        os.environ["VISION_MODEL"] = "example/sam-3.1"
+        os.environ["VISION_BASE_URL"] = "https://vision.example.test/v1"
+        os.environ["VISION_API_KEY"] = "vision-should-not-be-used"
         os.environ["BASETEN_API_KEY"] = "baseten-should-not-be-used"
         os.environ["BASETEN_MODEL"] = "deepseek-ai/DeepSeek-V4.1-Flash"
         image = "data:image/png;base64,iVBORw0KGgo="
         with _Recorder('{"match":true,"human_like":true,"read_as":"K","reason":"ok"}') as rec:
             verdict = muse_client.verify_drawing(image, "K")
         self.assertTrue(verdict["ok"])
-        self.assertEqual(verdict["model"], "deepseek-ai/DeepSeek-V4.1-Flash-1017")
-        self.assertNotEqual(verdict["model"], os.environ["MODAL_VISION_MODEL"])
-        self.assertEqual(rec.clients[0]["base_url"], "https://inference.baseten.co/v1")
-        self.assertNotIn("modal", rec.clients[0]["base_url"])
-        self.assertEqual(rec.clients[0]["api_key"], "baseten-should-not-be-used")
-        self.assertEqual(rec.calls[0]["model"], "deepseek-ai/DeepSeek-V4.1-Flash-1017")
+        self.assertEqual(verdict["provider"], "modal")
+        self.assertEqual(verdict["model"], "deepseek-ai/DeepSeek-V4.1-Flash")
+        self.assertEqual(verdict["powered_by"], "DeepSeek V4.1 Flash (Modal)")
+        self.assertNotIn("Meta", verdict["powered_by"])
+        self.assertEqual(rec.clients[0]["api_key"], "tid.secret")
+        self.assertEqual(rec.clients[0]["base_url"], os.environ["MODAL_BASE_URL"])
+        self.assertEqual(rec.calls[0]["model"], "deepseek-ai/DeepSeek-V4.1-Flash")
+        self.assertNotEqual(rec.calls[0]["model"], "example/sam-3.1")
         self.assertEqual(len(rec.clients), 1)
+        health = muse_client.health_snapshot()
+        self.assertEqual(health["vision"]["powered_by"], "DeepSeek V4.1 Flash (Modal)")
+        self.assertEqual(health["text"]["model"], "muse-spark-1.3")
+        providers = muse_client.api_providers()
+        self.assertEqual(providers["vision"]["powered_by"], "DeepSeek V4.1 Flash (Modal)")
+        self.assertEqual(providers["modal"]["base_url"], os.environ["MODAL_BASE_URL"])
+        self.assertNotIn("secret", str(providers["modal"]))
+        self.assertNotIn("tid.secret", str(health))
         with _Recorder(
             '{"risk":"low","reason":"ok","suggested_scopes":["view"],"drop_act":false}'
         ) as text_rec:
@@ -543,8 +559,9 @@ class MetaModelCallSites(unittest.TestCase):
         with _Recorder("", error=RuntimeError("upstream down")) as rec:
             verdict = muse_client.verify_drawing(image, "A")
         self.assertFalse(verdict["ok"])
-        self.assertIn("upstream down", verdict["reason"])
-        self.assertIn("vision provider error", verdict["reason"])
+        self.assertTrue(verdict["unavailable"])
+        self.assertEqual(verdict["reason"], "model request failed")
+        self.assertNotIn("upstream down", verdict["reason"])
         self.assertNotIn("fallback", verdict["reason"].lower())
         self.assertEqual(len(rec.clients), 1)
         self.assertEqual(len(rec.calls), 1)
@@ -594,7 +611,13 @@ class MetaModelCallSites(unittest.TestCase):
         body = response.get_json()
         self.assertTrue(body["degraded"])
         self.assertIn("does not grant agent act", body["error"])
-        self.assertEqual(body["fallback"]["target"], peek_challenge(challenge["challenge_id"])["target"])
+        target = peek_challenge(challenge["challenge_id"])["target"]
+        self.assertNotIn("target", body["fallback"])
+        self.assertNotIn(target, body["error"])
+        self.assertNotIn(target, body["fallback"]["prompt"])
+        self.assertIn("challenge image", body["fallback"]["prompt"])
+        if len(target) > 1:
+            self.assertNotIn(target, response.get_data(as_text=True))
         self.assertNotIn("human_token", body)
         self.assertNotIn("granted_scopes", body)
 
@@ -652,6 +675,7 @@ class MetaModelCallSites(unittest.TestCase):
                     )
         body = response.get_json()
         self.assertEqual(response.status_code, 403)
+        self.assertEqual(body["error"], "drawing did not match")
         self.assertNotIn("human_token", body)
         self.assertNotEqual(body.get("method"), "ink_fallback")
 
@@ -868,6 +892,220 @@ class MetaModelCallSites(unittest.TestCase):
         self.assertEqual(body["method"], "ink_fallback")
         self.assertTrue(body["degraded"])
         self.assertNotIn("granted_scopes", body)
+
+    def test_tiny_drawing_does_not_pass_on_a_positive_vision_match(self):
+        import base64
+        from io import BytesIO
+
+        from PIL import Image
+
+        image = Image.new("L", (8, 8), 255)
+        image.putpixel((2, 2), 0)
+        image.putpixel((3, 2), 0)
+        buf = BytesIO()
+        image.save(buf, format="PNG")
+        raw = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+        with _Recorder('{"match":true,"human_like":true,"read_as":"A","reason":"ok"}'):
+            verdict = muse_client.verify_drawing(raw, "A")
+        self.assertFalse(verdict["ok"])
+        self.assertFalse(verdict["unavailable"])
+        self.assertEqual(verdict["reason"], "drawing too small")
+
+    def test_reject_response_does_not_echo_the_target(self):
+        import json
+
+        import store
+        from app import app
+        from human_gate import issue_challenge, peek_challenge
+
+        challenge = issue_challenge()
+        target = peek_challenge(challenge["challenge_id"])["target"]
+        payload = (
+            '{"match":false,"human_like":true,"read_as":"%s","reason":"expected %s"}'
+            % (target, target)
+        )
+        with _Recorder(payload):
+            with tempfile.TemporaryDirectory() as tmp:
+                with patch.object(store, "STORE_PATH", Path(tmp) / "store.json"):
+                    response = app.test_client().post(
+                        "/api/public/human-verify",
+                        json={"challenge_id": challenge["challenge_id"], "image": self._ink_png()},
+                    )
+        body = response.get_json()
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(body["error"], "drawing did not match")
+        self.assertNotIn(target, body["error"])
+        self.assertNotIn("reason", body)
+        self.assertNotIn("reason", body["verdict"])
+        self.assertFalse(body["verdict"]["read_as"])
+        if len(target) > 1:
+            self.assertNotIn(target, json.dumps(body))
+
+    def test_access_error_is_logged_without_a_fallback_or_the_key(self):
+        class Forbidden(Exception):
+            status_code = 403
+
+            def __str__(self) -> str:
+                return "please check the api-key you provided test-baseten-key"
+
+        image = "data:image/png;base64,iVBORw0KGgo="
+        with _Recorder("", error=Forbidden()) as rec:
+            with self.assertLogs("aurif.models", level="ERROR") as logs:
+                verdict = muse_client.verify_drawing(image, "K7")
+        self.assertTrue(verdict["unavailable"])
+        self.assertEqual(
+            verdict["reason"],
+            "vision model deepseek-ai/DeepSeek-V4.1-Flash-1017: 403 forbidden, "
+            "check Baseten model access or slug",
+        )
+        self.assertNotIn("test-baseten-key", verdict["reason"])
+        self.assertNotIn("K7", verdict["reason"])
+        self.assertEqual(len(rec.clients), 1)
+        logged = "\n".join(logs.output)
+        self.assertIn("403 forbidden", logged)
+        self.assertIn("deepseek-ai/DeepSeek-V4.1-Flash-1017", logged)
+        self.assertNotIn("test-baseten-key", logged)
+        self.assertNotIn("K7", logged)
+        health = muse_client.health_snapshot()
+        self.assertEqual(health["vision"]["last_error"], verdict["reason"])
+
+    def test_configured_fallback_retries_once_inside_the_vision_budget(self):
+        os.environ["VISION_FALLBACK_MODEL"] = "meta-models/muse-spark-open-1026"
+        os.environ["VISION_FALLBACK_BASE_URL"] = "https://inference.baseten.co/v1"
+        os.environ["VISION_FALLBACK_API_KEY"] = "fallback-key"
+
+        class Forbidden(Exception):
+            status_code = 403
+
+            def __str__(self) -> str:
+                return "please check the api-key you provided test-baseten-key"
+
+        clients: list[dict] = []
+
+        class _Completions:
+            def __init__(self, index: int):
+                self.index = index
+
+            def create(self, **kwargs):
+                if self.index == 1:
+                    raise Forbidden()
+                msg = MagicMock()
+                msg.content = '{"match":true,"human_like":true,"read_as":"A","reason":"ok"}'
+                msg.reasoning_content = None
+                choice = MagicMock()
+                choice.message = msg
+                resp = MagicMock()
+                resp.choices = [choice]
+                return resp
+
+        class _Client:
+            def __init__(self, **kwargs):
+                clients.append(kwargs)
+                self.chat = type("Chat", (), {"completions": _Completions(len(clients))})()
+
+        image = "data:image/png;base64,iVBORw0KGgo="
+        with patch("muse_client.OpenAI", _Client):
+            verdict = muse_client.verify_drawing(image, "A")
+        self.assertTrue(verdict["ok"])
+        self.assertEqual(verdict["model"], "meta-models/muse-spark-open-1026")
+        self.assertEqual(verdict["powered_by"], "Meta Muse Spark Open")
+        self.assertEqual(len(clients), 2)
+        self.assertEqual(clients[0]["api_key"], "test-baseten-key")
+        self.assertEqual(clients[0]["timeout"], 15.0)
+        self.assertEqual(clients[1]["api_key"], "fallback-key")
+        self.assertEqual(clients[1]["base_url"], "https://inference.baseten.co/v1")
+        self.assertGreaterEqual(clients[1]["timeout"], 0.2)
+        self.assertLessEqual(clients[1]["timeout"], 15.0)
+        self.assertNotIn("test-baseten-key", str(verdict))
+        health = muse_client.health_snapshot()
+        self.assertTrue(health["vision"]["last_ok"])
+        self.assertFalse(health["vision"]["degraded"])
+        self.assertIn("403 forbidden", health["vision"]["last_error"])
+        self.assertIn("DeepSeek-V4.1-Flash-1017", health["vision"]["last_error"])
+        self.assertNotIn("fallback-key", str(health))
+        self.assertNotIn("test-baseten-key", str(health))
+
+    def test_non_access_errors_do_not_use_the_fallback_model(self):
+        os.environ["VISION_FALLBACK_MODEL"] = "meta-models/muse-spark-open-1026"
+
+        class ServerError(Exception):
+            status_code = 500
+
+        image = "data:image/png;base64,iVBORw0KGgo="
+        with _Recorder("", error=ServerError()) as rec:
+            verdict = muse_client.verify_drawing(image, "A")
+        self.assertTrue(verdict["unavailable"])
+        self.assertEqual(verdict["reason"], "model request failed (500)")
+        self.assertEqual(len(rec.clients), 1)
+        self.assertEqual(rec.calls[0]["model"], "deepseek-ai/DeepSeek-V4.1-Flash-1017")
+
+    def test_health_is_per_model_for_vision_down_and_text_down(self):
+        from app import app
+
+        class Forbidden(Exception):
+            status_code = 403
+
+            def __str__(self) -> str:
+                return "please check the api-key you provided secret-modal-token"
+
+        with _Recorder(
+            '{"risk":"low","reason":"shopper","suggested_scopes":["view","act"],"drop_act":false}'
+        ):
+            scored = muse_client.score_purpose("help me buy a tote")
+        self.assertEqual(scored["source"], "model")
+        self.assertFalse(scored["degraded"])
+
+        os.environ["MODAL_TOKEN_ID"] = "tid"
+        os.environ["MODAL_TOKEN_SECRET"] = "secret-modal-token"
+        image = "data:image/png;base64,iVBORw0KGgo="
+        with _Recorder("", error=Forbidden()):
+            failed = muse_client.verify_drawing(image, "K7")
+        self.assertTrue(failed["unavailable"])
+        self.assertIn("check Modal model access or slug", failed["reason"])
+        self.assertNotIn("secret-modal-token", failed["reason"])
+        self.assertNotIn("K7", failed["reason"])
+
+        vision_down = app.test_client().get("/api/health")
+        self.assertEqual(vision_down.status_code, 200)
+        vision_body = vision_down.get_json()
+        self.assertTrue(vision_body["ok"])
+        self.assertTrue(vision_body["degraded"])
+        self.assertTrue(vision_body["partial"])
+        self.assertFalse(vision_body["text"]["degraded"])
+        self.assertTrue(vision_body["text"]["last_ok"])
+        self.assertTrue(vision_body["vision"]["degraded"])
+        self.assertIn("403", vision_body["vision"]["last_error"])
+        self.assertEqual(vision_body["vision"]["powered_by"], "DeepSeek V4.1 Flash (Modal)")
+        self.assertNotIn("secret-modal-token", vision_down.get_data(as_text=True))
+        self.assertNotIn("K7", vision_down.get_data(as_text=True))
+
+        muse_client.reset_model_status()
+        for key in ("MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "META_API_KEY", "MODEL_API_KEY", "BASETEN_API_KEY"):
+            os.environ.pop(key, None)
+        os.environ["VISION_API_KEY"] = "vision-only-key"
+        os.environ["VISION_MODEL"] = "example/sam-3.1"
+        os.environ["VISION_BASE_URL"] = "https://vision.example.test/v1"
+        os.environ["VISION_PROVIDER"] = "sam"
+        with _Recorder('{"match":true,"human_like":true,"read_as":"A","reason":"ok"}') as rec:
+            passed = muse_client.verify_drawing(image, "A")
+        self.assertTrue(passed["ok"])
+        self.assertEqual(rec.clients[0]["api_key"], "vision-only-key")
+        self.assertEqual(rec.calls[0]["model"], "example/sam-3.1")
+        with _Recorder('{"risk":"low","reason":"ok","suggested_scopes":["view"],"drop_act":false}') as text_rec:
+            text_down_score = muse_client.score_purpose("help me buy a tote")
+        self.assertEqual(text_rec.calls, [])
+        self.assertEqual(text_down_score["source"], "rules")
+
+        text_down = app.test_client().get("/api/health")
+        self.assertEqual(text_down.status_code, 503)
+        text_body = text_down.get_json()
+        self.assertFalse(text_body["ok"])
+        self.assertTrue(text_body["degraded"])
+        self.assertFalse(text_body["partial"])
+        self.assertTrue(text_body["text"]["degraded"])
+        self.assertFalse(text_body["vision"]["degraded"])
+        self.assertTrue(text_body["vision"]["last_ok"])
+        self.assertNotIn("vision-only-key", text_down.get_data(as_text=True))
 
     def test_non_meta_chat_model_is_rejected(self):
         with _Recorder("nope") as rec:
