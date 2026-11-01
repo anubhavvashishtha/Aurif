@@ -64,7 +64,7 @@ pip install -r requirements.txt
 python app.py
 ```
 
-The log prints the API URL, the demo login, and the site key (`Site key → …`). CLI calls need that key. It is also on the dashboard after you log in. With no env set, the API listens on `127.0.0.1:8787` with the debugger on.
+The log prints the API URL, the demo login, and the site key (`Site key → …`). CLI calls need that key. It is also on the dashboard after you log in. With no env set, the API listens on `127.0.0.1:8787` with the debugger off. Set `FLASK_DEBUG=1` to turn the debugger on.
 
 ### 2. Customer site and dashboard
 
