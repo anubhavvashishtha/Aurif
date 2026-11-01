@@ -14,6 +14,7 @@ from typing import Any
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from werkzeug.exceptions import HTTPException
 
 import config
 import muse_browse
@@ -56,6 +57,23 @@ CORS(
         "X-Demo-As-Agent",
     ],
 )
+
+
+@app.errorhandler(HTTPException)
+def handle_http_exception(exc: HTTPException):
+    """Keep 404, 405, and other HTTP errors on their own status codes.
+
+    Pass the exception through so a body that is already JSON stays JSON,
+    and Flask's own pages stay as they are.
+    """
+    return exc
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(exc: Exception):
+    app.logger.exception("unhandled exception on %s %s", request.method, request.path)
+    return jsonify({"error": "internal server error"}), 500
+
 
 sessions: dict[str, dict[str, Any]] = {}
 cart_by_session: dict[str, list[str]] = {}
@@ -186,6 +204,32 @@ def owner_auth():
     if not session:
         return None, (jsonify({"ok": False, "error": "login required"}), 401)
     return session, None
+
+
+def require_json_object() -> tuple[dict[str, Any] | None, tuple[Any, int] | None]:
+    """Parse the body and require a JSON object. Anything else is a 400."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return None, (jsonify({"error": "request body must be a JSON object"}), 400)
+    return data, None
+
+
+_FIELD_TYPE_LABELS: dict[type, str] = {str: "a string", list: "a list", dict: "an object"}
+
+
+def reject_field_types(data: dict[str, Any], expected: dict[str, type]) -> tuple[Any, int] | None:
+    """400 when a present field is not the type the route reads.
+
+    Missing keys and JSON null keep the route's existing defaults.
+    """
+    for name, kind in expected.items():
+        if name not in data or data[name] is None:
+            continue
+        if isinstance(data[name], kind):
+            continue
+        label = _FIELD_TYPE_LABELS[kind]
+        return jsonify({"ok": False, "error": f"{name} must be {label}"}), 400
+    return None
 
 
 def get_agent_session() -> dict[str, Any] | None:
@@ -630,8 +674,22 @@ def ai_help():
 
 @app.post("/ai/handshake")
 def handshake():
+    data, err = require_json_object()
+    if err:
+        return err
+    err = reject_field_types(
+        data,
+        {
+            "agent_id": str,
+            "agent_version": str,
+            "purpose": str,
+            "site_key": str,
+            "requested_scopes": list,
+        },
+    )
+    if err:
+        return err
     site = site_record()
-    data = request.get_json(silent=True) or {}
     agent_id = (data.get("agent_id") or "agent").strip() or "agent"
     asked = {
         "method": "POST",
@@ -644,9 +702,6 @@ def handshake():
         return denied
 
     requested = data.get("requested_scopes") or ["view"]
-    if not isinstance(requested, list):
-        return jsonify({"ok": False, "error": "requested_scopes must be a list"}), 400
-
     granted = [s for s in requested if s in ALLOWED_SCOPES]
     if not granted:
         return jsonify({"ok": False, "error": "no supported scopes requested"}), 400
@@ -770,8 +825,20 @@ def ai_page():
 
 @app.post("/ai/actions")
 def ai_actions():
+    data, err = require_json_object()
+    if err:
+        return err
+    err = reject_field_types(
+        data,
+        {
+            "action_id": str,
+            "args": dict,
+            "site_key": str,
+        },
+    )
+    if err:
+        return err
     site = site_record()
-    data = request.get_json(silent=True) or {}
     action_id = (data.get("action_id") or "").strip()
     asked = {"method": "POST", "path": "/ai/actions", "action_id": action_id, "args": data.get("args") or {}}
     denied = reject_without_site_key(site, kind="action_blocked", asked=asked, body=data, action_id=action_id or None)
@@ -790,8 +857,6 @@ def ai_actions():
     if not action_id:
         return jsonify({"ok": False, "error": "action_id required"}), 400
     args = data.get("args") or {}
-    if not isinstance(args, dict):
-        return jsonify({"ok": False, "error": "args must be an object"}), 400
 
     if not store.endpoint_allowed(site, action_id=action_id):
         store.log_activity(
@@ -929,7 +994,12 @@ def ai_audit():
 
 @app.post("/api/auth/signup")
 def api_signup():
-    data = request.get_json(silent=True) or {}
+    data, err = require_json_object()
+    if err:
+        return err
+    err = reject_field_types(data, {"email": str, "password": str, "name": str})
+    if err:
+        return err
     email = (data.get("email") or "").strip()
     password = data.get("password") or ""
     name = (data.get("name") or "").strip()
@@ -990,10 +1060,15 @@ def api_sites():
 
 @app.post("/api/sites")
 def api_create_site():
+    data, err = require_json_object()
+    if err:
+        return err
+    err = reject_field_types(data, {"name": str, "url": str})
+    if err:
+        return err
     session, err = owner_auth()
     if err:
         return err
-    data = request.get_json(silent=True) or {}
     site = store.create_site(session["user"]["id"], data.get("name") or "New site", data.get("url") or "")
     return jsonify({"ok": True, "site": site})
 

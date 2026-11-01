@@ -1,8 +1,9 @@
 """Process settings for `python app.py`.
 
 Defaults match a zero-config checkout: bind 127.0.0.1:8787 with the Werkzeug
-debugger on, CORS limited to the two local frontends, public URLs pointing at
-those same ports. Optional env vars override each of those.
+debugger off, CORS limited to the two local frontends, public URLs pointing at
+those same ports. Optional env vars override each of those. Set FLASK_DEBUG=1
+(or true) to opt into the debugger.
 """
 
 from __future__ import annotations
@@ -71,11 +72,11 @@ def bind_host() -> str:
 
 
 def flask_debug() -> bool:
-    """Werkzeug debugger / reloader. Off in production.
+    """Werkzeug debugger and reloader. Off unless explicitly enabled.
 
-    Explicit FLASK_DEBUG or DEBUG wins. Otherwise production is when
-    AURIF_ENV=production or a platform set PORT. A laptop `python app.py`
-    with no env still runs debug, matching the previous hardcoded default.
+    FLASK_DEBUG or DEBUG turns it on only for 1, true, yes, or on. Any other
+    value, including unset, leaves it off, so a plain `python app.py` does
+    not start the debugger.
     """
     for name in ("FLASK_DEBUG", "DEBUG"):
         raw = os.environ.get(name)
@@ -86,11 +87,7 @@ def flask_debug() -> bool:
             return True
         if value in _FALSY:
             return False
-    if _raw("AURIF_ENV").lower() in ("production", "prod"):
-        return False
-    if _raw("PORT"):
-        return False
-    return True
+    return False
 
 
 def api_public_url() -> str:
