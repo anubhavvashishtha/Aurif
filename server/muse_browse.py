@@ -1,0 +1,1196 @@
+"""Muse as a normal browsing/scraping agent — returns step-by-step JSON for the dashboard."""
+
+from __future__ import annotations
+
+import base64
+import io
+import json
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
+from html.parser import HTMLParser
+from typing import Any
+
+import config
+import muse_client
+
+
+def api_base() -> str:
+    """Origin for Muse's own API calls. Local default is http://127.0.0.1:8787."""
+    return config.api_public_url()
+
+
+class _PageParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._skip = 0
+        self.title = ""
+        self._in_title = False
+        self.chunks: list[str] = []
+        self.links: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        t = tag.lower()
+        if t in ("script", "style", "noscript"):
+            self._skip += 1
+        if t == "title":
+            self._in_title = True
+        if t == "a":
+            href = dict(attrs).get("href")
+            if href:
+                self.links.append(href)
+
+    def handle_endtag(self, tag: str) -> None:
+        t = tag.lower()
+        if t in ("script", "style", "noscript") and self._skip:
+            self._skip -= 1
+        if t == "title":
+            self._in_title = False
+
+    def handle_data(self, data: str) -> None:
+        text = " ".join((data or "").split())
+        if not text:
+            return
+        if self._in_title and not self.title:
+            self.title = text
+        if self._skip:
+            return
+        self.chunks.append(text)
+
+
+def agent_headers(
+    *,
+    human_token: str | None = None,
+    site_key: str | None = None,
+    session: str | None = None,
+) -> dict[str, str]:
+    headers = {
+        "User-Agent": "MuseBot/1.0 (+https://example.local/bot)",
+        "X-Demo-As-Agent": "1",
+        "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+    }
+    if human_token:
+        headers["X-Aurif-Human"] = human_token
+        headers["Cookie"] = f"aurif_human={human_token}"
+    if site_key:
+        headers["X-Aurif-Site-Key"] = site_key
+    if session:
+        headers["X-Aurif-Session"] = session
+    return headers
+
+
+def _request(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    body: dict[str, Any] | None = None,
+    timeout: float = 12.0,
+) -> tuple[int, dict[str, str], str]:
+    data = None
+    req_headers = dict(headers or {})
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        req_headers.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            raw = res.read().decode("utf-8", errors="replace")
+            return int(res.status), {k.lower(): v for k, v in res.headers.items()}, raw
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        return int(e.code), {k.lower(): v for k, v in e.headers.items()}, raw
+    except Exception as e:
+        return 0, {}, str(e)
+
+
+def _json_body(raw: str) -> Any:
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def parse_page(html: str, *, limit: int = 1200) -> dict[str, Any]:
+    parser = _PageParser()
+    try:
+        parser.feed(html or "")
+    except Exception:
+        pass
+    body = re.sub(r"\s+", " ", " ".join(parser.chunks)).strip()
+    if len(body) > limit:
+        body = body[: limit - 1].rstrip() + "…"
+    return {"title": parser.title, "text": body, "links": parser.links[:40]}
+
+
+def make_captcha_drawing(target: str) -> str:
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception:
+        tiny = base64.b64encode(
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde"
+            b"\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82"
+        ).decode()
+        return f"data:image/png;base64,{tiny}"
+
+    img = Image.new("RGB", (420, 180), "white")
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((8, 8, 411, 171), outline=(210, 210, 210), width=2)
+    text = (target or "?").strip().upper() or "?"
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+    draw.text((48, 64), text, fill=(20, 20, 20), font=font)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+# Storefront words that have no AI surface. The protocol only serves these routes.
+_PATH_ALIASES = {
+    "/shop": "/products",
+    "/store": "/products",
+    "/catalog": "/products",
+    "/catalogue": "/products",
+    "/product": "/products",
+}
+
+
+def _normalize_ai_path(path: str) -> str:
+    """Collapse a URL path onto a route the site actually exposes to agents."""
+    path = (path or "/").split("?")[0].split("#")[0]
+    if not path.startswith("/"):
+        path = "/" + path
+    if len(path) > 1:
+        path = path.rstrip("/") or "/"
+    return _PATH_ALIASES.get(path, path)
+
+
+_TOKEN = re.compile(r"[a-z0-9]+")
+# Words that name the question, not the product. "how much is the tote" should
+# match Tote, not fail because the full name "field tote" is absent.
+_NAME_STOPWORDS = frozenset({
+    "a", "an", "the", "of", "and", "or", "for", "to", "my", "me", "please",
+    "this", "that", "these", "those", "it", "is", "are", "was", "be",
+    "how", "much", "what", "whats", "price", "prices", "cost", "costs",
+    "product", "products", "item", "items", "one", "some", "with",
+    "from", "in", "on", "at", "do", "does", "did", "you", "your", "i", "we",
+    "can", "could", "would", "should", "just", "now", "then",
+})
+
+
+def _tokens(text: str) -> list[str]:
+    return _TOKEN.findall((text or "").lower())
+
+
+def _same_word(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    if len(left) < 3 or len(right) < 3:
+        return False
+    return left.rstrip("s") == right.rstrip("s")
+
+
+def _product_slug_from_message(message: str, products: dict[str, dict[str, Any]]) -> str:
+    """Product the message names.
+
+    The full name or slug wins. A single distinctive word is enough ("tote"
+    for Field Tote, "notebook" for Trail Notebook). If two products share that
+    word and nothing breaks the tie, return nothing rather than guess.
+    """
+    lowered = (message or "").lower()
+    if not lowered.strip():
+        return ""
+    message_tokens = _tokens(lowered)
+    best_slug = ""
+    best_score = 0
+    tied = False
+    for slug, product in products.items():
+        name = str((product or {}).get("name") or "").lower().strip()
+        phrase = slug.replace("-", " ")
+        score = 0
+        for candidate in {c for c in (name, phrase, slug) if c}:
+            if re.search(rf"(?<![a-z0-9]){re.escape(candidate)}(?![a-z0-9])", lowered):
+                score = max(score, 1000 + len(candidate))
+        if score < 1000:
+            seen: set[str] = set()
+            words: list[str] = []
+            for tok in _tokens(f"{name} {phrase}"):
+                if len(tok) < 3 or tok in _NAME_STOPWORDS or tok in seen:
+                    continue
+                seen.add(tok)
+                words.append(tok)
+            matched = [tok for tok in words if any(_same_word(tok, msg) for msg in message_tokens)]
+            if matched:
+                score = sum(len(tok) for tok in matched) + 10 * len(matched)
+        if score > best_score:
+            best_slug = slug
+            best_score = score
+            tied = False
+        elif score == best_score and score > 0 and slug != best_slug:
+            tied = True
+    if tied or best_score <= 0:
+        return ""
+    return best_slug
+
+
+def shop_path_from_message(message: str, products: dict[str, dict[str, Any]]) -> str:
+    url_match = re.search(r"https?://\S+", message)
+    if url_match:
+        raw = url_match.group(0).rstrip(".,)")
+        path = re.sub(r"^https?://[^/]+", "", raw) or "/"
+        if not path.startswith("/"):
+            path = "/" + path
+        return _normalize_ai_path(path)
+    path_match = re.search(r"(?:^|\s)(/[A-Za-z0-9_./-]*)", message)
+    if path_match:
+        return _normalize_ai_path(path_match.group(1))
+    slug = _product_slug_from_message(message, products)
+    if slug:
+        return f"/products/{slug}"
+    lowered = message.lower()
+    # "shop" / "product(s)" / "catalog" are the catalog, which lives at /products.
+    if re.search(r"\b(shop(?:ping)?|stores?|catalog(?:ue)?|products?)\b", lowered):
+        return "/products"
+    if re.search(r"\bcarts?\b", lowered):
+        return "/cart"
+    if re.search(r"\bhome\b", lowered):
+        return "/"
+    return "/"
+
+
+# A cue before the verb, in the same clause, cancels that verb. "but" / "." start
+# a new clause so "don't add the notebook, but add the tote" still adds the tote.
+_NEGATION_CUE = re.compile(
+    r"\b(?:"
+    r"don'?t|do\s+not|doesn'?t|does\s+not|didn'?t|did\s+not|"
+    r"won'?t|will\s+not|can'?t|cannot|can\s+not|"
+    r"never|without|avoid|refrain(?:\s+from)?|skip|"
+    r"cancel(?:led|ed|ing)?|stop|"
+    r"no\s+longer|not"
+    r")\b",
+    re.I,
+)
+_SCOPE_RESET = re.compile(
+    r"[.!?;]|\b(?:but|however|although|though|instead|except)\b",
+    re.I,
+)
+_FRESH_IMPERATIVE = re.compile(r"(?:please|just|now|then|actually|do)?\s*", re.I)
+_CHECKOUT_VERB = re.compile(r"\bcheck\s*out\b|\bcheckout\b", re.I)
+_CLEAR_VERB = re.compile(r"\b(?:clear|empty)\b", re.I)
+_ADD_VERB = re.compile(r"\b(?:add|buy|purchase|order)\b", re.I)
+_PUT_VERB = re.compile(r"\b(?:put|place)\b", re.I)
+# A take-back after the verb ("add the tote, actually no"). "but not the tote"
+# is a different product, not one of these, so that add still stands.
+_RETRACTION = re.compile(
+    r"(?:"
+    r"\bactually\s*,?\s*no\b|"
+    r"\bnever\s*mind\b|"
+    r"\bnevermind\b|"
+    r"\bscratch\s+that\b|"
+    r"\bforget\s+(?:it|that)\b|"
+    r"\bon\s+second\s+thought\b|"
+    r"\bwait\s*,?\s*(?:don't|dont|do\s+not)\b|"
+    r",\s*no\b"
+    r")",
+    re.I,
+)
+
+
+def _scope_start(text: str, index: int) -> int:
+    start = 0
+    for match in _SCOPE_RESET.finditer(text):
+        if match.end() <= index:
+            start = match.end()
+        else:
+            break
+    prefix = text[start:index]
+    for match in re.finditer(r",\s*", prefix):
+        between = prefix[match.end():]
+        if _FRESH_IMPERATIVE.fullmatch(between):
+            start = start + match.end()
+    return start
+
+
+def _clause_end(text: str, index: int) -> int:
+    for match in _SCOPE_RESET.finditer(text):
+        if match.start() > index:
+            return match.start()
+    return len(text)
+
+
+def _verb_is_negated(text: str, verb_start: int) -> bool:
+    window = text[_scope_start(text, verb_start):verb_start]
+    return _NEGATION_CUE.search(window) is not None
+
+
+def _verb_is_retracted(text: str, verb_end: int) -> bool:
+    """A retraction after this verb cancels it. A later verb is judged on its own."""
+    return _RETRACTION.search(text[verb_end:]) is not None
+
+
+def _affirmed_matches(text: str, pattern: re.Pattern[str]) -> list[re.Match[str]]:
+    return [
+        match
+        for match in pattern.finditer(text)
+        if not _verb_is_negated(text, match.start()) and not _verb_is_retracted(text, match.end())
+    ]
+
+
+def _wants_cart_add(message: str) -> bool:
+    if _affirmed_matches(message, _ADD_VERB):
+        return True
+    return bool("cart" in message.lower() and _affirmed_matches(message, _PUT_VERB))
+
+
+def _slug_for_add(message: str, products: dict[str, dict[str, Any]]) -> str:
+    """Product named next to an affirmed add, ignoring a cancelled one."""
+    for pattern in (_ADD_VERB, _PUT_VERB):
+        for match in _affirmed_matches(message, pattern):
+            if pattern is _PUT_VERB and "cart" not in message.lower():
+                continue
+            clause = message[_scope_start(message, match.start()):_clause_end(message, match.start())]
+            slug = _product_slug_from_message(clause, products)
+            if slug:
+                return slug
+    if _wants_cart_add(message):
+        return _product_slug_from_message(message, products)
+    return ""
+
+
+def action_from_message(message: str, products: dict[str, dict[str, Any]]) -> dict[str, str] | None:
+    """Mutation the user asked for. A negated or cancelled instruction does not act."""
+    if _affirmed_matches(message, _CHECKOUT_VERB):
+        return {"action_id": "cart.checkout", "kind": "checkout"}
+    if "cart" in message.lower() and _affirmed_matches(message, _CLEAR_VERB):
+        return {"action_id": "cart.clear", "kind": "clear"}
+    slug = _slug_for_add(message, products)
+    if slug and _wants_cart_add(message):
+        return {"action_id": f"product.add:{slug}", "kind": "add", "slug": slug}
+    return None
+
+
+def _absolute(url: str, base: str) -> str:
+    return urllib.parse.urljoin(base if base.endswith("/") else base + "/", url)
+
+
+def _summarize_fetch(status: int, body: str, content_type: str = "") -> dict[str, Any]:
+    out: dict[str, Any] = {"status": status}
+    if "json" in (content_type or "") or (body or "").lstrip().startswith(("{", "[")):
+        parsed = _json_body(body)
+        if parsed is not None:
+            out["json"] = parsed
+            return out
+    page = parse_page(body)
+    out["title"] = page.get("title")
+    out["text"] = (page.get("text") or "")[:700]
+    out["links"] = page.get("links") or []
+    return out
+
+
+def _step(n: int, action: str, *, result: str, detail: str = "", **extra: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {"step": n, "action": action, "result": result}
+    if detail:
+        row["detail"] = detail
+    for k, v in extra.items():
+        if v is not None and v != "":
+            row[k] = v
+    return row
+
+
+def _catalog_line(item: dict[str, Any]) -> str:
+    """One catalog row. Price is included only when the site actually sent it."""
+    name = str(item.get("name") or "").strip()
+    if not name:
+        return ""
+    if "price" in item and item.get("price") not in (None, ""):
+        return f"{name} ({item.get('price')})"
+    return name
+
+
+def _fields_from_product(product: dict[str, Any]) -> list[dict[str, str]]:
+    fields: list[dict[str, str]] = []
+    for key in ("name", "title", "summary", "price", "compare_at", "discount", "rating", "sku", "highlights"):
+        val = product.get(key)
+        if val is None or val == "":
+            continue
+        fields.append({"label": key.replace("_", " ").capitalize(), "value": str(val)})
+    return fields
+
+
+def _fields_from_page_payload(parsed: dict[str, Any], *, path: str) -> list[dict[str, str]]:
+    """Pull answerable fields from an /ai/page JSON body (after owner redaction)."""
+    fields: list[dict[str, str]] = []
+    if isinstance(parsed.get("products"), list):
+        slug_m = re.match(r"^/products/([^/]+)/?$", path)
+        wanted = None
+        if slug_m:
+            slug = slug_m.group(1)
+            wanted = next(
+                (
+                    p
+                    for p in parsed["products"]
+                    if isinstance(p, dict) and (p.get("slug") == slug or p.get("id") == slug)
+                ),
+                None,
+            )
+        if wanted:
+            return _fields_from_product(wanted)
+        names = [
+            str(p.get("name"))
+            for p in parsed["products"][:8]
+            if isinstance(p, dict) and p.get("name")
+        ]
+        if names:
+            return [{"label": "Products", "value": ", ".join(names)}]
+
+    for key in ("title", "summary"):
+        if parsed.get(key) not in (None, ""):
+            fields.append({"label": key.capitalize(), "value": str(parsed.get(key))})
+    meta = parsed.get("meta") if isinstance(parsed.get("meta"), dict) else {}
+    for key in ("name", "price", "compare_at", "discount", "rating", "sku", "highlights"):
+        if meta.get(key) is not None and meta.get(key) != "":
+            fields.append(
+                {
+                    "label": key.replace("_", " ").capitalize(),
+                    "value": str(meta.get(key)),
+                }
+            )
+    catalog = meta.get("products")
+    if isinstance(catalog, list):
+        lines = [_catalog_line(item) for item in catalog if isinstance(item, dict)]
+        lines = [line for line in lines if line]
+        if lines:
+            fields.append({"label": "Products", "value": ", ".join(lines)})
+
+    # Top-level leftovers after parent `meta` was redacted (rating, discount, …).
+    seen = {f["label"].lower() for f in fields}
+    for key in ("name", "title", "summary", "price", "compare_at", "discount", "rating", "sku", "highlights"):
+        label = key.replace("_", " ").capitalize()
+        if label.lower() in seen:
+            continue
+        if parsed.get(key) not in (None, ""):
+            fields.append({"label": label, "value": str(parsed.get(key))})
+            seen.add(label.lower())
+    reviews = parsed.get("reviews")
+    if isinstance(reviews, list) and "reviews" not in seen:
+        fields.append({"label": "Reviews", "value": str(len(reviews))})
+    return fields
+
+
+def _ai_page_ok(steps: list[dict[str, Any]]) -> bool:
+    return any(
+        s.get("action") == "request"
+        and s.get("result") == "ok"
+        and "/ai/page" in str(s.get("url") or "")
+        for s in steps
+    )
+
+
+def _try_captcha() -> dict[str, Any]:
+    """Attempt human verification like a bot. Returns passed/token/steps/agent_access."""
+    out: dict[str, Any] = {"passed": False, "human_token": None, "steps": [], "agent_access": None}
+    gate_status, _, gate_raw = _request(f"{api_base()}/api/public/gate", headers=agent_headers())
+    gate = _json_body(gate_raw) if gate_status else {}
+    if isinstance(gate, dict) and gate.get("require_human_captcha") is False:
+        out["passed"] = True
+        out["steps"].append(
+            {"action": "check_captcha_required", "result": "skipped", "detail": "Human CAPTCHA is off"}
+        )
+        return out
+
+    ch_status, _, ch_raw = _request(f"{api_base()}/api/public/human-challenge", headers=agent_headers())
+    challenge = _json_body(ch_raw) if ch_status else {}
+    if not isinstance(challenge, dict):
+        out["steps"].append({"action": "fetch_captcha", "result": "failed", "detail": "No challenge returned"})
+        return out
+    if challenge.get("required") is False:
+        out["passed"] = True
+        out["steps"].append({"action": "fetch_captcha", "result": "skipped", "detail": "Challenge not required"})
+        return out
+
+    target = str(challenge.get("target") or "")
+    prompt = str(challenge.get("prompt") or f'Draw "{target}"')
+    if not (target or challenge.get("challenge_id")):
+        out["steps"].append({"action": "fetch_captcha", "result": "failed", "detail": "Empty challenge"})
+        return out
+
+    out["steps"].append(
+        {
+            "action": "fetch_captcha",
+            "result": "shown",
+            "detail": prompt,
+            "target": target,
+            "challenge_id": challenge.get("challenge_id"),
+        }
+    )
+
+    wrong = "X" if target.upper() != "X" else "Y"
+    drawing = make_captcha_drawing(wrong)
+    v_status, _, v_raw = _request(
+        f"{api_base()}/api/public/human-verify",
+        method="POST",
+        headers=agent_headers(),
+        body={"challenge_id": challenge.get("challenge_id"), "image": drawing},
+    )
+    verdict = _json_body(v_raw) if isinstance(_json_body(v_raw), dict) else {}
+    if not isinstance(verdict, dict):
+        verdict = {}
+
+    if v_status == 200 and verdict.get("ok"):
+        # Still treat as failed human proof for bot-rendered drawings.
+        out["steps"].append(
+            {
+                "action": "solve_captcha",
+                "result": "rejected",
+                "detail": "Bot drawing was not accepted as human",
+                "drew": wrong,
+                "asked_for": target,
+            }
+        )
+    else:
+        out["steps"].append(
+            {
+                "action": "solve_captcha",
+                "result": "rejected",
+                "detail": str(verdict.get("error") or verdict.get("reason") or "drawing rejected"),
+                "drew": wrong,
+                "asked_for": target,
+                "verdict": {
+                    "match": verdict.get("match"),
+                    "human_like": verdict.get("human_like"),
+                    "read_as": verdict.get("read_as"),
+                },
+            }
+        )
+
+    hint = verdict.get("agent_access") if isinstance(verdict.get("agent_access"), dict) else None
+    if hint:
+        out["agent_access"] = hint
+        out["steps"].append(
+            {
+                "action": "agent_access_modal",
+                "result": "shown",
+                "detail": hint.get("message") or "Use API with site key",
+                "api_steps": hint.get("steps") or [],
+            }
+        )
+    else:
+        out["steps"].append(
+            {
+                "action": "agent_access_modal",
+                "result": "shown",
+                "detail": "To access as an agent, call the API with the required site key",
+            }
+        )
+    return out
+
+
+def browse_as_agent(
+    *,
+    site: dict[str, Any],
+    path: str,
+    products: dict[str, dict[str, Any]],
+    message: str,
+    site_key: str | None = None,
+    model: str | None = None,
+    provider: str | None = None,
+    on_session: Any = None,
+    resume_session: str | None = None,
+    purpose: str | None = None,
+) -> dict[str, Any]:
+    """Browse/scrape like a normal agent and return structured steps for the dashboard."""
+    base = (site.get("url") or config.customer_site_url()).rstrip("/")
+    # Older seeds stored the API origin in the site URL. Send Muse to the storefront.
+    if ":8787" in base or base == config.api_public_url().rstrip("/"):
+        base = config.customer_site_url()
+    target_url = f"{base}{path if path.startswith('/') else '/' + path}"
+    site_key = (site_key or "").strip() or None
+    model_info = muse_client.resolve_model(model)
+    if provider:
+        model_info["provider"] = provider
+
+    intent = action_from_message(message, products)
+    scopes = ["view", "act"] if intent else ["view"]
+    steps: list[dict[str, Any]] = []
+    findings: list[dict[str, Any]] = []
+    fields: list[dict[str, str]] = []
+    denied = False
+    action_outcome: dict[str, Any] | None = None
+    n = 0
+
+    def add(action: str, *, result: str, detail: str = "", **extra: Any) -> None:
+        nonlocal n
+        n += 1
+        steps.append(_step(n, action, result=result, detail=detail, **extra))
+
+    add(
+        "open_url",
+        result="started",
+        detail=f"Opening {target_url}",
+        url=target_url,
+        site_key_used=bool(site_key),
+        model=model_info.get("id"),
+        provider=model_info.get("provider"),
+    )
+
+    status = 0
+    page_ok = False
+    captcha: dict[str, Any] = {"passed": False, "human_token": None, "steps": [], "agent_access": None}
+    human_token = None
+    captcha_passed = False
+
+    # Always hit the storefront + CAPTCHA first — even when a site key is on.
+    # Site key is the fallback the CAPTCHA agent-access modal points at after a fail.
+    headers = agent_headers()
+    status, resp_headers, body = _request(target_url, headers=headers)
+    summary = _summarize_fetch(status, body, resp_headers.get("content-type", ""))
+    findings.append({"url": target_url, **summary})
+
+    blocked = (
+        status == 403
+        or resp_headers.get("x-aurif-gate") == "anonymous_agent_blocked"
+        or "Automated agents are blocked" in (body or "")
+        or "anonymous_agent_blocked" in (body or "")
+    )
+    if status == 0:
+        denied = True
+        add("open_url", result="failed", detail="Could not reach the page", status=status)
+    elif blocked:
+        denied = True
+        add(
+            "open_url",
+            result="blocked",
+            detail="Storefront blocked automated access",
+            status=status,
+            saw=(summary.get("text") or "")[:240],
+        )
+    else:
+        page_ok = True
+        title = summary.get("title") or ""
+        text = summary.get("text") or ""
+        if title:
+            fields.append({"label": "Title", "value": title})
+        add(
+            "open_url",
+            result="ok",
+            detail="Page HTML loaded",
+            status=status,
+            title=title or None,
+            saw=(text or "")[:420] or None,
+        )
+
+    captcha = _try_captcha()
+    for raw_step in captcha.get("steps") or []:
+        n += 1
+        steps.append({"step": n, **raw_step})
+    captcha_passed = bool(captcha.get("passed"))
+    human_token = captcha.get("human_token")
+    if not captcha_passed:
+        denied = True
+
+    # After CAPTCHA fails, the modal tells agents to use the API with a site key.
+    # Only then do we continue on /ai/*. No key + CAPTCHA fail → stop.
+    can_continue = bool(site_key) or (page_ok and captcha_passed)
+    if not can_continue:
+        detail = "No site key enabled — stopped after CAPTCHA / storefront block"
+        if intent:
+            detail = "No site key enabled — I can't act on the cart without permissioned API access"
+        add("stop", result="stopped", detail=detail)
+
+    session_token = (resume_session or "").strip() or None
+    if can_continue:
+        if site_key:
+            if captcha_passed:
+                api_detail = "Using the permissioned API with the site key"
+            else:
+                api_detail = (
+                    "CAPTCHA blocked — following agent-access instructions with the site key"
+                )
+            add(
+                "switch_to_api",
+                result="started",
+                detail=api_detail,
+            )
+            actions = [
+                {"method": "GET", "url": f"{api_base()}/ai/help", "use_site_key": False},
+            ]
+            # One handshake per conversation. A later turn reuses that session
+            # so the cart is still there. A new handshake is only for a new
+            # conversation (no token yet).
+            if not session_token:
+                actions.append(
+                    {
+                        "method": "POST",
+                        "url": f"{api_base()}/ai/handshake",
+                        "use_site_key": True,
+                        "body": {
+                            "purpose": (purpose or message)[:240],
+                            "requested_scopes": scopes,
+                            "site_key": site_key,
+                        },
+                    }
+                )
+            actions.append(
+                {
+                    "method": "GET",
+                    "url": f"{api_base()}/ai/page?path={urllib.parse.quote(path)}",
+                    "use_site_key": True,
+                },
+            )
+            if intent:
+                # Same gate as any external agent: ask for act, then invoke the action.
+                actions.append(
+                    {
+                        "method": "POST",
+                        "url": f"{api_base()}/ai/actions",
+                        "use_site_key": True,
+                        "body": {"action_id": intent["action_id"], "args": {}},
+                    }
+                )
+        else:
+            add("follow_up", result="started", detail="Trying follow-up fetches for product data")
+            actions = [
+                {"method": "GET", "url": f"{api_base()}/api/products", "use_site_key": bool(site_key)},
+            ]
+
+        for action in actions:
+            url = str(action.get("url") or "").strip()
+            if not url:
+                continue
+            if url.startswith("/"):
+                if url.startswith("/api") or url.startswith("/ai") or url.startswith("/.well-known"):
+                    url = _absolute(url, api_base())
+                else:
+                    url = _absolute(url, base)
+            method = str(action.get("method") or "GET").upper()
+            use_key = bool(action.get("use_site_key")) and bool(site_key)
+            body_obj = action.get("body") if isinstance(action.get("body"), dict) else None
+            hdrs = agent_headers(
+                human_token=human_token if isinstance(human_token, str) else None,
+                site_key=site_key if use_key else None,
+                session=session_token,
+            )
+            if method == "POST" and use_key and body_obj is not None and site_key:
+                body_obj = {**body_obj, "site_key": site_key}
+
+            st, rh, raw = _request(url, method=method, headers=hdrs, body=body_obj)
+            summ = _summarize_fetch(st, raw, rh.get("content-type", ""))
+            findings.append({"url": url, "method": method, **summ})
+            parsed = summ.get("json")
+
+            if isinstance(parsed, dict) and parsed.get("session_token"):
+                new_token = str(parsed.get("session_token"))
+                if new_token != session_token:
+                    session_token = new_token
+                    if on_session is not None:
+                        on_session(session_token)
+
+            is_action_call = urllib.parse.urlparse(url).path.rstrip("/") == "/ai/actions"
+            action_id = str((body_obj or {}).get("action_id") or "")
+
+            if st >= 400:
+                denied = True
+                err = ""
+                if isinstance(parsed, dict):
+                    err = str(parsed.get("error") or parsed.get("message") or parsed.get("summary") or "")
+                if is_action_call:
+                    action_outcome = {
+                        "ok": False,
+                        "action_id": action_id,
+                        "error": err or f"HTTP {st}",
+                        "status": st,
+                    }
+                add(
+                    "request",
+                    result="failed",
+                    detail=err or f"HTTP {st}",
+                    method=method,
+                    url=url,
+                    status=st,
+                    site_key_sent=use_key,
+                    action_id=action_id or None,
+                )
+                continue
+
+            if is_action_call and isinstance(parsed, dict):
+                result_body = parsed.get("result") if isinstance(parsed.get("result"), dict) else {}
+                added = result_body.get("added") if isinstance(result_body.get("added"), dict) else {}
+                added_name = str(added.get("name") or "").strip()
+                action_outcome = {
+                    "ok": bool(parsed.get("ok", True)),
+                    "action_id": action_id,
+                    "added_name": added_name or None,
+                    "cart": result_body.get("cart") if isinstance(result_body.get("cart"), list) else None,
+                }
+                if action_outcome["ok"]:
+                    denied = False
+                else:
+                    denied = True
+                    action_outcome["error"] = str(parsed.get("error") or "action failed")
+                add(
+                    "request",
+                    result="ok" if action_outcome["ok"] else "failed",
+                    detail="Action completed" if action_outcome["ok"] else str(action_outcome.get("error") or "action failed"),
+                    method=method,
+                    url=url,
+                    status=st,
+                    site_key_sent=use_key,
+                    action_id=action_id or None,
+                    saw={
+                        "action_id": action_id,
+                        "ok": action_outcome["ok"],
+                        "added": added_name or None,
+                    },
+                )
+                continue
+
+            saw = None
+            if isinstance(parsed, dict):
+                is_ai_page = urllib.parse.urlparse(url).path.rstrip("/") == "/ai/page"
+                if is_ai_page:
+                    page_fields = _fields_from_page_payload(parsed, path=path)
+                    if page_fields:
+                        fields = page_fields
+                        saw = {f["label"]: f["value"] for f in page_fields}
+                    # Agent reached the AI surface for this link even if the owner
+                    # hid every answer field — do not fall back to HTML-block copy.
+                    denied = False
+                elif parsed.get("ok") and parsed.get("session_token"):
+                    saw = {"session": "received", "scopes": parsed.get("granted_scopes")}
+                elif "endpoints" in parsed or "help" in str(parsed.get("note") or "").lower() or parsed.get("protocol"):
+                    saw = {"help": True, "keys": list(parsed.keys())[:8]}
+                else:
+                    page_fields = _fields_from_page_payload(parsed, path=path)
+                    if page_fields:
+                        fields = page_fields
+                        saw = {f["label"]: f["value"] for f in page_fields}
+                        denied = False
+
+            add(
+                "request",
+                result="ok",
+                detail="Got a response",
+                method=method,
+                url=url,
+                status=st,
+                site_key_sent=use_key,
+                saw=saw,
+            )
+
+    reply = _compose_reply(
+        message=message,
+        steps=steps,
+        fields=fields,
+        denied=denied,
+        model=model_info.get("id"),
+        provider=model_info.get("provider"),
+        action_outcome=action_outcome,
+    )
+
+    return {
+        "ok": True,
+        "denied": denied,
+        "reply": reply,
+        "steps": steps,
+        "path": path,
+        "url": target_url,
+        "status": status,
+        "captcha": {"attempted": True, "passed": captcha_passed},
+        "fields": fields,
+        "model": model_info,
+        "session_token": session_token,
+        "site_response": {
+            "url": target_url,
+            "site_key_used": bool(site_key),
+            "findings": findings,
+            "agent_access": captcha.get("agent_access"),
+        },
+    }
+
+
+def _field_map(fields: list[dict[str, str]]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for f in fields:
+        label = str(f.get("label") or "").strip()
+        value = str(f.get("value") or "").strip()
+        if label and value:
+            out[label.lower()] = value
+    return out
+
+
+def _asked_keys(message: str) -> list[str]:
+    lowered = message.lower()
+    # Price is only `price`. compare_at and discount are different facts and
+    # must not stand in when the site hid the price.
+    if "discount" in lowered or "% off" in lowered or "percent off" in lowered or re.search(r"\boff\b", lowered):
+        return ["discount"]
+    if any(w in lowered for w in ("compare at", "compare-at", "was price", "original price", "list price")):
+        return ["compare_at"]
+    if any(w in lowered for w in ("price", "cost", "how much")):
+        return ["price"]
+    if any(w in lowered for w in ("rating", "review", "stars")):
+        return ["rating"]
+    if any(w in lowered for w in ("name", "title", "called", "what product")):
+        return ["name", "title"]
+    if "sku" in lowered:
+        return ["sku"]
+    return []
+
+
+def _answer_from_fields(message: str, fields: list[dict[str, str]]) -> str | None:
+    """Direct answer only when the asked field is actually present."""
+    if not fields:
+        return None
+    m = _field_map(fields)
+
+    def pick(*keys: str) -> str | None:
+        for k in keys:
+            if k in m:
+                return m[k]
+        return None
+
+    asked = _asked_keys(message)
+    if asked:
+        value = pick(*asked)
+        if not value:
+            return None
+        name = pick("name", "title")
+        key = asked[0]
+        if key == "price":
+            return f"The price of {name} is {value}." if name else f"The price is {value}."
+        if key == "discount":
+            return f"The discount on {name} is {value}%." if name else f"The discount is {value}%."
+        if key == "compare_at":
+            return f"The compare-at price of {name} is {value}." if name else f"The compare-at price is {value}."
+        if key == "rating":
+            return f"The rating for {name} is {value}." if name else f"The rating is {value}."
+        if key in ("name", "title"):
+            return f"The product name is {value}."
+        if key == "sku":
+            return f"The SKU is {value}."
+        return f"{key.capitalize()}: {value}."
+
+    # Broad ask ("what can you see" / "open the shop") — short field dump, no story.
+    preferred = ["products", "name", "title", "price", "discount", "rating", "sku"]
+    bits = [f"{k.capitalize()}: {m[k]}" for k in preferred if k in m]
+    if not bits:
+        return None
+    return "; ".join(bits) + "."
+
+
+def _numbers_in(text: str) -> set[float]:
+    found: set[float] = set()
+    for raw in re.findall(r"\d+(?:\.\d+)?", text or ""):
+        try:
+            found.add(float(raw))
+        except ValueError:
+            continue
+    return found
+
+
+def _mentions_value(text: str, value: str) -> bool:
+    value = (value or "").strip()
+    if not value:
+        return False
+    if value in (text or ""):
+        return True
+    wanted = _numbers_in(value)
+    return bool(wanted) and wanted <= _numbers_in(text)
+
+
+def _facts_for_answer(message: str, fields: list[dict[str, str]]) -> dict[str, str]:
+    """Facts the model is allowed to see. A price question never receives stand-ins."""
+    asked = _asked_keys(message)
+    if "price" in asked:
+        keep = {"name", "title", "price"}
+        return {
+            str(f.get("label")): str(f.get("value"))
+            for f in fields
+            if str(f.get("label") or "").strip().lower() in keep and f.get("value") not in (None, "")
+        }
+    return {
+        str(f.get("label")): str(f.get("value"))
+        for f in fields
+        if f.get("label") and f.get("value") not in (None, "")
+    }
+
+
+def _polish_ok(polished: str, message: str, facts: dict[str, str], fields: list[dict[str, str]]) -> bool:
+    words = polished.split()
+    bad = any(w in polished.lower() for w in ("rewrite", "steps", "json", "as an ai", "prompt"))
+    if not polished or not (3 <= len(words) <= 40) or bad:
+        return False
+    allowed = set()
+    for value in facts.values():
+        allowed |= _numbers_in(value)
+    if _numbers_in(polished) - allowed:
+        return False
+    asked = _asked_keys(message)
+    if not asked:
+        return True
+    present = _field_map(fields)
+    key = asked[0]
+    if key not in present:
+        return False
+    return _mentions_value(polished, present[key])
+
+
+def _missing_field_reply(message: str) -> str | None:
+    asked = _asked_keys(message)
+    if not asked:
+        return None
+    if asked[0] == "price":
+        return "I reached the page, but the price isn't shared by this site."
+    if asked[0] == "discount":
+        return "I reached the page, but the discount isn't shared by this site."
+    if asked[0] == "compare_at":
+        return "I reached the page, but the compare-at price isn't shared by this site."
+    label = asked[0].replace("_", " ")
+    return f"I reached the page, but {label} was not available to agents."
+
+
+_CART_READ = re.compile(
+    r"\b(?:my cart|the cart|show\b.{0,40}\bcart\b|what(?:'s| is) in (?:my |the )?cart|cart contents)\b",
+    re.I,
+)
+
+
+def _is_cart_read(message: str) -> bool:
+    """A question about the cart, not an add, clear, or checkout."""
+    if _wants_cart_add(message):
+        return False
+    if _CHECKOUT_VERB.search(message) or _CLEAR_VERB.search(message):
+        return False
+    return bool(_CART_READ.search(message))
+
+
+def _cart_reply(fields: list[dict[str, str]]) -> str | None:
+    mapped = _field_map(fields)
+    products = mapped.get("products") or ""
+    if products:
+        names: list[str] = []
+        for part in products.split(", "):
+            name = re.sub(r"\s*\([^)]*\)\s*$", "", part).strip()
+            if name:
+                names.append(name)
+        if names:
+            return "Your cart has " + ", ".join(names) + "."
+    summary = mapped.get("summary") or ""
+    if re.search(r"\b0 item\(s\) in cart\b", summary):
+        return "Your cart is empty."
+    return None
+
+
+def _declined_add_reply(message: str) -> str | None:
+    """A cancelled add should read as a sentence, not a dump of the page fields."""
+    mentions_add = bool(_ADD_VERB.search(message) or ("cart" in message.lower() and _PUT_VERB.search(message)))
+    if not mentions_add or _wants_cart_add(message):
+        return None
+    if not (_NEGATION_CUE.search(message) or _RETRACTION.search(message)):
+        return None
+    return "OK, I won't add it."
+
+
+def _reply_for_action(outcome: dict[str, Any]) -> str:
+    if outcome.get("ok"):
+        action_id = str(outcome.get("action_id") or "")
+        if action_id.startswith("product.add:"):
+            name = str(outcome.get("added_name") or "").strip()
+            if not name:
+                name = action_id.split(":", 1)[-1].replace("-", " ").strip() or "The item"
+            return f"{name} is in the cart."
+        if action_id == "cart.clear":
+            return "The cart is cleared."
+        if action_id == "cart.checkout":
+            return "Checkout is complete."
+        return "Done."
+    err = str(outcome.get("error") or "the site denied that action")
+    return f"I couldn't do that — {err}."
+
+
+def _failure_reason(steps: list[dict[str, Any]]) -> str:
+    fail_reqs = [s for s in steps if s.get("action") == "request" and s.get("result") == "failed"]
+    if fail_reqs:
+        detail = str(fail_reqs[-1].get("detail") or "access denied")
+        return f"I couldn't get that — {detail}."
+    if any(s.get("action") == "solve_captcha" and s.get("result") == "rejected" for s in steps):
+        if not any(s.get("action") == "switch_to_api" for s in steps):
+            return "I couldn't get that — human verification blocked me."
+    if any(s.get("action") == "open_url" and s.get("result") == "blocked" for s in steps):
+        return "I couldn't get that — the storefront blocked automated access."
+    return "I couldn't get the data you asked for."
+
+
+def _compose_reply(
+    *,
+    message: str,
+    steps: list[dict[str, Any]],
+    fields: list[dict[str, str]],
+    denied: bool,
+    model: str | None = None,
+    provider: str | None = None,
+    action_outcome: dict[str, Any] | None = None,
+) -> str:
+    """If we can answer, answer only. Otherwise one short failure line.
+
+    Action allow/deny is reported as the gate returned it. The model is not
+    asked to rephrase those, and it is not given stand-in fields for a value
+    the site withheld.
+    """
+    if action_outcome:
+        return _reply_for_action(action_outcome)
+
+    declined = _declined_add_reply(message)
+    if declined:
+        return declined
+
+    if _is_cart_read(message):
+        cart_line = _cart_reply(fields)
+        if cart_line:
+            return cart_line
+
+    deterministic = _answer_from_fields(message, fields) if fields else None
+    if deterministic:
+        # Optional model phrasing — fall back instantly if the model is weird/slow/fails
+        # or tries to cite a number that was not in the facts it was given.
+        try:
+            facts = _facts_for_answer(message, fields)
+            polished = muse_client.complete(
+                [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Answer the user in ONE short sentence using only these facts. "
+                            "If a fact they asked for is missing, say it isn't shared by this site. "
+                            "Never substitute another field for a missing one "
+                            "(compare-at, discount, and similar are not the price). "
+                            "No steps, no story, no JSON.\n"
+                            f"Question: {message}\nFacts: {json.dumps(facts)}"
+                        ),
+                    }
+                ],
+                model=model,
+                provider=provider,
+                max_tokens=1024,
+                temperature=0.1,
+            ).strip()
+            if _polish_ok(polished, message, facts, fields):
+                return polished
+        except Exception:
+            pass
+        return deterministic
+
+    missing = _missing_field_reply(message) if fields or _ai_page_ok(steps) else None
+    if missing:
+        return missing
+
+    if _ai_page_ok(steps):
+        return "I checked the page, but couldn't find an answer to that."
+
+    if denied or not fields:
+        return _failure_reason(steps)
+
+    return "I checked the page, but couldn't find an answer to that."
